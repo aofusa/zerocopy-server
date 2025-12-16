@@ -1,0 +1,53 @@
+[package]
+name = "zerocopy-server"
+version = "0.1.0"
+edition = "2021"
+
+[features]
+default = []
+
+# kTLS（Kernel TLS）サポート
+# s2n-tls を使用し、kTLS によるカーネルオフロードをサポート
+# 
+# 要件:
+#   - Linux 5.15+ カーネル
+#   - `modprobe tls` でkTLSモジュールをロード済み
+#   - AES-GCM暗号スイートの使用
+# 
+# ビルド方法: cargo build --features ktls
+ktls = ["s2n-tls", "s2n-tls-sys"]
+
+[dependencies]
+monoio = { version = "0.2.2", features = ["poll-io"] }
+monoio-rustls = "0.4.0"
+rustls = { version = "0.23", features = ["tls12", "ring"] }
+webpki-roots = "0.26"
+rustls-pemfile = "2.1.3"
+libc = "0.2"
+mimalloc = { version = "0.1.43", default-features = false }
+toml = "0.8.19"
+serde = { version = "1.0.209", features = ["derive"] }
+httparse = "1.9.4"
+memchr = "2.7"
+bytes = "1.7.1"
+anyhow = "1.0.89"
+mime_guess = "2.0.5"
+num_cpus = "1.17.0"
+ftlog = "0.2"
+time = "0.3"
+hostname = "0.4"
+itoa = "1.0"
+ctrlc = "3.4"
+
+# CPUアフィニティ設定
+# 各ワーカースレッドを特定のCPUコアに固定し、キャッシュ効率を向上
+core_affinity = "0.8"
+
+# s2n-tls（オプション）
+# AWS 製の TLS 実装、kTLS をネイティブサポート
+s2n-tls = { version = "0.3", optional = true, features = ["unstable-ktls"] }
+s2n-tls-sys = { version = "0.3", optional = true, features = ["unstable-ktls"] }
+
+[build-dependencies]
+# s2n-tls のビルドに必要
+cc = "1.0"

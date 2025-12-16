@@ -1,0 +1,26 @@
+[server]
+listen = "0.0.0.0:443"
+# ワーカースレッド数（オプション）
+# 未指定または0の場合はCPUコア数と同じスレッド数を使用
+threads = 4
+
+[performance]
+# SO_REUSEPORT の振り分け方式
+# "kernel" = カーネルデフォルト（3元タプルハッシュ）
+# "cbpf"   = クライアントIPベースのCBPF（キャッシュ効率向上、Linux 4.6+必須）
+reuseport_balancing = "cbpf"
+
+[tls]
+cert_path = "/path/to/cert.pem"
+key_path = "/path/to/key.pem"
+ktls_enabled = false  # kTLS有効化（Linux 5.15+、feature flag必須）
+
+# ホストベースルーティング
+[host_routes]
+"example.com" = { type = "File", path = "/var/www/example", mode = "sendfile" }
+"api.example.com" = { type = "Proxy", url = "http://localhost:8080" }
+
+# パスベースルーティング
+[path_routes."example.com"]
+"/api/" = { type = "Proxy", url = "http://localhost:8080" }
+"/static/" = { type = "File", path = "/var/www/static", mode = "sendfile" }
