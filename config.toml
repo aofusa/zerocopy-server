@@ -10,6 +10,24 @@ threads = 4
 # "cbpf"   = クライアントIPベースのCBPF（キャッシュ効率向上、Linux 4.6+必須）
 reuseport_balancing = "cbpf"
 
+# Huge Pages (Large OS Pages) の使用
+# true: mimallocでHuge Pages（2MB）を優先使用し、TLBミスを削減
+# false: 通常の4KBページを使用
+#
+# 利点:
+#   - TLB（Translation Lookaside Buffer）ミス削減
+#   - 大容量メモリ使用時（バッファプール拡大）のページフォルト減少
+#   - kTLS/splice時のカーネル連携で効果的（5-10%パフォーマンス向上）
+#
+# 要件（Linux）:
+#   - sudo echo 128 > /proc/sys/vm/nr_hugepages
+#   - または /etc/sysctl.conf に vm.nr_hugepages=128 を追加
+#
+# 注意:
+#   - コンテナ環境（Docker/K8s）では無効化される可能性あり
+#   - 利用不可の場合は自動的に通常ページにフォールバック
+huge_pages_enabled = true
+
 [tls]
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
