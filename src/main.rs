@@ -1,12 +1,12 @@
 //! # High-Performance Reverse Proxy Server
 //!
-//! io_uring (monoio) と rustls/s2n-tls を使用した高性能リバースプロキシサーバー。
+//! io_uring (monoio) と rustls + ktls2 を使用した高性能リバースプロキシサーバー。
 //!
 //! ## 特徴
 //!
 //! - **非同期I/O**: monoio (io_uring) による効率的なI/O処理
-//! - **TLS**: rustls または s2n-tls によるTLS実装
-//! - **kTLS**: s2n-tls 使用時はカーネルTLSオフロード対応
+//! - **TLS**: rustls によるPure Rust TLS実装
+//! - **kTLS**: rustls + ktls2 によるカーネルTLSオフロード対応
 //! - **コネクションプール**: バックエンド接続の再利用
 //! - **バッファプール**: メモリアロケーションの削減
 //! - **Keep-Alive**: HTTP/1.1 Keep-Alive完全サポート
@@ -27,13 +27,13 @@
 //!
 //! ### 有効化方法
 //!
-//! kTLSはs2n-tls経由でサポートされています。
+//! kTLSはrustls + ktls2経由でサポートされています。
 //!
 //! ```bash
 //! # 1. カーネルモジュールのロード
 //! sudo modprobe tls
 //!
-//! # 2. s2n-tlsフィーチャー付きでビルド
+//! # 2. ktlsフィーチャー付きでビルド
 //! cargo build --release --features ktls
 //!
 //! # 3. 設定ファイルで有効化
@@ -49,14 +49,14 @@
 //! - Linux 5.15以上（推奨）
 //! - `tls`カーネルモジュールがロード済み
 //! - AES-GCM暗号スイート（TLS 1.2/1.3）
-//! - s2n-tlsフィーチャーでビルド（`--features ktls`）
+//! - ktlsフィーチャーでビルド（`--features ktls`）
 //!
 //! ### セキュリティ考慮事項
 //!
 //! | リスク | 緩和策 |
 //! |--------|--------|
 //! | カーネルバグ | カーネルバージョン固定、定期的なパッチ適用 |
-//! | セッションキー露出 | TLSハンドシェイクはs2n-tlsで実行 |
+//! | セッションキー露出 | TLSハンドシェイクはrustlsで実行 |
 //! | DoS攻撃 | カーネルリソース監視、レート制限 |
 //! | NICファームウェア脆弱性 | ハードウェアオフロード無効化オプション |
 //!
@@ -70,7 +70,7 @@
 //! ./target/release/zerocopy-server &
 //! wrk -t4 -c100 -d30s https://localhost/
 //!
-//! # 2. kTLS有効（s2n-tls使用）
+//! # 2. kTLS有効（rustls + ktls2使用）
 //! cargo build --release --features ktls
 //! # config.tomlでktls_enabled = true
 //! ./target/release/zerocopy-server &
@@ -83,16 +83,17 @@
 //! ### 参考資料
 //!
 //! - [Linux Kernel TLS](https://docs.kernel.org/networking/tls.html)
-//! - [s2n-tls](https://github.com/aws/s2n-tls): AWS製のTLS実装（kTLSネイティブサポート）
+//! - [rustls](https://github.com/rustls/rustls): Pure Rust TLS実装
+//! - [ktls2](https://crates.io/crates/ktls2): rustls用kTLS統合クレート
 
 use mimalloc::MiMalloc;
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-// s2n-tls モジュール（kTLS 対応）
+// ktls_rustls モジュール（kTLS 対応）
 #[cfg(feature = "ktls")]
-mod s2n_tls;
+mod ktls_rustls;
 
 use httparse::{Request, Status, Header};
 use monoio::fs::OpenOptions;
@@ -104,10 +105,8 @@ use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::fs;
-#[cfg(not(feature = "ktls"))]
 use std::fs::File;
 use std::io;
-#[cfg(not(feature = "ktls"))]
 use std::io::BufReader;
 use std::net::SocketAddr;
 #[cfg(target_os = "linux")]
@@ -123,42 +122,38 @@ use ftlog::{info, error, warn};
 use memchr::memchr3;
 use time::OffsetDateTime;
 
-// rustls（デフォルト）
-#[cfg(not(feature = "ktls"))]
-use monoio_rustls::{TlsAcceptor, TlsConnector, ServerTlsStream, ClientTlsStream};
-#[cfg(not(feature = "ktls"))]
-use rustls::{ServerConfig, ClientConfig, RootCertStore};
-#[cfg(not(feature = "ktls"))]
+// rustls 共通インポート
+use rustls::ServerConfig;
 use rustls::crypto::CryptoProvider;
-#[cfg(not(feature = "ktls"))]
-use rustls::pki_types::ServerName;
-#[cfg(not(feature = "ktls"))]
 use rustls_pemfile::{certs, private_key};
 
-// s2n-tls（kTLS 対応）
+// ktls_rustls（kTLS 対応）
 #[cfg(feature = "ktls")]
-use s2n_tls::{S2nConfig, S2nAcceptor, S2nConnector, S2nTlsStream, SplicePipe};
+use ktls_rustls::{RustlsAcceptor, RustlsConnector, KtlsServerStream, KtlsClientStream};
 
 // ====================
 // TLS ストリーム型エイリアス
 // ====================
 // 
-// s2n フィーチャーの有無に応じて、使用する TLS ストリーム型を切り替えます。
-// これにより、コードの大部分を共通化できます。
-
-#[cfg(not(feature = "ktls"))]
-type ServerTls = ServerTlsStream<TcpStream>;
+// ktls フィーチャーの有無に応じて、使用する TLS ストリーム型を切り替えます。
+// kTLS 有効時は ktls_rustls モジュールの型を使用し、
+// 無効時はシンプルな rustls ラッパーを使用します。
 
 #[cfg(feature = "ktls")]
-type ServerTls = S2nTlsStream;
+type ServerTls = KtlsServerStream;
+
+#[cfg(feature = "ktls")]
+type ClientTls = KtlsClientStream;
+
+// kTLS 無効時は直接 rustls を使用するシンプルなラッパー
+#[cfg(not(feature = "ktls"))]
+mod simple_tls;
 
 #[cfg(not(feature = "ktls"))]
-type ClientTls = ClientTlsStream<TcpStream>;
+type ServerTls = simple_tls::SimpleTlsServerStream;
 
-// s2n-tls 使用時のクライアント TLS ストリーム
-// 注: s2n-tls でのバックエンド接続は将来の実装
-#[cfg(feature = "ktls")]
-type ClientTls = S2nTlsStream;
+#[cfg(not(feature = "ktls"))]
+type ClientTls = simple_tls::SimpleTlsClientStream;
 
 // ====================
 // kTLS設定情報
@@ -225,28 +220,21 @@ static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 // TLSコネクタ（スレッドローカル）
 // ====================
 
-// rustls 用の TLS コネクター
-#[cfg(not(feature = "ktls"))]
+// rustls 用の TLS コネクター（kTLS 有効時は ktls_rustls を使用）
+#[cfg(feature = "ktls")]
 thread_local! {
-    static TLS_CONNECTOR: TlsConnector = {
-        let mut root_store = RootCertStore::empty();
-        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-        
-        let client_config = ClientConfig::builder()
-            .with_root_certificates(root_store)
-            .with_no_client_auth();
-        
-        TlsConnector::from(Arc::new(client_config))
+    static TLS_CONNECTOR: RustlsConnector = {
+        let config = ktls_rustls::default_client_config();
+        RustlsConnector::new(config)
     };
 }
 
-// s2n-tls 用の TLS コネクター
-#[cfg(feature = "ktls")]
+// rustls 用の TLS コネクター（kTLS 無効時は simple_tls を使用）
+#[cfg(not(feature = "ktls"))]
 thread_local! {
-    static TLS_CONNECTOR: S2nConnector = {
-        let config = S2nConfig::new_client()
-            .expect("Failed to create s2n-tls client config");
-        S2nConnector::new(Arc::new(config))
+    static TLS_CONNECTOR: simple_tls::SimpleTlsConnector = {
+        let config = simple_tls::default_client_config();
+        simple_tls::SimpleTlsConnector::new(config)
     };
 }
 
@@ -363,17 +351,17 @@ thread_local! {
 // splice(2) によるゼロコピー転送に使用
 #[cfg(feature = "ktls")]
 thread_local! {
-    static SPLICE_PIPE: RefCell<Option<SplicePipe>> = RefCell::new(None);
+    static SPLICE_PIPE: RefCell<Option<ktls_rustls::SplicePipe>> = RefCell::new(None);
 }
 
 /// スレッドローカルな Splice パイプを取得または初期化
 #[cfg(feature = "ktls")]
-fn get_splice_pipe() -> std::cell::Ref<'static, Option<SplicePipe>> {
+fn get_splice_pipe() -> std::cell::Ref<'static, Option<ktls_rustls::SplicePipe>> {
     SPLICE_PIPE.with(|p| {
         {
             let mut pipe = p.borrow_mut();
             if pipe.is_none() {
-                match SplicePipe::new() {
+                match ktls_rustls::SplicePipe::new() {
                     Ok(new_pipe) => {
                         *pipe = Some(new_pipe);
                         ftlog::info!("Splice pipe initialized for this thread");
@@ -855,46 +843,61 @@ impl AsyncWriter for TcpStream {
     }
 }
 
-// ServerTlsStream用の実装（rustls）
-#[cfg(not(feature = "ktls"))]
-impl AsyncReader for ServerTlsStream<TcpStream> {
-    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
-        self.read(buf).await
-    }
-}
-
-#[cfg(not(feature = "ktls"))]
-impl AsyncWriter for ServerTlsStream<TcpStream> {
-    async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
-        self.write_all(buf).await
-    }
-}
-
-// ClientTlsStream用の実装（rustls）
-#[cfg(not(feature = "ktls"))]
-impl AsyncReader for ClientTlsStream<TcpStream> {
-    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
-        self.read(buf).await
-    }
-}
-
-#[cfg(not(feature = "ktls"))]
-impl AsyncWriter for ClientTlsStream<TcpStream> {
-    async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
-        self.write_all(buf).await
-    }
-}
-
-// S2nTlsStream用の実装（s2n-tls + kTLS）
+// KtlsServerStream用の実装（rustls + ktls2）
 #[cfg(feature = "ktls")]
-impl AsyncReader for S2nTlsStream {
+impl AsyncReader for KtlsServerStream {
     async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.read(buf).await
     }
 }
 
 #[cfg(feature = "ktls")]
-impl AsyncWriter for S2nTlsStream {
+impl AsyncWriter for KtlsServerStream {
+    async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.write_all(buf).await
+    }
+}
+
+// KtlsClientStream用の実装（rustls + ktls2）
+#[cfg(feature = "ktls")]
+impl AsyncReader for KtlsClientStream {
+    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.read(buf).await
+    }
+}
+
+#[cfg(feature = "ktls")]
+impl AsyncWriter for KtlsClientStream {
+    async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.write_all(buf).await
+    }
+}
+
+// SimpleTlsServerStream用の実装（rustls のみ）
+#[cfg(not(feature = "ktls"))]
+impl AsyncReader for simple_tls::SimpleTlsServerStream {
+    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.read(buf).await
+    }
+}
+
+#[cfg(not(feature = "ktls"))]
+impl AsyncWriter for simple_tls::SimpleTlsServerStream {
+    async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.write_all(buf).await
+    }
+}
+
+// SimpleTlsClientStream用の実装（rustls のみ）
+#[cfg(not(feature = "ktls"))]
+impl AsyncReader for simple_tls::SimpleTlsClientStream {
+    async fn read_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
+        self.read(buf).await
+    }
+}
+
+#[cfg(not(feature = "ktls"))]
+impl AsyncWriter for simple_tls::SimpleTlsClientStream {
     async fn write_buf(&mut self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.write_all(buf).await
     }
@@ -904,8 +907,7 @@ impl AsyncWriter for S2nTlsStream {
 // 設定読み込み
 // ====================
 
-// rustls 用の TLS 設定読み込み
-#[cfg(not(feature = "ktls"))]
+// rustls 用の TLS 設定読み込み（統一）
 fn load_tls_config(tls_config: &TlsConfigSection) -> io::Result<Arc<ServerConfig>> {
     let cert_file = File::open(&tls_config.cert_path)?;
     let key_file = File::open(&tls_config.key_path)?;
@@ -925,35 +927,10 @@ fn load_tls_config(tls_config: &TlsConfigSection) -> io::Result<Arc<ServerConfig
     Ok(Arc::new(config))
 }
 
-// s2n-tls 用の TLS 設定読み込み
-#[cfg(feature = "ktls")]
-fn load_tls_config(tls_config: &TlsConfigSection) -> io::Result<Arc<S2nConfig>> {
-    let cert_pem = fs::read(&tls_config.cert_path)?;
-    let key_pem = fs::read(&tls_config.key_path)?;
-
-    let config = S2nConfig::new_server(&cert_pem, &key_pem)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-    Ok(Arc::new(config))
-}
-
-/// 設定読み込みの戻り値型（rustls）
-#[cfg(not(feature = "ktls"))]
+/// 設定読み込みの戻り値型（統一）
 struct LoadedConfig {
     listen_addr: String,
     tls_config: Arc<ServerConfig>,
-    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
-    ktls_config: KtlsConfig,
-    reuseport_balancing: ReuseportBalancing,
-    num_threads: usize,
-}
-
-/// 設定読み込みの戻り値型（s2n-tls）
-#[cfg(feature = "ktls")]
-struct LoadedConfig {
-    listen_addr: String,
-    tls_config: Arc<S2nConfig>,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
     ktls_config: KtlsConfig,
@@ -1053,14 +1030,9 @@ fn load_backend(config: &BackendConfig) -> io::Result<Backend> {
 // ====================
 
 fn main() {
-    // rustls 使用時: プロセスレベルで暗号プロバイダーをインストール（ring使用）
-    #[cfg(not(feature = "ktls"))]
+    // プロセスレベルで暗号プロバイダーをインストール（ring使用）
     CryptoProvider::install_default(rustls::crypto::ring::default_provider())
         .expect("Failed to install rustls crypto provider");
-    
-    // s2n-tls 使用時: s2n-tls ライブラリを初期化
-    #[cfg(feature = "ktls")]
-    s2n_tls::init().expect("Failed to initialize s2n-tls");
     
     let _guard = ftlog::Builder::new().try_init().unwrap();
 
@@ -1073,11 +1045,12 @@ fn main() {
     };
     
     // TLS アクセプターを作成
-    #[cfg(not(feature = "ktls"))]
-    let acceptor = TlsAcceptor::from(loaded_config.tls_config);
-    
     #[cfg(feature = "ktls")]
-    let acceptor = S2nAcceptor::new(loaded_config.tls_config.clone())
+    let acceptor = RustlsAcceptor::new(loaded_config.tls_config.clone())
+        .with_ktls(loaded_config.ktls_config.enabled);
+    
+    #[cfg(not(feature = "ktls"))]
+    let acceptor = simple_tls::SimpleTlsAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled);
     
     let listen_addr = loaded_config.listen_addr.parse::<SocketAddr>()
@@ -1219,28 +1192,25 @@ fn main() {
 /// kTLSの状態をログ出力
 fn log_ktls_status(ktls_config: &KtlsConfig) {
     if ktls_config.enabled {
-        // s2n-tls + kTLS 使用時
+        // rustls + ktls2 使用時
         #[cfg(feature = "ktls")]
         {
-            if s2n_tls::is_ktls_available() {
-                info!("kTLS: Enabled via s2n-tls (TX={}, RX={})", ktls_config.enable_tx, ktls_config.enable_rx);
+            if ktls_rustls::is_ktls_available() {
+                info!("kTLS: Enabled via rustls + ktls2 (TX={}, RX={})", ktls_config.enable_tx, ktls_config.enable_rx);
                 info!("kTLS: Kernel TLS offload active - reduced CPU usage expected");
             } else {
                 warn!("kTLS: Requested but kernel support not available");
                 warn!("kTLS: Ensure 'modprobe tls' has been run and kernel 5.15+ is used");
-                warn!("kTLS: Falling back to userspace TLS via s2n-tls");
+                warn!("kTLS: Falling back to userspace TLS via rustls");
             }
         }
-        // rustls 使用時（kTLS非対応）
+        // kTLS フィーチャー無効時
         #[cfg(not(feature = "ktls"))]
         {
-            warn!("kTLS: Enabled in config but rustls does not support kTLS");
-            warn!("kTLS: Rebuild with: cargo build --features ktls (s2n-tls) for kTLS support");
+            warn!("kTLS: Enabled in config but ktls feature is not enabled");
+            warn!("kTLS: Rebuild with: cargo build --features ktls for kTLS support");
         }
     } else {
-        #[cfg(feature = "ktls")]
-        info!("kTLS: Disabled (using userspace TLS via s2n-tls)");
-        #[cfg(not(feature = "ktls"))]
         info!("kTLS: Disabled (using userspace TLS via rustls)");
     }
 }
@@ -1413,11 +1383,48 @@ fn create_listener(
 // 接続処理
 // ====================
 
-// rustls 使用時の接続処理
+// kTLS 有効時の接続処理（rustls + ktls2）
+#[cfg(feature = "ktls")]
+async fn handle_connection(
+    stream: TcpStream,
+    acceptor: RustlsAcceptor,
+    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
+    path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    _peer_addr: SocketAddr,
+    ktls_config: Arc<KtlsConfig>,
+) {
+    // TLSハンドシェイクにタイムアウトを設定
+    // rustls でハンドシェイク後、ktls2 で kTLS を有効化
+    let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await;
+    
+    let tls_stream = match tls_result {
+        Ok(Ok(tls)) => tls,
+        Ok(Err(e)) => {
+            warn!("TLS handshake error: {}", e);
+            return;
+        }
+        Err(_) => {
+            warn!("TLS handshake timeout");
+            return;
+        }
+    };
+
+    // kTLS 状態をログ出力
+    if tls_stream.is_ktls_enabled() {
+        ftlog::debug!("kTLS: Active for this connection");
+    }
+
+    // 警告抑制
+    let _ = &ktls_config;
+
+    handle_requests(tls_stream, &host_routes, &path_routes).await;
+}
+
+// kTLS 無効時の接続処理（rustls のみ）
 #[cfg(not(feature = "ktls"))]
 async fn handle_connection(
     stream: TcpStream,
-    acceptor: TlsAcceptor,
+    acceptor: simple_tls::SimpleTlsAcceptor,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
     _peer_addr: SocketAddr,
@@ -1437,47 +1444,6 @@ async fn handle_connection(
             return;
         }
     };
-
-    // 注意: rustls では kTLS はサポートされていません。
-    // kTLS を使用するには --features ktls でビルドし、s2n-tls を使用してください。
-
-    handle_requests(tls_stream, &host_routes, &path_routes).await;
-}
-
-// s2n-tls + kTLS 使用時の接続処理
-#[cfg(feature = "ktls")]
-async fn handle_connection(
-    stream: TcpStream,
-    acceptor: S2nAcceptor,
-    host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
-    _peer_addr: SocketAddr,
-    ktls_config: Arc<KtlsConfig>,
-) {
-    // TLSハンドシェイクにタイムアウトを設定
-    // s2n-tls は内部でノンブロッキングハンドシェイクを実行し、
-    // ハンドシェイク完了後に kTLS を自動的に有効化します
-    let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await;
-    
-    let tls_stream = match tls_result {
-        Ok(Ok(tls)) => tls,
-        Ok(Err(e)) => {
-            warn!("s2n-tls handshake error: {}", e);
-            return;
-        }
-        Err(_) => {
-            warn!("s2n-tls handshake timeout");
-            return;
-        }
-    };
-
-    // kTLS 状態をログ出力
-    if tls_stream.is_ktls_enabled() {
-        ftlog::debug!("kTLS: Active for this connection");
-    }
-
-    // 警告抑制
-    let _ = &ktls_config;
 
     handle_requests(tls_stream, &host_routes, &path_routes).await;
 }
@@ -2431,7 +2397,7 @@ async fn proxy_http_request(
 async fn splice_body_transfer(
     src_stream: &TcpStream,
     dst_stream: &TcpStream,
-    pipe: &SplicePipe,
+    pipe: &ktls_rustls::SplicePipe,
     mut remaining: usize,
 ) -> u64 {
     use std::os::unix::io::AsRawFd;
@@ -2490,7 +2456,7 @@ async fn splice_body_transfer(
 /// Chunked 転送の場合は通常の転送を使用。
 #[cfg(feature = "ktls")]
 async fn proxy_http_request_splice(
-    client_stream: &S2nTlsStream,
+    client_stream: &KtlsServerStream,
     backend_stream: &TcpStream,
     request: &[u8],
     content_length: usize,
@@ -2568,8 +2534,8 @@ async fn proxy_http_request_splice(
 #[cfg(feature = "ktls")]
 async fn splice_transfer_response_ktls(
     backend_stream: &TcpStream,
-    client_stream: &S2nTlsStream,
-    pipe: &SplicePipe,
+    client_stream: &KtlsServerStream,
+    pipe: &ktls_rustls::SplicePipe,
 ) -> (u16, u64, bool) {
     let client_tcp = client_stream.get_ref();
     
@@ -2739,63 +2705,24 @@ async fn proxy_https_pooled(
             };
             
             // TLS接続（タイムアウト付き）
-            // rustls 使用時
-            #[cfg(not(feature = "ktls"))]
-            let tls_stream = {
-                let server_name = match ServerName::try_from(target.host.clone()) {
-                    Ok(name) => name,
-                    Err(e) => {
-                        error!("Invalid server name {}: {}", target.host, e);
-                        let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                        return Some((client_stream, 502, 0, true));
-                    }
-                };
-
-                let connector = TLS_CONNECTOR.with(|c| c.clone());
-                let tls_result = timeout(CONNECT_TIMEOUT, connector.connect(server_name, backend_tcp)).await;
-                
-                match tls_result {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(e)) => {
-                        error!("TLS connect error to {}: {}", target.host, e);
-                        let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                        return Some((client_stream, 502, 0, true));
-                    }
-                    Err(_) => {
-                        error!("TLS connect timeout to {}", target.host);
-                        let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                        return Some((client_stream, 504, 0, true));
-                    }
-                }
-            };
+            let connector = TLS_CONNECTOR.with(|c| c.clone());
+            let tls_result = timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &target.host)).await;
             
-            // s2n-tls 使用時
-            #[cfg(feature = "ktls")]
-            let tls_stream = {
-                let connector = TLS_CONNECTOR.with(|c| c.clone());
-                let tls_result = timeout(CONNECT_TIMEOUT, connector.connect(backend_tcp, &target.host)).await;
-                
-                match tls_result {
-                    Ok(Ok(stream)) => stream,
-                    Ok(Err(e)) => {
-                        error!("s2n-tls connect error to {}: {}", target.host, e);
-                        let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                        return Some((client_stream, 502, 0, true));
-                    }
-                    Err(_) => {
-                        error!("s2n-tls connect timeout to {}", target.host);
-                        let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
-                        let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
-                        return Some((client_stream, 504, 0, true));
-                    }
+            match tls_result {
+                Ok(Ok(stream)) => stream,
+                Ok(Err(e)) => {
+                    error!("TLS connect error to {}: {}", target.host, e);
+                    let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                    return Some((client_stream, 502, 0, true));
                 }
-            };
-            
-            tls_stream
+                Err(_) => {
+                    error!("TLS connect timeout to {}", target.host);
+                    let err_buf = ERR_MSG_GATEWAY_TIMEOUT.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
+                    return Some((client_stream, 504, 0, true));
+                }
+            }
         }
     };
 
