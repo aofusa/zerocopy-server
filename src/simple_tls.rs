@@ -197,7 +197,6 @@ async fn do_client_handshake(
 ) -> io::Result<()> {
     let fd = stream.as_raw_fd();
     let mut read_buf = vec![0u8; 16384];
-
     while conn.is_handshaking() {
         while conn.wants_write() {
             let mut write_buf = Vec::new();
@@ -243,7 +242,7 @@ async fn do_client_handshake(
     }
 
     // ハンドシェイク完了後、バッファリングされた TLS レコードを全て送信
-    // TLS 1.3 ではセッションチケット等がハンドシェイク後に送信される場合がある
+    // TLS 1.3 ではクライアントの Finished メッセージがここで送信される
     while conn.wants_write() {
         let mut write_buf = Vec::new();
         conn.write_tls(&mut write_buf)?;
@@ -330,11 +329,19 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
                 match raw_read(fd, &mut read_buf) {
                     Ok(0) => return (Ok(0), buf),
                     Ok(n) => {
-                        if let Err(e) = self.conn.read_tls(&mut &read_buf[..n]) {
-                            return (Err(e), buf);
-                        }
-                        if let Err(e) = self.conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        // read_tls が全てのデータを消費するまでループ
+                        let mut consumed = 0;
+                        while consumed < n {
+                            let remaining = &read_buf[consumed..n];
+                            let tls_read = match self.conn.read_tls(&mut &*remaining) {
+                                Ok(0) => break,
+                                Ok(r) => r,
+                                Err(e) => return (Err(e), buf),
+                            };
+                            consumed += tls_read;
+                            if let Err(e) = self.conn.process_new_packets() {
+                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                            }
                         }
                         break;
                     }
@@ -386,11 +393,19 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
                 match raw_read(fd, &mut read_buf) {
                     Ok(0) => return (Ok(0), buf),
                     Ok(n) => {
-                        if let Err(e) = self.conn.read_tls(&mut &read_buf[..n]) {
-                            return (Err(e), buf);
-                        }
-                        if let Err(e) = self.conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        // read_tls が全てのデータを消費するまでループ
+                        let mut consumed = 0;
+                        while consumed < n {
+                            let remaining = &read_buf[consumed..n];
+                            let tls_read = match self.conn.read_tls(&mut &*remaining) {
+                                Ok(0) => break,
+                                Ok(r) => r,
+                                Err(e) => return (Err(e), buf),
+                            };
+                            consumed += tls_read;
+                            if let Err(e) = self.conn.process_new_packets() {
+                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                            }
                         }
                         break;
                     }
@@ -529,18 +544,32 @@ impl monoio::io::AsyncReadRent for SimpleTlsClientStream {
                 }
                 Ok(_) => {}  // Not EOF yet, need more TLS data
                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
-                Err(e) => return (Err(e), buf),  // Return actual errors
+                Err(e) => {
+                    return (Err(e), buf);  // Return actual errors
+                }
             }
 
             loop {
                 match raw_read(fd, &mut read_buf) {
-                    Ok(0) => return (Ok(0), buf),
+                    Ok(0) => {
+                        return (Ok(0), buf);
+                    }
                     Ok(n) => {
-                        if let Err(e) = self.conn.read_tls(&mut &read_buf[..n]) {
-                            return (Err(e), buf);
-                        }
-                        if let Err(e) = self.conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        // read_tls が全てのデータを消費するまでループ
+                        let mut consumed = 0;
+                        while consumed < n {
+                            let remaining = &read_buf[consumed..n];
+                            let tls_read = match self.conn.read_tls(&mut &*remaining) {
+                                Ok(0) => break, // rustls がこれ以上読めない
+                                Ok(r) => r,
+                                Err(e) => {
+                                    return (Err(e), buf);
+                                }
+                            };
+                            consumed += tls_read;
+                            if let Err(e) = self.conn.process_new_packets() {
+                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                            }
                         }
                         break;
                     }
@@ -549,7 +578,9 @@ impl monoio::io::AsyncReadRent for SimpleTlsClientStream {
                             return (Err(e), buf);
                         }
                     }
-                    Err(e) => return (Err(e), buf),
+                    Err(e) => {
+                        return (Err(e), buf);
+                    }
                 }
             }
         }
@@ -592,11 +623,19 @@ impl monoio::io::AsyncReadRent for SimpleTlsClientStream {
                 match raw_read(fd, &mut read_buf) {
                     Ok(0) => return (Ok(0), buf),
                     Ok(n) => {
-                        if let Err(e) = self.conn.read_tls(&mut &read_buf[..n]) {
-                            return (Err(e), buf);
-                        }
-                        if let Err(e) = self.conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        // read_tls が全てのデータを消費するまでループ
+                        let mut consumed = 0;
+                        while consumed < n {
+                            let remaining = &read_buf[consumed..n];
+                            let tls_read = match self.conn.read_tls(&mut &*remaining) {
+                                Ok(0) => break,
+                                Ok(r) => r,
+                                Err(e) => return (Err(e), buf),
+                            };
+                            consumed += tls_read;
+                            if let Err(e) = self.conn.process_new_packets() {
+                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                            }
                         }
                         break;
                     }

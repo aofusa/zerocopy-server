@@ -717,11 +717,19 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
                 match raw_read(fd, &mut read_buf) {
                     Ok(0) => return (Ok(0), buf),
                     Ok(n) => {
-                        if let Err(e) = conn.read_tls(&mut &read_buf[..n]) {
-                            return (Err(e), buf);
-                        }
-                        if let Err(e) = conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        // read_tls が全てのデータを消費するまでループ
+                        let mut consumed = 0;
+                        while consumed < n {
+                            let remaining = &read_buf[consumed..n];
+                            let tls_read = match conn.read_tls(&mut &*remaining) {
+                                Ok(0) => break,
+                                Ok(r) => r,
+                                Err(e) => return (Err(e), buf),
+                            };
+                            consumed += tls_read;
+                            if let Err(e) = conn.process_new_packets() {
+                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                            }
                         }
                         break;
                     }
@@ -784,11 +792,19 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
                 match raw_read(fd, &mut read_buf) {
                     Ok(0) => return (Ok(0), buf),
                     Ok(n) => {
-                        if let Err(e) = conn.read_tls(&mut &read_buf[..n]) {
-                            return (Err(e), buf);
-                        }
-                        if let Err(e) = conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        // read_tls が全てのデータを消費するまでループ
+                        let mut consumed = 0;
+                        while consumed < n {
+                            let remaining = &read_buf[consumed..n];
+                            let tls_read = match conn.read_tls(&mut &*remaining) {
+                                Ok(0) => break,
+                                Ok(r) => r,
+                                Err(e) => return (Err(e), buf),
+                            };
+                            consumed += tls_read;
+                            if let Err(e) = conn.process_new_packets() {
+                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                            }
                         }
                         break;
                     }
@@ -958,11 +974,19 @@ impl monoio::io::AsyncReadRent for KtlsClientStream {
                 match raw_read(fd, &mut read_buf) {
                     Ok(0) => return (Ok(0), buf),
                     Ok(n) => {
-                        if let Err(e) = conn.read_tls(&mut &read_buf[..n]) {
-                            return (Err(e), buf);
-                        }
-                        if let Err(e) = conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        // read_tls が全てのデータを消費するまでループ
+                        let mut consumed = 0;
+                        while consumed < n {
+                            let remaining = &read_buf[consumed..n];
+                            let tls_read = match conn.read_tls(&mut &*remaining) {
+                                Ok(0) => break,
+                                Ok(r) => r,
+                                Err(e) => return (Err(e), buf),
+                            };
+                            consumed += tls_read;
+                            if let Err(e) = conn.process_new_packets() {
+                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                            }
                         }
                         break;
                     }
@@ -1023,11 +1047,19 @@ impl monoio::io::AsyncReadRent for KtlsClientStream {
                 match raw_read(fd, &mut read_buf) {
                     Ok(0) => return (Ok(0), buf),
                     Ok(n) => {
-                        if let Err(e) = conn.read_tls(&mut &read_buf[..n]) {
-                            return (Err(e), buf);
-                        }
-                        if let Err(e) = conn.process_new_packets() {
-                            return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                        // read_tls が全てのデータを消費するまでループ
+                        let mut consumed = 0;
+                        while consumed < n {
+                            let remaining = &read_buf[consumed..n];
+                            let tls_read = match conn.read_tls(&mut &*remaining) {
+                                Ok(0) => break,
+                                Ok(r) => r,
+                                Err(e) => return (Err(e), buf),
+                            };
+                            consumed += tls_read;
+                            if let Err(e) = conn.process_new_packets() {
+                                return (Err(io::Error::new(io::ErrorKind::InvalidData, e)), buf);
+                            }
                         }
                         break;
                     }
