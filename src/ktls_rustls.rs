@@ -707,7 +707,9 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
                     // EOF
                     return (Ok(0), buf);
                 }
-                _ => {}
+                Ok(_) => {}  // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
+                Err(e) => return (Err(e), buf),  // Return actual errors
             }
 
             // TLS データを読み込む
@@ -773,7 +775,9 @@ impl monoio::io::AsyncReadRent for KtlsServerStream {
                 Ok(0) if !conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                _ => {}
+                Ok(_) => {}  // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
+                Err(e) => return (Err(e), buf),  // Return actual errors
             }
 
             loop {
@@ -945,7 +949,9 @@ impl monoio::io::AsyncReadRent for KtlsClientStream {
                 Ok(0) if !conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                _ => {}
+                Ok(_) => {}  // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
+                Err(e) => return (Err(e), buf),  // Return actual errors
             }
 
             loop {
@@ -1008,7 +1014,9 @@ impl monoio::io::AsyncReadRent for KtlsClientStream {
                 Ok(0) if !conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                _ => {}
+                Ok(_) => {}  // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
+                Err(e) => return (Err(e), buf),  // Return actual errors
             }
 
             loop {

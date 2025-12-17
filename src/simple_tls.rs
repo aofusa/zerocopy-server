@@ -163,6 +163,31 @@ async fn do_server_handshake(
         }
     }
 
+    // ハンドシェイク完了後、バッファリングされた TLS レコードを全て送信
+    // TLS 1.3 ではセッションチケット (NewSessionTicket) がハンドシェイク後に送信される
+    while conn.wants_write() {
+        let mut write_buf = Vec::new();
+        conn.write_tls(&mut write_buf)?;
+
+        if write_buf.is_empty() {
+            break;
+        }
+
+        let mut written = 0;
+        while written < write_buf.len() {
+            match raw_write(fd, &write_buf[written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"))
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    stream.writable(false).await?;
+                }
+                Err(e) => return Err(e),
+            }
+        }
+    }
+
     Ok(())
 }
 
@@ -213,6 +238,31 @@ async fn do_client_handshake(
                     }
                     Err(e) => return Err(e),
                 }
+            }
+        }
+    }
+
+    // ハンドシェイク完了後、バッファリングされた TLS レコードを全て送信
+    // TLS 1.3 ではセッションチケット等がハンドシェイク後に送信される場合がある
+    while conn.wants_write() {
+        let mut write_buf = Vec::new();
+        conn.write_tls(&mut write_buf)?;
+
+        if write_buf.is_empty() {
+            break;
+        }
+
+        let mut written = 0;
+        while written < write_buf.len() {
+            match raw_write(fd, &write_buf[written..]) {
+                Ok(0) => {
+                    return Err(io::Error::new(io::ErrorKind::WriteZero, "write returned 0"))
+                }
+                Ok(n) => written += n,
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    stream.writable(false).await?;
+                }
+                Err(e) => return Err(e),
             }
         }
     }
@@ -271,7 +321,9 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
                 Ok(0) if !self.conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                _ => {}
+                Ok(_) => {}  // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
+                Err(e) => return (Err(e), buf),  // Return actual errors
             }
 
             loop {
@@ -325,7 +377,9 @@ impl monoio::io::AsyncReadRent for SimpleTlsServerStream {
                 Ok(0) if !self.conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                _ => {}
+                Ok(_) => {}  // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
+                Err(e) => return (Err(e), buf),  // Return actual errors
             }
 
             loop {
@@ -473,7 +527,9 @@ impl monoio::io::AsyncReadRent for SimpleTlsClientStream {
                 Ok(0) if !self.conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                _ => {}
+                Ok(_) => {}  // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
+                Err(e) => return (Err(e), buf),  // Return actual errors
             }
 
             loop {
@@ -527,7 +583,9 @@ impl monoio::io::AsyncReadRent for SimpleTlsClientStream {
                 Ok(0) if !self.conn.wants_read() => {
                     return (Ok(0), buf);
                 }
-                _ => {}
+                Ok(_) => {}  // Not EOF yet, need more TLS data
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}  // Need more TLS data
+                Err(e) => return (Err(e), buf),  // Return actual errors
             }
 
             loop {

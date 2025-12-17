@@ -368,9 +368,11 @@ static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 thread_local! {
     static TLS_CONNECTOR: RustlsConnector = {
         // kTLSフィーチャーが有効な場合はシークレット抽出を有効化
-        // 実際のkTLS使用はRustlsConnector::with_ktls()で制御
+        // kTLSを有効にし、失敗時はrustlsにフォールバック
         let config = ktls_rustls::client_config(true);
         RustlsConnector::new(config)
+            .with_ktls(true)        // kTLSを有効化
+            .with_fallback(true)    // kTLS失敗時はrustlsにフォールバック
     };
 }
 
