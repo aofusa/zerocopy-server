@@ -85,7 +85,8 @@ reuseport_balancing = "cbpf"
 [tls]
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
-ktls_enabled = false  # kTLS有効化（Linux 5.15+、feature flag必須）
+ktls_enabled = true         # kTLS有効化（Linux 5.15+、feature flag必須）
+ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デフォルト: true）
 
 # ホストベースルーティング
 [host_routes]
@@ -126,6 +127,35 @@ cargo build --release --features ktls
 # 3. 設定ファイルで有効化（config.toml）
 # [tls]
 # ktls_enabled = true
+# ktls_fallback_enabled = true  # オプション
+```
+
+### フォールバック設定
+
+kTLSの有効化に失敗した場合の動作を `ktls_fallback_enabled` で制御できます：
+
+| 設定値 | 動作 |
+|--------|------|
+| `true`（デフォルト） | kTLS失敗時はrustlsで継続（graceful degradation） |
+| `false` | kTLS必須モード（失敗時は接続拒否） |
+
+**フォールバック無効化 (`ktls_fallback_enabled = false`) のメリット:**
+
+| 観点 | 効果 |
+|------|------|
+| パフォーマンス予測可能性 | すべての接続が確実にkTLSを使用 |
+| デバッグ容易性 | kTLS/rustls混在状態がなくなる |
+| 環境問題の早期発見 | kTLS利用不可時に即座に失敗 |
+
+**注意:** フォールバック無効時は、kTLSが利用できない環境で接続が失敗します。
+事前に `modprobe tls` でカーネルモジュールがロードされていることを確認してください。
+
+```toml
+[tls]
+cert_path = "/path/to/cert.pem"
+key_path = "/path/to/key.pem"
+ktls_enabled = true
+ktls_fallback_enabled = false  # kTLS必須モード
 ```
 
 ### 要件

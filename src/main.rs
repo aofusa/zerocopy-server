@@ -172,6 +172,10 @@ pub struct KtlsConfig {
     pub enable_tx: bool,
     /// TLS RX（受信）のkTLSを有効化
     pub enable_rx: bool,
+    /// kTLS有効化失敗時にrustlsへフォールバックするかどうか
+    /// false: kTLS必須（失敗時は接続拒否）
+    /// true: kTLS失敗時はrustlsで継続（デフォルト）
+    pub fallback_enabled: bool,
 }
 
 // ====================
@@ -637,6 +641,22 @@ struct TlsConfigSection {
     /// - カーネルバグの影響範囲に注意
     #[serde(default)]
     ktls_enabled: bool,
+    /// kTLS有効化失敗時にrustlsへフォールバックするかどうか
+    /// 
+    /// - false: kTLS必須モード（失敗時は接続拒否）
+    /// - true: kTLS失敗時はrustlsで継続（デフォルト）
+    /// 
+    /// フォールバック無効化のメリット:
+    /// - パフォーマンス予測可能性（確実にkTLSを使用）
+    /// - デバッグ容易性（kTLS/rustls混在なし）
+    /// - 環境問題の早期発見
+    #[serde(default = "default_ktls_fallback")]
+    ktls_fallback_enabled: bool,
+}
+
+/// kTLSフォールバックのデフォルト値（true = フォールバック有効）
+fn default_ktls_fallback() -> bool {
+    true
 }
 
 /// パフォーマンス設定
@@ -965,6 +985,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         enabled: config.tls.ktls_enabled,
         enable_tx: config.tls.ktls_enabled,
         enable_rx: config.tls.ktls_enabled,
+        fallback_enabled: config.tls.ktls_fallback_enabled,
     };
 
     // TLS設定（kTLS有効時はシークレット抽出を有効化）
@@ -1065,7 +1086,8 @@ fn main() {
     // TLS アクセプターを作成
     #[cfg(feature = "ktls")]
     let acceptor = RustlsAcceptor::new(loaded_config.tls_config.clone())
-        .with_ktls(loaded_config.ktls_config.enabled);
+        .with_ktls(loaded_config.ktls_config.enabled)
+        .with_fallback(loaded_config.ktls_config.fallback_enabled);
     
     #[cfg(not(feature = "ktls"))]
     let acceptor = simple_tls::SimpleTlsAcceptor::new(loaded_config.tls_config.clone())
@@ -1216,10 +1238,20 @@ fn log_ktls_status(ktls_config: &KtlsConfig) {
             if ktls_rustls::is_ktls_available() {
                 info!("kTLS: Enabled via rustls + ktls2 (TX={}, RX={})", ktls_config.enable_tx, ktls_config.enable_rx);
                 info!("kTLS: Kernel TLS offload active - reduced CPU usage expected");
+                if ktls_config.fallback_enabled {
+                    info!("kTLS: Fallback to rustls enabled (graceful degradation)");
+                } else {
+                    info!("kTLS: Fallback disabled (kTLS required, connections will fail if unavailable)");
+                }
             } else {
                 warn!("kTLS: Requested but kernel support not available");
                 warn!("kTLS: Ensure 'modprobe tls' has been run and kernel 5.15+ is used");
-                warn!("kTLS: Falling back to userspace TLS via rustls");
+                if ktls_config.fallback_enabled {
+                    warn!("kTLS: Falling back to userspace TLS via rustls");
+                } else {
+                    error!("kTLS: Fallback disabled but kTLS unavailable - connections will fail!");
+                    error!("kTLS: Either enable fallback or run 'modprobe tls'");
+                }
             }
         }
         // kTLS フィーチャー無効時

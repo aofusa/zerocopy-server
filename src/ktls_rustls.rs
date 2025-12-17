@@ -542,12 +542,16 @@ fn setup_tls_info(fd: RawFd, dir: Direction, info: &ktls2::CryptoInfo) -> io::Re
 
 /// TLS ハンドシェイクを実行しサーバー TLS ストリームを作成
 /// 
-/// kTLS の有効化に失敗した場合は、可能な限り rustls にフォールバックして
-/// 接続を継続します。致命的なエラーの場合のみエラーを返します。
+/// kTLS の有効化に失敗した場合の動作は `allow_fallback` で制御されます：
+/// - true: rustls にフォールバックして接続を継続
+/// - false: kTLS 必須モード、有効化失敗時はエラーを返す
+/// 
+/// 致命的なエラー（シークレット抽出後の失敗等）は常にエラーを返します。
 pub async fn accept(
     stream: TcpStream,
     config: Arc<ServerConfig>,
     enable_ktls: bool,
+    allow_fallback: bool,
 ) -> io::Result<KtlsServerStream> {
     let mut conn = ServerConnection::new(config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -566,12 +570,24 @@ pub async fn accept(
                 (mode, None)
             }
             KtlsEnableResult::Fallback(returned_conn, reason) => {
-                // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
-                ftlog::info!(
-                    "kTLS unavailable ({}), using rustls for this connection",
-                    reason
-                );
-                (TlsMode::Rustls, Some(returned_conn))
+                if allow_fallback {
+                    // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
+                    ftlog::info!(
+                        "kTLS unavailable ({}), using rustls for this connection",
+                        reason
+                    );
+                    (TlsMode::Rustls, Some(returned_conn))
+                } else {
+                    // フォールバック無効 - 接続を拒否
+                    ftlog::error!(
+                        "kTLS unavailable ({}) and fallback disabled, rejecting connection",
+                        reason
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("kTLS required but unavailable: {}", reason)
+                    ));
+                }
             }
             KtlsEnableResult::Fatal(e) => {
                 // シークレット抽出後の失敗等、致命的エラー
@@ -586,6 +602,7 @@ pub async fn accept(
     #[cfg(not(feature = "ktls"))]
     let (mode, conn_option) = {
         let _ = enable_ktls;
+        let _ = allow_fallback;
         (TlsMode::Rustls, Some(conn))
     };
 
@@ -598,13 +615,17 @@ pub async fn accept(
 
 /// TLS ハンドシェイクを実行しクライアント TLS ストリームを作成
 /// 
-/// kTLS の有効化に失敗した場合は、可能な限り rustls にフォールバックして
-/// 接続を継続します。致命的なエラーの場合のみエラーを返します。
+/// kTLS の有効化に失敗した場合の動作は `allow_fallback` で制御されます：
+/// - true: rustls にフォールバックして接続を継続
+/// - false: kTLS 必須モード、有効化失敗時はエラーを返す
+/// 
+/// 致命的なエラー（シークレット抽出後の失敗等）は常にエラーを返します。
 pub async fn connect(
     stream: TcpStream,
     config: Arc<ClientConfig>,
     server_name: ServerName<'static>,
     enable_ktls: bool,
+    allow_fallback: bool,
 ) -> io::Result<KtlsClientStream> {
     let mut conn = ClientConnection::new(config, server_name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -623,12 +644,24 @@ pub async fn connect(
                 (mode, None)
             }
             KtlsEnableResult::Fallback(returned_conn, reason) => {
-                // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
-                ftlog::info!(
-                    "kTLS unavailable ({}), using rustls for this connection",
-                    reason
-                );
-                (TlsMode::Rustls, Some(returned_conn))
+                if allow_fallback {
+                    // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
+                    ftlog::info!(
+                        "kTLS unavailable ({}), using rustls for this connection",
+                        reason
+                    );
+                    (TlsMode::Rustls, Some(returned_conn))
+                } else {
+                    // フォールバック無効 - 接続を拒否
+                    ftlog::error!(
+                        "kTLS unavailable ({}) and fallback disabled, rejecting connection",
+                        reason
+                    );
+                    return Err(io::Error::new(
+                        io::ErrorKind::Other,
+                        format!("kTLS required but unavailable: {}", reason)
+                    ));
+                }
             }
             KtlsEnableResult::Fatal(e) => {
                 // シークレット抽出後の失敗等、致命的エラー
@@ -643,6 +676,7 @@ pub async fn connect(
     #[cfg(not(feature = "ktls"))]
     let (mode, conn_option) = {
         let _ = enable_ktls;
+        let _ = allow_fallback;
         (TlsMode::Rustls, Some(conn))
     };
 
@@ -1134,6 +1168,8 @@ pub struct RustlsAcceptor {
     config: Arc<ServerConfig>,
     /// kTLS を有効化するかどうか
     enable_ktls: bool,
+    /// kTLS 有効化失敗時に rustls へフォールバックを許可するかどうか
+    allow_fallback: bool,
 }
 
 impl RustlsAcceptor {
@@ -1142,6 +1178,7 @@ impl RustlsAcceptor {
         RustlsAcceptor {
             config,
             enable_ktls: false,
+            allow_fallback: true,  // デフォルトはフォールバック有効
         }
     }
 
@@ -1151,9 +1188,18 @@ impl RustlsAcceptor {
         self
     }
 
+    /// kTLS 有効化失敗時のフォールバックを設定
+    /// 
+    /// - true: kTLS 失敗時は rustls で継続（デフォルト）
+    /// - false: kTLS 必須（失敗時は接続拒否）
+    pub fn with_fallback(mut self, allow: bool) -> Self {
+        self.allow_fallback = allow;
+        self
+    }
+
     /// TLS ハンドシェイクを実行
     pub async fn accept(&self, stream: TcpStream) -> io::Result<KtlsServerStream> {
-        accept(stream, self.config.clone(), self.enable_ktls).await
+        accept(stream, self.config.clone(), self.enable_ktls, self.allow_fallback).await
     }
 }
 
@@ -1163,6 +1209,8 @@ pub struct RustlsConnector {
     config: Arc<ClientConfig>,
     /// kTLS を有効化するかどうか
     enable_ktls: bool,
+    /// kTLS 有効化失敗時に rustls へフォールバックを許可するかどうか
+    allow_fallback: bool,
 }
 
 impl RustlsConnector {
@@ -1171,12 +1219,22 @@ impl RustlsConnector {
         RustlsConnector {
             config,
             enable_ktls: false,
+            allow_fallback: true,  // デフォルトはフォールバック有効
         }
     }
 
     /// kTLS を有効化
     pub fn with_ktls(mut self, enable: bool) -> Self {
         self.enable_ktls = enable;
+        self
+    }
+
+    /// kTLS 有効化失敗時のフォールバックを設定
+    /// 
+    /// - true: kTLS 失敗時は rustls で継続（デフォルト）
+    /// - false: kTLS 必須（失敗時は接続拒否）
+    pub fn with_fallback(mut self, allow: bool) -> Self {
+        self.allow_fallback = allow;
         self
     }
 
@@ -1188,7 +1246,7 @@ impl RustlsConnector {
     ) -> io::Result<KtlsClientStream> {
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        connect(stream, self.config.clone(), server_name, self.enable_ktls).await
+        connect(stream, self.config.clone(), server_name, self.enable_ktls, self.allow_fallback).await
     }
 }
 
