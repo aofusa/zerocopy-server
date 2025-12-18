@@ -1,13 +1,21 @@
+# ==========================================
+# High-Performance Reverse Proxy Server
+# 設定ファイル
+# ==========================================
+
 [server]
 listen = "0.0.0.0:443"
+
 # ワーカースレッド数（オプション）
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
 threads = 4
+
 
 # ==========================================
 # グローバルセキュリティ設定
 # ==========================================
 [security]
+
 # 権限降格設定（Linux専用）
 # rootで起動した場合、リスナー作成後に指定ユーザー/グループへ降格
 # 
@@ -22,7 +30,12 @@ threads = 4
 # グローバル同時接続上限（0 = 無制限）
 # max_concurrent_connections = 10000
 
+
+# ==========================================
+# パフォーマンス設定
+# ==========================================
 [performance]
+
 # SO_REUSEPORT の振り分け方式
 # "kernel" = カーネルデフォルト（3元タプルハッシュ）
 # "cbpf"   = クライアントIPベースのCBPF（キャッシュ効率向上、Linux 4.6+必須）
@@ -38,22 +51,31 @@ reuseport_balancing = "cbpf"
 #   - kTLS/splice時のカーネル連携で効果的（5-10%パフォーマンス向上）
 #
 # 要件（Linux）:
-#   - sudo echo 128 > /proc/sys/vm/nr_hugepages
-#   - または /etc/sysctl.conf に vm.nr_hugepages=128 を追加
+#   sudo echo 128 > /proc/sys/vm/nr_hugepages
+#   または /etc/sysctl.conf に vm.nr_hugepages=128 を追加
 #
 # 注意:
 #   - コンテナ環境（Docker/K8s）では無効化される可能性あり
 #   - 利用不可の場合は自動的に通常ページにフォールバック
 huge_pages_enabled = true
 
+
+# ==========================================
+# TLS設定
+# ==========================================
 [tls]
+
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
-ktls_enabled = false  # kTLS有効化（Linux 5.15+、feature flag必須）
+
+# kTLS有効化（Linux 5.15+、feature flag必須）
+ktls_enabled = false
+
 # kTLS有効化失敗時にrustlsへフォールバックするかどうか
 # false: kTLS必須（失敗時は接続拒否）
 # true: kTLS失敗時はrustlsで継続（デフォルト）
 ktls_fallback_enabled = false
+
 
 # ==========================================
 # ホストベースのルーティング定義
@@ -61,20 +83,32 @@ ktls_fallback_enabled = false
 # ホスト名が完全一致した場合のデフォルトバックエンド
 # 注意: path_routesより先に評価されるため、ホスト全体のデフォルトとして使用
 #
-# セキュリティ設定（security）オプション:
-#   - max_request_body_size: リクエストボディ最大サイズ（バイト、デフォルト: 10485760 = 10MB）
-#   - max_chunked_body_size: Chunked転送時の累積最大サイズ（バイト、デフォルト: 10485760）
-#   - client_header_timeout_secs: クライアントヘッダー受信タイムアウト（秒、デフォルト: 30）
-#   - client_body_timeout_secs: クライアントボディ受信タイムアウト（秒、デフォルト: 30）
-#   - allowed_methods: 許可するHTTPメソッド（配列、空 = すべて許可）
-#   - rate_limit_requests_per_min: 分間リクエスト数上限（0 = 無制限、スライディングウィンドウ方式）
-#   - backend_connect_timeout_secs: バックエンド接続タイムアウト（秒、デフォルト: 10）
-#   - max_idle_connections_per_host: ホストごとの最大アイドル接続数（デフォルト: 8）
-#   - idle_connection_timeout_secs: アイドル接続の維持時間（秒、デフォルト: 30）
-#   - max_request_header_size: リクエストヘッダー最大サイズ（バイト、デフォルト: 8192）
+# ルートごとのセキュリティ設定（security）オプション:
+#
+#   サイズ制限:
+#     max_request_body_size         リクエストボディ最大サイズ（バイト）     デフォルト: 10MB
+#     max_chunked_body_size         Chunked転送時の累積最大サイズ（バイト） デフォルト: 10MB
+#     max_request_header_size       リクエストヘッダー最大サイズ（バイト）   デフォルト: 8KB
+#
+#   タイムアウト:
+#     client_header_timeout_secs    クライアントヘッダー受信タイムアウト     デフォルト: 30秒
+#     client_body_timeout_secs      クライアントボディ受信タイムアウト       デフォルト: 30秒
+#     backend_connect_timeout_secs  バックエンド接続タイムアウト             デフォルト: 10秒
+#
+#   アクセス制御:
+#     allowed_methods               許可するHTTPメソッド（配列）             デフォルト: すべて許可
+#     rate_limit_requests_per_min   分間リクエスト数上限                     デフォルト: 0（無制限）
+#
+#   コネクションプール:
+#     max_idle_connections_per_host ホストごとの最大アイドル接続数           デフォルト: 8
+#     idle_connection_timeout_secs  アイドル接続の維持時間                   デフォルト: 30秒
+
 [host_routes]
+
 "example.com" = { type = "File", path = "/var/www/example", mode = "sendfile" }
+
 "api.example.com" = { type = "Proxy", url = "http://localhost:8080" }
+
 
 # ==========================================
 # パスベースのルーティング定義 (Nginx風)
@@ -84,85 +118,78 @@ ktls_fallback_enabled = false
 # ルーティングの挙動:
 # 
 # 1. 静的ファイル（完全一致）
-#    - パスが末尾スラッシュなし & 設定pathがファイル → 完全一致
-#    - リクエストが完全一致した場合のみファイルを返す
-#    - 例: "/robots.txt" → リクエスト "/robots.txt" にのみマッチ
-#          "/robots.txt/extra" → 404 Not Found
+#    パスが末尾スラッシュなし & 設定pathがファイル → 完全一致
+#    例: "/robots.txt" → リクエスト "/robots.txt" にのみマッチ
 #
 # 2. ディレクトリ配信（Alias動作）
-#    - 設定pathがディレクトリ → ディレクトリとして扱う
-#    - 末尾スラッシュの有無は問わない（どちらでも同じ動作）
-#    - プレフィックス除去後の残りパスをディレクトリに結合
-#    - ディレクトリ自体へのアクセス時はインデックスファイルを返す
-#    - 例: "/static/" または "/static" + path="/var/www/assets/"
-#          リクエスト "/static" → "/var/www/assets/index.html" (リダイレクトなし)
-#          リクエスト "/static/" → "/var/www/assets/index.html"
-#          リクエスト "/static/css/style.css" → "/var/www/assets/css/style.css"
+#    設定pathがディレクトリ → プレフィックス除去後の残りパスをディレクトリに結合
+#    例: "/static/" + path="/var/www/assets/"
+#        リクエスト "/static/css/style.css" → "/var/www/assets/css/style.css"
 #
-# 3. インデックスファイルの指定
-#    - index オプションでディレクトリアクセス時に返すファイルを指定可能
-#    - 未指定の場合はデフォルトで "index.html" を使用
-#    - 例: index = "dashboard.html"
+# 3. インデックスファイル
+#    index オプションでディレクトリアクセス時に返すファイルを指定
+#    未指定の場合はデフォルトで "index.html" を使用
 #
 # 4. プロキシ（Proxy Pass動作）
-#    - プレフィックス除去後の残りパスをバックエンドURLに結合
-#    - 例: "/api/" + url="http://backend:3000/app/"
-#          リクエスト "/api/v1/users" → "http://backend:3000/app/v1/users"
+#    プレフィックス除去後の残りパスをバックエンドURLに結合
+#    例: "/api/" + url="http://backend:3000/app/"
+#        リクエスト "/api/v1/users" → "http://backend:3000/app/v1/users"
 
 [path_routes."example.com"]
 
-# 1. 静的ファイル（完全一致）
+# ------------------------------------------
+# 静的ファイル（完全一致）
+# ------------------------------------------
 # リクエスト: /robots.txt → /var/www/robots.txt を返す
-# リクエスト: /robots.txt/hoge → 404 Not Found (ファイルの下は掘れない)
+# リクエスト: /robots.txt/hoge → 404 Not Found
 "/robots.txt" = { type = "File", path = "/var/www/robots.txt" }
 
-# 2. 静的ディレクトリ配信 (デフォルトインデックス)
-# リクエスト: /static/ → /var/www/assets/index.html を返す
-# リクエスト: /static/css/style.css → /var/www/assets/css/style.css を返す
+# ------------------------------------------
+# 静的ディレクトリ配信
+# ------------------------------------------
+# デフォルトインデックス (index.html)
 "/static/" = { type = "File", path = "/var/www/assets/", mode = "sendfile" }
 
-# 3. 静的ディレクトリ配信 (カスタムインデックス)
-# リクエスト: /user/ → /var/www/user/profile.html を返す
-# リクエスト: /user/avatar.png → /var/www/user/avatar.png を返す
-# リクエスト: /user/settings/config.json → /var/www/user/settings/config.json を返す
+# カスタムインデックス (profile.html)
 "/user/" = { type = "File", path = "/var/www/user/", index = "profile.html" }
 
-# 4. アプリケーションディレクトリ (カスタムインデックス)
-# リクエスト: /app/ → /var/www/app/dashboard.html を返す
-# リクエスト: /app/style.css → /var/www/app/style.css を返す
+# カスタムインデックス (dashboard.html)
 "/app/" = { type = "File", path = "/var/www/app/", index = "dashboard.html" }
 
-# 5. 末尾スラッシュなしのディレクトリ配信
-# 末尾スラッシュなしでもディレクトリ配信として動作（301リダイレクトなし）
-# リクエスト: /docs → /var/www/docs/index.html を直接返す
-# リクエスト: /docs/ → /var/www/docs/index.html を返す
-# リクエスト: /docs/guide/intro.html → /var/www/docs/guide/intro.html を返す
+# 末尾スラッシュなし（301リダイレクトなし）
 "/docs" = { type = "File", path = "/var/www/docs/" }
 
-# 6. 末尾スラッシュなしのプロキシ配信
-# 末尾スラッシュなしでもプロキシとして動作
-# リクエスト: /backend → http://localhost:3000/ へ転送
-# リクエスト: /backend/ → http://localhost:3000/ へ転送
-# リクエスト: /backend/users → http://localhost:3000/users へ転送
+# ------------------------------------------
+# プロキシ配信
+# ------------------------------------------
+# シンプルなプロキシ
 "/backend" = { type = "Proxy", url = "http://localhost:3000" }
 
-# 7. バックエンドAPIへのプロキシ (Proxy Pass動作 - 末尾スラッシュあり)
-# リクエスト: /api/v1/users
-# マッチ: /api/
-# 残りパス: v1/users
-# 解決URL: http://localhost:8080/app/ + v1/users → http://localhost:8080/app/v1/users
-# 
-# セキュリティ設定の例:
-#   - 許可メソッド: GET, POST, PUT のみ
-#   - ボディサイズ制限: 5MB
-#   - バックエンド接続タイムアウト: 5秒
-#   - レートリミット: 60リクエスト/分
-"/api/" = { type = "Proxy", url = "http://localhost:8080/app/", security = { allowed_methods = ["GET", "POST", "PUT"], max_request_body_size = 5242880, backend_connect_timeout_secs = 5, rate_limit_requests_per_min = 60 } }
+# セキュリティ設定付きプロキシ
+# - 許可メソッド: GET, POST, PUT のみ
+# - ボディサイズ制限: 5MB
+# - バックエンド接続タイムアウト: 5秒
+# - レートリミット: 60リクエスト/分
+"/api/" = { 
+    type = "Proxy", 
+    url = "http://localhost:8080/app/", 
+    security = { 
+        allowed_methods = ["GET", "POST", "PUT"], 
+        max_request_body_size = 5242880, 
+        backend_connect_timeout_secs = 5, 
+        rate_limit_requests_per_min = 60 
+    } 
+}
 
-# 8. ルート (SPAやデフォルトファイル)
+# ------------------------------------------
+# ルートパス
+# ------------------------------------------
 # "/" は完全一致（/へのリクエストのみマッチ）
 # catch-all動作はなし: マッチしないパスは404
-# 
-# セキュリティ設定の例:
-#   - 許可メソッド: GET のみ（静的ファイルなのでGET限定）
-"/" = { type = "File", path = "/var/www/index.html", security = { allowed_methods = ["GET"] } }
+"/" = { 
+    type = "File", 
+    path = "/var/www/index.html", 
+    security = { 
+        allowed_methods = ["GET"] 
+    } 
+}
