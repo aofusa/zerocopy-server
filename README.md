@@ -101,8 +101,27 @@ ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デ
 
 # パスベースルーティング
 [path_routes."example.com"]
-"/api/" = { type = "Proxy", url = "http://localhost:8080" }
-"/static/" = { type = "File", path = "/var/www/static", mode = "sendfile" }
+
+# 静的ファイル（完全一致）
+"/robots.txt" = { type = "File", path = "/var/www/robots.txt" }
+
+# ディレクトリ配信（末尾スラッシュあり）
+"/static/" = { type = "File", path = "/var/www/assets/", mode = "sendfile" }
+
+# ディレクトリ配信（末尾スラッシュなし - 同じ動作、リダイレクトなし）
+"/docs" = { type = "File", path = "/var/www/docs/" }
+
+# カスタムインデックスファイル
+"/user/" = { type = "File", path = "/var/www/user/", index = "profile.html" }
+
+# プロキシ（末尾スラッシュあり）
+"/api/" = { type = "Proxy", url = "http://localhost:8080/app/" }
+
+# プロキシ（末尾スラッシュなし - 同じ動作）
+"/backend" = { type = "Proxy", url = "http://localhost:3000" }
+
+# ルート
+"/" = { type = "File", path = "/var/www/index.html" }
 ```
 
 ## ルーティング
@@ -118,6 +137,71 @@ ktls_fallback_enabled = true # kTLS失敗時のrustlsフォールバック（デ
 |--------|------|--------|
 | `Proxy` | HTTPリバースプロキシ | `{ type = "Proxy", url = "http://localhost:8080" }` |
 | `File` | 静的ファイル配信 | `{ type = "File", path = "/var/www", mode = "sendfile" }` |
+
+### ルーティングの挙動（Nginx風）
+
+#### 1. 静的ファイル（完全一致）
+
+設定の `path` がファイルの場合、リクエストパスが完全一致した場合のみファイルを返します。
+
+```toml
+# /robots.txt → /var/www/robots.txt を返す
+# /robots.txt/extra → 404 Not Found（ファイルの下は掘れない）
+"/robots.txt" = { type = "File", path = "/var/www/robots.txt" }
+```
+
+#### 2. ディレクトリ配信（Alias動作）
+
+設定の `path` がディレクトリの場合、プレフィックスを除去した残りのパスをディレクトリに結合します。
+**末尾スラッシュの有無は問いません**（どちらでも同じ動作）。
+
+```toml
+# 末尾スラッシュあり（従来の書き方）
+"/static/" = { type = "File", path = "/var/www/assets/" }
+
+# 末尾スラッシュなし（同じ動作、301リダイレクトなし）
+"/docs" = { type = "File", path = "/var/www/docs/" }
+```
+
+| リクエスト | 設定 | 解決パス |
+|-----------|------|---------|
+| `/static/css/style.css` | `"/static/"` | `/var/www/assets/css/style.css` |
+| `/static/` | `"/static/"` | `/var/www/assets/index.html` |
+| `/docs` | `"/docs"` | `/var/www/docs/index.html` ※直接返す |
+| `/docs/` | `"/docs"` | `/var/www/docs/index.html` |
+| `/docs/guide/intro.html` | `"/docs"` | `/var/www/docs/guide/intro.html` |
+
+#### 3. インデックスファイルの指定
+
+`index` オプションでディレクトリアクセス時に返すファイルを指定できます。
+未指定の場合はデフォルトで `index.html` を使用します。
+
+```toml
+# /user/ → /var/www/user/profile.html を返す
+"/user/" = { type = "File", path = "/var/www/user/", index = "profile.html" }
+
+# /app/ → /var/www/app/dashboard.html を返す
+"/app/" = { type = "File", path = "/var/www/app/", index = "dashboard.html" }
+```
+
+#### 4. プロキシ（Proxy Pass動作）
+
+プレフィックスを除去した残りのパスをバックエンドURLに結合します。
+**末尾スラッシュの有無は問いません**。
+
+```toml
+# 末尾スラッシュあり
+"/api/" = { type = "Proxy", url = "http://localhost:8080/app/" }
+
+# 末尾スラッシュなし（同じ動作）
+"/backend" = { type = "Proxy", url = "http://localhost:3000" }
+```
+
+| リクエスト | 設定 | 転送先 |
+|-----------|------|--------|
+| `/api/v1/users` | `"/api/"` → `url = ".../app/"` | `http://localhost:8080/app/v1/users` |
+| `/backend` | `"/backend"` → `url = ".../"` | `http://localhost:3000/` |
+| `/backend/users` | `"/backend"` | `http://localhost:3000/users` |
 
 ### ファイル配信モード
 
