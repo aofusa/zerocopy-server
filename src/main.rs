@@ -573,6 +573,143 @@ fn drop_privileges(_security: &GlobalSecurityConfig) -> io::Result<()> {
 static SHUTDOWN_FLAG: AtomicBool = AtomicBool::new(false);
 
 // ====================
+// 同時接続数カウンター
+// ====================
+//
+// グローバルなアトミックカウンターで現在の接続数を追跡します。
+// max_concurrent_connections が設定されている場合、上限を超える接続は拒否されます。
+// ====================
+
+static CURRENT_CONNECTIONS: AtomicUsize = AtomicUsize::new(0);
+
+// ====================
+// レートリミッター（スライディングウィンドウ方式）
+// ====================
+//
+// クライアントIPごとに分間リクエスト数を追跡します。
+// スレッドローカルで管理し、ロックフリーで高パフォーマンスを実現。
+// ====================
+
+/// レートリミットのエントリ
+struct RateLimitEntry {
+    /// 現在のウィンドウ（分）のリクエスト数
+    current_count: u32,
+    /// 前のウィンドウ（分）のリクエスト数
+    previous_count: u32,
+    /// 現在のウィンドウの開始時刻（分単位のタイムスタンプ）
+    current_minute: u64,
+}
+
+impl RateLimitEntry {
+    fn new(current_minute: u64) -> Self {
+        Self {
+            current_count: 1,
+            previous_count: 0,
+            current_minute,
+        }
+    }
+    
+    /// リクエストを記録し、現在のレートを返す（スライディングウィンドウ方式）
+    /// 返り値: 推定される分間リクエスト数
+    fn record_request(&mut self, now_minute: u64, now_second_in_minute: u32) -> u32 {
+        if now_minute > self.current_minute {
+            if now_minute == self.current_minute + 1 {
+                // 次の分に移行
+                self.previous_count = self.current_count;
+                self.current_count = 1;
+            } else {
+                // 2分以上経過 - リセット
+                self.previous_count = 0;
+                self.current_count = 1;
+            }
+            self.current_minute = now_minute;
+        } else {
+            self.current_count += 1;
+        }
+        
+        // スライディングウィンドウによる推定レート計算
+        // 現在の分の経過割合に基づいて重み付け
+        let weight = (60 - now_second_in_minute) as f32 / 60.0;
+        let estimated = (self.previous_count as f32 * weight) + self.current_count as f32;
+        estimated.ceil() as u32
+    }
+}
+
+/// スレッドローカルなレートリミットマップ
+/// キー: クライアントIPアドレス（文字列）
+/// 値: RateLimitEntry
+struct RateLimiter {
+    entries: HashMap<String, RateLimitEntry>,
+    last_cleanup: std::time::Instant,
+}
+
+impl RateLimiter {
+    fn new() -> Self {
+        Self {
+            entries: HashMap::new(),
+            last_cleanup: std::time::Instant::now(),
+        }
+    }
+    
+    /// リクエストをチェックし、レート制限を超えていないか確認
+    /// 戻り値: (許可されたか, 現在のレート)
+    fn check_and_record(&mut self, client_ip: &str, limit: u64) -> (bool, u32) {
+        // 定期的なクリーンアップ（5分ごと）
+        if self.last_cleanup.elapsed().as_secs() > 300 {
+            self.cleanup();
+            self.last_cleanup = std::time::Instant::now();
+        }
+        
+        // 現在時刻を取得
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now_secs = now.as_secs();
+        let now_minute = now_secs / 60;
+        let now_second_in_minute = (now_secs % 60) as u32;
+        
+        let rate = if let Some(entry) = self.entries.get_mut(client_ip) {
+            entry.record_request(now_minute, now_second_in_minute)
+        } else {
+            self.entries.insert(client_ip.to_string(), RateLimitEntry::new(now_minute));
+            1
+        };
+        
+        (rate as u64 <= limit, rate)
+    }
+    
+    /// 古いエントリをクリーンアップ
+    fn cleanup(&mut self) {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default();
+        let now_minute = now.as_secs() / 60;
+        
+        // 2分以上古いエントリを削除
+        self.entries.retain(|_, entry| {
+            now_minute.saturating_sub(entry.current_minute) < 2
+        });
+    }
+}
+
+thread_local! {
+    static RATE_LIMITER: RefCell<RateLimiter> = RefCell::new(RateLimiter::new());
+}
+
+/// レートリミットをチェック
+/// 戻り値: レート制限内であればtrue
+fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
+    if limit == 0 {
+        return true; // 0 = 無制限
+    }
+    
+    RATE_LIMITER.with(|limiter| {
+        let (allowed, _rate) = limiter.borrow_mut().check_and_record(client_ip, limit);
+        allowed
+    })
+}
+
+// ====================
 // TLSコネクタ（スレッドローカル）
 // ====================
 
@@ -611,19 +748,22 @@ thread_local! {
 struct PooledConnection<T> {
     stream: T,
     created_at: std::time::Instant,
+    /// この接続のアイドルタイムアウト（秒）
+    idle_timeout_secs: u64,
 }
 
 impl<T> PooledConnection<T> {
-    fn new(stream: T) -> Self {
+    fn new(stream: T, idle_timeout_secs: u64) -> Self {
         Self {
             stream,
             created_at: std::time::Instant::now(),
+            idle_timeout_secs,
         }
     }
     
     /// 接続がまだ有効かどうかを判定（タイムアウトチェック）
     fn is_valid(&self) -> bool {
-        self.created_at.elapsed().as_secs() < BACKEND_POOL_IDLE_TIMEOUT_SECS
+        self.created_at.elapsed().as_secs() < self.idle_timeout_secs
     }
 }
 
@@ -652,16 +792,16 @@ impl HttpConnectionPool {
         None
     }
     
-    /// 接続をプールに返却
-    fn put(&mut self, key: String, stream: TcpStream) {
+    /// 接続をプールに返却（設定可能なパラメータ付き）
+    fn put(&mut self, key: String, stream: TcpStream, max_idle: usize, idle_timeout_secs: u64) {
         let queue = self.connections.entry(key).or_insert_with(VecDeque::new);
         
-        // 古い接続を削除
-        while queue.len() >= BACKEND_POOL_MAX_IDLE_PER_HOST {
+        // 古い接続を削除（設定可能な最大数を使用）
+        while queue.len() >= max_idle {
             queue.pop_front();
         }
         
-        queue.push_back(PooledConnection::new(stream));
+        queue.push_back(PooledConnection::new(stream, idle_timeout_secs));
     }
 }
 
@@ -690,16 +830,16 @@ impl HttpsConnectionPool {
         None
     }
     
-    /// 接続をプールに返却
-    fn put(&mut self, key: String, stream: ClientTls) {
+    /// 接続をプールに返却（設定可能なパラメータ付き）
+    fn put(&mut self, key: String, stream: ClientTls, max_idle: usize, idle_timeout_secs: u64) {
         let queue = self.connections.entry(key).or_insert_with(VecDeque::new);
         
-        // 古い接続を削除
-        while queue.len() >= BACKEND_POOL_MAX_IDLE_PER_HOST {
+        // 古い接続を削除（設定可能な最大数を使用）
+        while queue.len() >= max_idle {
             queue.pop_front();
         }
         
-        queue.push_back(PooledConnection::new(stream));
+        queue.push_back(PooledConnection::new(stream, idle_timeout_secs));
     }
 }
 
@@ -1754,6 +1894,9 @@ fn main() {
         return;
     }
 
+    // 同時接続数制限
+    let max_connections = loaded_config.global_security.max_concurrent_connections;
+    
     for thread_id in 0..num_threads {
         let acceptor_clone = acceptor.clone();
         let host_routes_clone = loaded_config.host_routes.clone();
@@ -1762,6 +1905,7 @@ fn main() {
         let addr = listen_addr;
         let balancing = reuseport_balancing;
         let workers = num_threads;
+        let max_conn = max_connections;
         
         // このスレッドに割り当てるコアIDを決定
         // コア数よりスレッド数が多い場合はモジュロ演算でラップアラウンド
@@ -1819,6 +1963,20 @@ fn main() {
                         }
                     };
                     
+                    // 同時接続数制限チェック
+                    if max_conn > 0 {
+                        let current = CURRENT_CONNECTIONS.load(Ordering::Relaxed);
+                        if current >= max_conn {
+                            warn!("[Thread {}] Connection limit reached ({}/{}), rejecting connection from {}", 
+                                  thread_id, current, max_conn, peer_addr);
+                            drop(stream);
+                            continue;
+                        }
+                    }
+                    
+                    // 接続カウンター増加
+                    CURRENT_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+                    
                     let _ = stream.set_nodelay(true);
                     
                     let acceptor = acceptor_clone.clone();
@@ -1828,6 +1986,8 @@ fn main() {
                     
                     monoio::spawn(async move {
                         handle_connection(stream, acceptor, host_routes, path_routes, peer_addr, ktls_cfg).await;
+                        // 接続カウンター減少
+                        CURRENT_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 
@@ -2055,7 +2215,7 @@ async fn handle_connection(
     acceptor: RustlsAcceptor,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
-    _peer_addr: SocketAddr,
+    peer_addr: SocketAddr,
     ktls_config: Arc<KtlsConfig>,
 ) {
     // TLSハンドシェイクにタイムアウトを設定
@@ -2076,8 +2236,11 @@ async fn handle_connection(
 
     // 警告抑制
     let _ = &ktls_config;
+    
+    // クライアントIPアドレスを文字列に変換
+    let client_ip = peer_addr.ip().to_string();
 
-    handle_requests(tls_stream, &host_routes, &path_routes).await;
+    handle_requests(tls_stream, &host_routes, &path_routes, &client_ip).await;
 }
 
 // kTLS 無効時の接続処理（rustls のみ）
@@ -2087,7 +2250,7 @@ async fn handle_connection(
     acceptor: simple_tls::SimpleTlsAcceptor,
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
-    _peer_addr: SocketAddr,
+    peer_addr: SocketAddr,
     _ktls_config: Arc<KtlsConfig>,
 ) {
     // TLSハンドシェイクにタイムアウトを設定
@@ -2104,8 +2267,11 @@ async fn handle_connection(
             return;
         }
     };
+    
+    // クライアントIPアドレスを文字列に変換
+    let client_ip = peer_addr.ip().to_string();
 
-    handle_requests(tls_stream, &host_routes, &path_routes).await;
+    handle_requests(tls_stream, &host_routes, &path_routes, &client_ip).await;
 }
 
 // ====================
@@ -2117,6 +2283,7 @@ async fn handle_requests(
     mut tls_stream: ServerTls,
     host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
     path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    client_ip: &str,
 ) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
 
@@ -2252,6 +2419,15 @@ async fn handle_requests(
                     let err_buf = ERR_MSG_REQUEST_TOO_LARGE.to_vec();
                     let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
                     return;
+                }
+                
+                // レートリミットチェック
+                if security.rate_limit_requests_per_min > 0 {
+                    if !check_rate_limit(client_ip, security.rate_limit_requests_per_min) {
+                        let err_buf = ERR_MSG_TOO_MANY_REQUESTS.to_vec();
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                        return;
+                    }
                 }
 
                 let start_time = OffsetDateTime::now_utc();
@@ -3076,7 +3252,9 @@ async fn proxy_http_pooled(
         Some((status_code, total, backend_wants_keep_alive)) => {
             // バックエンドがKeep-Aliveを許可している場合、プールに返却
             if backend_wants_keep_alive {
-                HTTP_POOL.with(|p| p.borrow_mut().put(pool_key.to_string(), backend_stream));
+                let max_idle = security.max_idle_connections_per_host;
+                let idle_timeout = security.idle_connection_timeout_secs;
+                HTTP_POOL.with(|p| p.borrow_mut().put(pool_key.to_string(), backend_stream, max_idle, idle_timeout));
             }
             Some((client_stream, status_code, total, client_wants_close))
         }
@@ -3517,7 +3695,9 @@ async fn proxy_https_pooled(
         Some((status_code, total, backend_wants_keep_alive)) => {
             // バックエンドがKeep-Aliveを許可している場合、プールに返却
             if backend_wants_keep_alive {
-                HTTPS_POOL.with(|p| p.borrow_mut().put(pool_key.to_string(), backend_stream));
+                let max_idle = security.max_idle_connections_per_host;
+                let idle_timeout = security.idle_connection_timeout_secs;
+                HTTPS_POOL.with(|p| p.borrow_mut().put(pool_key.to_string(), backend_stream, max_idle, idle_timeout));
             }
             Some((client_stream, status_code, total, client_wants_close))
         }

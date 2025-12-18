@@ -67,7 +67,7 @@ ktls_fallback_enabled = false
 #   - client_header_timeout_secs: クライアントヘッダー受信タイムアウト（秒、デフォルト: 30）
 #   - client_body_timeout_secs: クライアントボディ受信タイムアウト（秒、デフォルト: 30）
 #   - allowed_methods: 許可するHTTPメソッド（配列、空 = すべて許可）
-#   - rate_limit_requests_per_min: 分間リクエスト数上限（0 = 無制限）※未実装
+#   - rate_limit_requests_per_min: 分間リクエスト数上限（0 = 無制限、スライディングウィンドウ方式）
 #   - backend_connect_timeout_secs: バックエンド接続タイムアウト（秒、デフォルト: 10）
 #   - max_idle_connections_per_host: ホストごとの最大アイドル接続数（デフォルト: 8）
 #   - idle_connection_timeout_secs: アイドル接続の維持時間（秒、デフォルト: 30）
@@ -156,7 +156,8 @@ ktls_fallback_enabled = false
 #   - 許可メソッド: GET, POST, PUT のみ
 #   - ボディサイズ制限: 5MB
 #   - バックエンド接続タイムアウト: 5秒
-"/api/" = { type = "Proxy", url = "http://localhost:8080/app/", security = { allowed_methods = ["GET", "POST", "PUT"], max_request_body_size = 5242880, backend_connect_timeout_secs = 5 } }
+#   - レートリミット: 60リクエスト/分
+"/api/" = { type = "Proxy", url = "http://localhost:8080/app/", security = { allowed_methods = ["GET", "POST", "PUT"], max_request_body_size = 5242880, backend_connect_timeout_secs = 5, rate_limit_requests_per_min = 60 } }
 
 # 8. ルート (SPAやデフォルトファイル)
 # "/" は完全一致（/へのリクエストのみマッチ）
