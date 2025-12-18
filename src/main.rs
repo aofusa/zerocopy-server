@@ -855,7 +855,11 @@ impl<'de> serde::Deserialize<'de> for ReuseportBalancing {
 #[derive(Clone)]
 enum BackendConfig {
     Proxy { url: String },
-    File { path: String, mode: String },
+    /// File バックエンド設定
+    /// - path: ファイルまたはディレクトリのパス
+    /// - mode: "sendfile" または "memory"
+    /// - index: ディレクトリアクセス時に返すファイル名（デフォルト: "index.html"）
+    File { path: String, mode: String, index: Option<String> },
 }
 
 impl<'de> serde::Deserialize<'de> for BackendConfig {
@@ -882,6 +886,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut url: Option<String> = None;
                 let mut path: Option<String> = None;
                 let mut mode: Option<String> = None;
+                let mut index: Option<String> = None;
                 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -889,6 +894,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "url" => url = Some(map.next_value()?),
                         "path" => path = Some(map.next_value()?),
                         "mode" => mode = Some(map.next_value()?),
+                        "index" => index = Some(map.next_value()?),
                         _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
                     }
                 }
@@ -903,7 +909,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                     "File" | _ => {
                         let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
                         let mode = mode.unwrap_or_else(|| "sendfile".to_string());
-                        Ok(BackendConfig::File { path, mode })
+                        Ok(BackendConfig::File { path, mode, index })
                     }
                 }
             }
@@ -921,7 +927,11 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
 enum Backend {
     Proxy(Arc<ProxyTarget>),
     MemoryFile(Arc<Vec<u8>>, Arc<str>),  // (content, mime_type)
-    SendFile(Arc<PathBuf>, bool),         // (path, is_directory)
+    /// SendFile バックエンド
+    /// - Arc<PathBuf>: ベースパス
+    /// - bool: ディレクトリかどうか
+    /// - Option<Arc<str>>: インデックスファイル名（None = "index.html"）
+    SendFile(Arc<PathBuf>, bool, Option<Arc<str>>),
 }
 
 #[derive(Clone)]
@@ -976,82 +986,97 @@ impl ProxyTarget {
 }
 
 // ====================
-// Radix Tree ベースの高速パスルーター
+// nginx風パスルーター（最長プレフィックス一致）
 // ====================
 //
-// matchit クレートを使用した O(log n) のパスマッチングを実現。
-// 従来の線形探索 O(n) から大幅に高速化。
+// nginxの location ディレクティブと同様のマッチング動作を実現。
 //
-// ## パフォーマンス比較
+// ## nginxのマッチング規則（優先順位順）
 //
-// | ルート数 | 線形探索 (O(n)) | Radix Tree (O(log n)) |
-// |----------|-----------------|------------------------|
-// | 10       | ~100ns          | ~50ns                  |
-// | 100      | ~1μs            | ~100ns                 |
-// | 1000     | ~10μs           | ~150ns                 |
+// | 優先度 | nginx記法 | 説明                     | 本実装での対応       |
+// |--------|-----------|--------------------------|---------------------|
+// | 1      | = /path   | 完全一致                 | 将来対応予定         |
+// | 2      | ^~ /path  | 優先プレフィックス       | 将来対応予定         |
+// | 3      | ~ regex   | 正規表現                 | 対応なし             |
+// | 4      | /path     | **最長プレフィックス一致** | ✓ 実装済み         |
 //
-// ## 実装詳細
+// ## 動作例
 //
-// - プレフィックスマッチには `/{*rest}` ワイルドカードを使用
-// - 完全一致と前方一致の両方をサポート
-// - スレッドセーフ（Arc経由で共有）
+// 設定:
+//   "/static" = { path = "./www/static/" }
+//   "/api"    = { url = "http://backend:8080" }
+//   "/"       = { path = "./www/index.html" }
+//
+// リクエスト → マッチするルート:
+//   /                     → /       (完全一致)
+//   /static/css/style.css → /static (プレフィックスマッチ)
+//   /static               → /static (完全一致)
+//   /api/users            → /api    (プレフィックスマッチ)
+//   /favicon.ico          → 404     (マッチなし)
+//   /unknown              → 404     (マッチなし)
+//
+// ## パフォーマンス
+//
+// matchit (Radix Tree) を使用: O(log n)
+// | ルート数 | 線形探索 O(n) | Radix Tree O(log n) |
+// |----------|---------------|---------------------|
+// | 10       | ~100ns        | ~50ns               |
+// | 100      | ~1μs          | ~100ns              |
+// | 1000     | ~10μs         | ~150ns              |
 
-/// Radix Treeベースの高速パスルーター
+/// nginx風パスルーター
+/// 
+/// 最長プレフィックス一致による高速なルーティングを提供。
+/// "/" が登録されている場合はcatch-all（フォールバック）として機能。
 #[derive(Clone)]
 struct PathRouter {
     /// matchit Router（Radix Tree実装）
-    /// 値としてBackendへの参照用インデックスを保持
     router: Arc<matchit::Router<usize>>,
-    /// Backendの実体を保持（インデックスでアクセス）
+    /// Backendの実体を保持
     backends: Arc<Vec<(Arc<[u8]>, Backend)>>,
 }
 
 impl PathRouter {
     /// 新しいPathRouterを構築
     /// 
-    /// # Arguments
-    /// * `entries` - (プレフィックス, バックエンド) のペアのリスト
-    /// 
-    /// # Returns
-    /// 構築されたPathRouter、またはエラー
+    /// nginx風の最長プレフィックス一致を実現するため、
+    /// 各プレフィックスに対して完全一致とワイルドカードの両方を登録。
     fn new(entries: Vec<(String, Backend)>) -> io::Result<Self> {
         let mut router = matchit::Router::new();
         let mut backends = Vec::with_capacity(entries.len());
         
-        for (i, (prefix, backend)) in entries.into_iter().enumerate() {
-            // プレフィックスをmatchit形式に変換
-            // 例: "/api" → "/api/{*rest}" (サブパスにマッチ)
-            
+        // バックエンドを登録（インデックスを確定）
+        for (prefix, backend) in entries.iter() {
+            backends.push((Arc::from(prefix.as_bytes()), backend.clone()));
+        }
+        
+        // ルートを登録
+        // matchitの優先順位: 静的パス > パラメータ > ワイルドカード
+        // より具体的なプレフィックスが自動的に優先される
+        for (i, (prefix, _)) in entries.iter().enumerate() {
             if prefix == "/" {
-                // ルートパス "/" は特別扱い
-                // 1. "/" への完全一致を登録
-                if router.insert("/".to_string(), i).is_err() {
-                    // 既に登録済みの場合は無視
-                }
-                // 2. "/{*rest}" でサブパス全体にマッチ
-                if router.insert("/{*rest}".to_string(), i).is_err() {
-                    // 既に登録済みの場合は無視
+                // "/" は完全一致のみ（"/" へのリクエストのみマッチ）
+                // catch-all動作なし: マッチしないパスは404エラー
+                if let Err(e) = router.insert("/".to_string(), i) {
+                    warn!("Route registration failed for '/': {}", e);
                 }
             } else if prefix.ends_with('/') {
-                // "/api/" → "/api/{*rest}"
-                let route = format!("{prefix}{{*rest}}");
-                if router.insert(route, i).is_err() {
-                    // 既に登録済みの場合は無視
-                }
+                // "/api/" スタイル（ディレクトリ）
+                let base = prefix.trim_end_matches('/');
+                
+                // "/api" への完全一致
+                let _ = router.insert(base.to_string(), i);
+                // "/api/" への完全一致
+                let _ = router.insert(prefix.clone(), i);
+                // "/api/{*rest}" でサブパスにマッチ
+                let _ = router.insert(format!("{base}/{{*rest}}"), i);
             } else {
-                // "/api" → 完全一致と前方一致の両方を登録
-                // 1. 完全一致 "/api"
-                if router.insert(prefix.clone(), i).is_err() {
-                    // 既に登録済みの場合は無視
-                }
-                // 2. サブパス "/api/{*rest}"
-                let route = format!("{prefix}/{{*rest}}");
-                if router.insert(route, i).is_err() {
-                    // 既に登録済みの場合は無視
-                }
+                // "/api" スタイル（通常のプレフィックス）
+                // 1. "/api" への完全一致
+                let _ = router.insert(prefix.clone(), i);
+                // 2. "/api/{*rest}" でサブパスにマッチ
+                let _ = router.insert(format!("{prefix}/{{*rest}}"), i);
             }
-            
-            backends.push((Arc::from(prefix.as_bytes()), backend));
         }
         
         Ok(Self {
@@ -1060,13 +1085,10 @@ impl PathRouter {
         })
     }
     
-    /// パスに最長一致するバックエンドを検索
+    /// パスに最長一致するバックエンドを検索（nginx風）
     /// 
-    /// # Arguments
-    /// * `path` - 検索対象のパス（バイト列）
-    /// 
-    /// # Returns
-    /// マッチしたプレフィックスとバックエンドのタプル、またはNone
+    /// matchitが内部でRadix Treeを使用し、
+    /// 最も具体的な（＝最長の）プレフィックスを自動的に選択。
     fn find_longest(&self, path: &[u8]) -> Option<(&[u8], &Backend)> {
         let path_str = std::str::from_utf8(path).ok()?;
         
@@ -1365,9 +1387,12 @@ fn load_backend(config: &BackendConfig) -> io::Result<Backend> {
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?;
             Ok(Backend::Proxy(Arc::new(target)))
         }
-        BackendConfig::File { path, mode } => {
+        BackendConfig::File { path, mode, index } => {
             let metadata = fs::metadata(path)?;
             let is_dir = metadata.is_dir();
+            // インデックスファイル名を Arc<str> に変換（None = デフォルトで "index.html"）
+            let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
+            
             match mode.as_str() {
                 "memory" => {
                     if is_dir {
@@ -1378,7 +1403,7 @@ fn load_backend(config: &BackendConfig) -> io::Result<Backend> {
                     
                     Ok(Backend::MemoryFile(Arc::new(data), Arc::from(mime_type.as_ref())))
                 }
-                "sendfile" | "" => Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir)),
+                "sendfile" | "" => Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file)),
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
         }
@@ -2136,6 +2161,25 @@ async fn handle_backend(
             handle_proxy(tls_stream, &target, method, req_path, &prefix, content_length, is_chunked, headers, initial_body, client_wants_close).await
         }
         Backend::MemoryFile(data, mime_type) => {
+            // ファイル完全一致チェック
+            // MemoryFileはファイル指定なので、プレフィックス以降にパスがあれば404
+            let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+            let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
+            
+            let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+                &path_str[prefix_str.len()..]
+            } else {
+                ""
+            };
+            
+            let clean_remainder = remainder.trim_matches('/');
+            if !clean_remainder.is_empty() {
+                // ファイル指定なのにさらにパスが続いている場合は404
+                let err_buf = ERR_MSG_NOT_FOUND.to_vec();
+                let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                return Some((tls_stream, 404, 0, true));
+            }
+            
             // Keep-Alive対応: クライアントの要求に応じてConnectionヘッダーを動的に生成
             let mut header = Vec::with_capacity(HEADER_BUF_CAPACITY);
             header.extend_from_slice(HTTP_200_PREFIX);
@@ -2167,8 +2211,8 @@ async fn handle_backend(
                 _ => None,
             }
         }
-        Backend::SendFile(base_path, is_dir) => {
-            handle_sendfile(tls_stream, &base_path, is_dir, req_path, &prefix, client_wants_close).await
+        Backend::SendFile(base_path, is_dir, index_file) => {
+            handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close).await
         }
     }
 }
@@ -3793,29 +3837,64 @@ async fn handle_sendfile(
     mut tls_stream: ServerTls,
     base_path: &Path,
     is_dir: bool,
+    index_filename: Option<&str>,
     req_path: &[u8],
     prefix: &[u8],
     client_wants_close: bool,
 ) -> Option<(ServerTls, u16, u64, bool)> {
-    let full_path = if is_dir {
-        let path_str = std::str::from_utf8(req_path).unwrap_or("/");
-        let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
-        let sub_path = path_str.strip_prefix(prefix_str).unwrap_or(path_str);
-        let sub_path = sub_path.trim_start_matches('/');
-        
-        // パストラバーサル防止
-        if sub_path.contains("..") {
-            let err_buf = ERR_MSG_FORBIDDEN.to_vec();
-            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-            return Some((tls_stream, 403, 0, true));  // エラー時は接続を閉じる
-        }
-        
-        let mut path = base_path.to_path_buf();
-        if !sub_path.is_empty() {
-            path.push(sub_path);
-        }
-        path
+    // --- パス解決ロジック（Nginx風） ---
+    // 
+    // 1. ファイル指定（is_dir=false）: 完全一致のみ
+    //    例: prefix="/robots.txt", path="./www/robots.txt"
+    //    - リクエスト "/robots.txt" → OK（ファイルを返す）
+    //    - リクエスト "/robots.txt/extra" → 404（ファイルの下には入れない）
+    //
+    // 2. ディレクトリ指定（is_dir=true）: プレフィックス除去後のパスを結合
+    //    例: prefix="/static/", path="./www/assets/"
+    //    - リクエスト "/static/css/style.css" → "./www/assets/css/style.css"
+    //    - リクエスト "/static/" → "./www/assets/{index_filename}" (デフォルト: index.html)
+    
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+    
+    // プレフィックスを除去して「残りパス」を取得
+    let remainder = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+        &path_str[prefix_str.len()..]
     } else {
+        path_str
+    };
+    
+    // パストラバーサル防止（簡易チェック）
+    if remainder.contains("..") {
+        let err_buf = ERR_MSG_FORBIDDEN.to_vec();
+        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+        return Some((tls_stream, 403, 0, true));
+    }
+    
+    let full_path = if is_dir {
+        // ケースA: ディレクトリへのルーティング（Alias動作）
+        // config: path = "./www/static/"
+        // req: /static/css/style.css → remainder: css/style.css
+        // result: ./www/static/css/style.css
+        let sub_path = remainder.trim_start_matches('/');
+        let mut p = base_path.to_path_buf();
+        if !sub_path.is_empty() {
+            p.push(sub_path);
+        }
+        p
+    } else {
+        // ケースB: ファイルへの直接ルーティング（完全一致）
+        // config: path = "./www/robots.txt"
+        // req: /robots.txt → remainder: "" (OK)
+        // req: /robots.txt/extra → remainder: "/extra" (NG → 404)
+        
+        let clean_remainder = remainder.trim_matches('/');
+        if !clean_remainder.is_empty() {
+            // ファイル指定なのにさらにパスが続いている場合は404
+            let err_buf = ERR_MSG_NOT_FOUND.to_vec();
+            let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+            return Some((tls_stream, 404, 0, true));
+        }
         base_path.to_path_buf()
     };
 
@@ -3838,15 +3917,18 @@ async fn handle_sendfile(
         }
     }
 
-    // ディレクトリの場合はindex.htmlを試す
+    // ディレクトリの場合はインデックスファイルを試す
+    // 設定されたファイル名、なければデフォルトの "index.html" を使用
     let final_path = if full_path_canonical.is_dir() {
-        let index_path = full_path_canonical.join("index.html");
+        let filename = index_filename.unwrap_or("index.html");
+        let index_path = full_path_canonical.join(filename);
         if index_path.exists() {
             index_path
         } else {
+            // インデックスファイルが存在しない場合は403 Forbidden（ディレクトリリスティング禁止）
             let err_buf = ERR_MSG_FORBIDDEN.to_vec();
             let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
-            return Some((tls_stream, 403, 0, true));  // エラー時は接続を閉じる
+            return Some((tls_stream, 403, 0, true));
         }
     } else {
         full_path_canonical

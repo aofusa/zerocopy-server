@@ -37,12 +37,77 @@ ktls_enabled = false  # kTLS有効化（Linux 5.15+、feature flag必須）
 # true: kTLS失敗時はrustlsで継続（デフォルト）
 ktls_fallback_enabled = false
 
-# ホストベースルーティング
+# ==========================================
+# ホストベースのルーティング定義
+# ==========================================
+# ホスト名が完全一致した場合のデフォルトバックエンド
+# 注意: path_routesより先に評価されるため、ホスト全体のデフォルトとして使用
 [host_routes]
 "example.com" = { type = "File", path = "/var/www/example", mode = "sendfile" }
 "api.example.com" = { type = "Proxy", url = "http://localhost:8080" }
 
-# パスベースルーティング
+# ==========================================
+# パスベースのルーティング定義 (Nginx風)
+# ==========================================
+# 優先順位: 最長プレフィックス一致 (PathRouterの実装により自動解決)
+#
+# ルーティングの挙動:
+# 
+# 1. 静的ファイル（完全一致）
+#    - パスが末尾スラッシュなし & 設定pathがファイル → 完全一致
+#    - リクエストが完全一致した場合のみファイルを返す
+#    - 例: "/robots.txt" → リクエスト "/robots.txt" にのみマッチ
+#          "/robots.txt/extra" → 404 Not Found
+#
+# 2. ディレクトリ配信（Alias動作）
+#    - パスが末尾スラッシュあり → ディレクトリとして扱う
+#    - プレフィックス除去後の残りパスをディレクトリに結合
+#    - ディレクトリ自体へのアクセス時はインデックスファイルを返す
+#    - 例: "/static/" + path="/var/www/assets/"
+#          リクエスト "/static/css/style.css" → "/var/www/assets/css/style.css"
+#          リクエスト "/static/" → "/var/www/assets/index.html"
+#
+# 3. インデックスファイルの指定
+#    - index オプションでディレクトリアクセス時に返すファイルを指定可能
+#    - 未指定の場合はデフォルトで "index.html" を使用
+#    - 例: index = "dashboard.html"
+#
+# 4. プロキシ（Proxy Pass動作）
+#    - プレフィックス除去後の残りパスをバックエンドURLに結合
+#    - 例: "/api/" + url="http://backend:3000/app/"
+#          リクエスト "/api/v1/users" → "http://backend:3000/app/v1/users"
+
 [path_routes."example.com"]
-"/api/" = { type = "Proxy", url = "http://localhost:8080" }
-"/static/" = { type = "File", path = "/var/www/static", mode = "sendfile" }
+
+# 1. 静的ファイル（完全一致）
+# リクエスト: /robots.txt → /var/www/robots.txt を返す
+# リクエスト: /robots.txt/hoge → 404 Not Found (ファイルの下は掘れない)
+"/robots.txt" = { type = "File", path = "/var/www/robots.txt" }
+
+# 2. 静的ディレクトリ配信 (デフォルトインデックス)
+# リクエスト: /static/ → /var/www/assets/index.html を返す
+# リクエスト: /static/css/style.css → /var/www/assets/css/style.css を返す
+"/static/" = { type = "File", path = "/var/www/assets/", mode = "sendfile" }
+
+# 3. 静的ディレクトリ配信 (カスタムインデックス)
+# リクエスト: /user/ → /var/www/user/profile.html を返す
+# リクエスト: /user/avatar.png → /var/www/user/avatar.png を返す
+# リクエスト: /user/settings/config.json → /var/www/user/settings/config.json を返す
+"/user/" = { type = "File", path = "/var/www/user/", index = "profile.html" }
+
+# 4. アプリケーションディレクトリ (カスタムインデックス)
+# リクエスト: /app/ → /var/www/app/dashboard.html を返す
+# リクエスト: /app/style.css → /var/www/app/style.css を返す
+"/app/" = { type = "File", path = "/var/www/app/", index = "dashboard.html" }
+
+# 5. バックエンドAPIへのプロキシ (Proxy Pass動作)
+# リクエスト: /api/v1/users
+# マッチ: /api/
+# 残りパス: v1/users
+# 解決URL: http://localhost:8080/app/ + v1/users → http://localhost:8080/app/v1/users
+"/api/" = { type = "Proxy", url = "http://localhost:8080/app/" }
+
+# 6. ルート (SPAやデフォルトファイル)
+# "/" は完全一致（/へのリクエストのみマッチ）
+# catch-all動作はなし: マッチしないパスは404
+"/" = { type = "File", path = "/var/www/index.html" }
