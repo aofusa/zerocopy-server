@@ -37,6 +37,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **Prometheusメトリクス**: `/__metrics` エンドポイントでリクエスト数、レイテンシ等を出力
 
 ### セキュリティ
+- **HTTP to HTTPSリダイレクト**: HTTPアクセスを自動的にHTTPSへ301リダイレクト
 - **同時接続数制限**: グローバルな接続数上限設定
 - **レートリミッター**: スライディングウィンドウ方式のレート制限
 - **IP制限**: CIDR対応のIPアドレスフィルタリング
@@ -76,6 +77,41 @@ cargo build --release --features ktls
 | `-c, --config <PATH>` | 設定ファイルのパス | `/etc/zerocopy-server/config.toml` |
 | `-h, --help` | ヘルプメッセージを表示 | - |
 | `-V, --version` | バージョン情報を表示 | - |
+
+## HTTP to HTTPS リダイレクト
+
+HTTPアクセスを自動的にHTTPSにリダイレクトする機能です。
+
+### 設定
+
+```toml
+[server]
+listen = "0.0.0.0:443"
+http = "0.0.0.0:80"  # HTTPリダイレクトを有効化
+```
+
+### 動作
+
+- `http://example.com/path` へのアクセスは `https://example.com/path` に301リダイレクト
+- Hostヘッダーからドメイン名を取得し、リダイレクト先URLを構築
+- ポート番号が含まれている場合は自動的に除去（HTTPSのデフォルトポート443を使用）
+
+### セキュリティ考慮事項
+
+- **リダイレクト専用**: HTTPではリダイレクトのみを行い、コンテンツは一切配信しません
+- **301 Moved Permanently**: ブラウザがリダイレクト先をキャッシュするため、2回目以降は直接HTTPSにアクセスします
+- **初回アクセス**: 初回HTTPアクセス時のみ平文通信が発生しますが、コンテンツは含まれません
+
+### 注意事項
+
+- 特権ポート（80番）を使用するため、以下のいずれかが必要です：
+  1. rootで起動（権限降格機能と併用を推奨）
+  2. `CAP_NET_BIND_SERVICE`ケイパビリティを付与
+
+```bash
+# ケイパビリティを付与する場合
+sudo setcap 'cap_net_bind_service=+ep' ./target/release/zerocopy-server
+```
 
 ## TLS証明書の生成
 
@@ -128,6 +164,9 @@ cargo build --release --features ktls
 ```toml
 [server]
 listen = "0.0.0.0:443"
+# HTTP to HTTPSリダイレクト（オプション）
+# HTTPアクセスを自動的にHTTPSにリダイレクト（301 Moved Permanently）
+http = "0.0.0.0:80"
 # ワーカースレッド数（オプション）
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
 threads = 4
