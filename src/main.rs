@@ -95,6 +95,42 @@ static GLOBAL: MiMalloc = MiMalloc;
 #[cfg(feature = "ktls")]
 mod ktls_rustls;
 
+// ====================
+// HTTP/2・HTTP/3 モジュール
+// ====================
+//
+// HTTP/2 (h2): TLS ALPN ネゴシエーションによる HTTP/2 サポート
+// HTTP/3 (h3): QUIC/UDP ベースの HTTP/3 サポート
+
+/// プロトコル抽象化（ALPN ネゴシエーション）
+#[cfg(feature = "http2")]
+pub mod protocol;
+
+/// HTTP/2 プロトコル実装 (RFC 7540)
+/// - HPACK ヘッダー圧縮
+/// - フレーム処理（DATA, HEADERS, SETTINGS, etc.）
+/// - ストリーム管理・フロー制御
+/// - コネクション管理
+#[cfg(feature = "http2")]
+pub mod http2;
+
+/// HTTP/3 プロトコル実装 (RFC 9114)
+/// - QUIC プロトコル (RFC 9000)
+/// - QPACK ヘッダー圧縮 (RFC 9204)
+/// - HTTP/3 フレーム処理
+/// 
+/// 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
+/// GSO/GRO による高パフォーマンス UDP 処理を使用
+#[cfg(feature = "http3")]
+pub mod http3;
+
+/// UDP ソケット (HTTP/3 用)
+/// - monoio io_uring 統合
+/// - GSO (Generic Segmentation Offload) サポート
+/// - GRO (Generic Receive Offload) サポート
+#[cfg(feature = "http3")]
+pub mod udp;
+
 use httparse::{Request, Status, Header};
 use monoio::fs::OpenOptions;
 use monoio::buf::{IoBuf, IoBufMut};
@@ -2136,6 +2172,48 @@ struct ServerConfigSection {
     /// 未指定または0の場合はCPUコア数と同じスレッド数を使用
     #[serde(default)]
     threads: Option<usize>,
+    
+    // ====================
+    // HTTP/2・HTTP/3 設定
+    // ====================
+    
+    /// HTTP/2 を有効化するかどうか
+    /// 
+    /// TLS ALPN ネゴシエーションにより HTTP/2 (h2) をサポートします。
+    /// HTTP/1.1 へのフォールバックも可能です。
+    /// 
+    /// 効果:
+    /// - ストリーム多重化によるレイテンシ削減
+    /// - HPACK ヘッダー圧縮によるオーバーヘッド削減
+    /// - サーバープッシュ（無効化推奨）
+    /// 
+    /// 注意: `--features http2` でビルドする必要があります
+    #[serde(default)]
+    http2_enabled: bool,
+    
+    /// HTTP/3 を有効化するかどうか
+    /// 
+    /// QUIC/UDP ベースの HTTP/3 プロトコルをサポートします。
+    /// 
+    /// 効果:
+    /// - 0-RTT 接続確立
+    /// - 接続マイグレーション
+    /// - Head-of-Line ブロッキング解消
+    /// 
+    /// 注意: 
+    /// - `--features http3` でビルドする必要があります
+    /// - HTTP/3 は UDP ベースのため kTLS は使用不可
+    /// - GSO/GRO による高パフォーマンス UDP 処理を使用
+    #[serde(default)]
+    http3_enabled: bool,
+    
+    /// HTTP/3 リスナーアドレス (UDP)
+    /// 
+    /// HTTP/3 用の UDP ソケットをバインドするアドレス。
+    /// 未指定の場合は `listen` と同じアドレスを使用します。
+    /// 例: "0.0.0.0:443"
+    #[serde(default)]
+    http3_listen: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -4275,6 +4353,53 @@ fn create_listener(
 // ====================
 // 接続処理
 // ====================
+
+// ====================
+// HTTP/2 ハンドラー
+// ====================
+//
+// HTTP/2 (RFC 7540) 接続を処理します。
+// ALPN ネゴシエーションで h2 が選択された場合に呼び出されます。
+
+/// HTTP/2 リクエストを処理
+/// 
+/// HTTP/2 コネクションのメインループを実行し、各ストリームのリクエストを処理します。
+#[cfg(feature = "http2")]
+#[allow(dead_code)]
+async fn handle_http2_connection<S>(
+    tls_stream: S,
+    _host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
+    _path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    client_ip: &str,
+) where
+    S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
+{
+    use http2::{Http2Connection, Http2Settings};
+    
+    // HTTP/2 設定（高パフォーマンス設定を使用）
+    let settings = Http2Settings::high_performance();
+    
+    // HTTP/2 コネクションを作成
+    let mut conn = Http2Connection::new(tls_stream, settings);
+    
+    // ハンドシェイク（プリフェース確認 + SETTINGS 交換）
+    if let Err(e) = conn.handshake().await {
+        warn!("[HTTP/2] Handshake error: {}", e);
+        return;
+    }
+    
+    info!("[HTTP/2] Connection established from {}", client_ip);
+    
+    // メインループ: リクエストを処理
+    // 簡略化: 各リクエストに対してダミーレスポンスを返す
+    let result = conn.run_simple().await;
+    
+    if let Err(e) = result {
+        warn!("[HTTP/2] Connection error: {}", e);
+    }
+    
+    info!("[HTTP/2] Connection closed from {}", client_ip);
+}
 
 // kTLS 有効時の接続処理（rustls + ktls2）
 #[cfg(feature = "ktls")]

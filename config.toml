@@ -24,6 +24,43 @@ listen = "0.0.0.0:443"
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
 threads = 4
 
+# ====================
+# HTTP/2・HTTP/3 設定
+# ====================
+#
+# HTTP/2 と HTTP/3 のサポートを有効化できます。
+# 各プロトコルを使用するには対応するフィーチャーでビルドする必要があります:
+#   HTTP/2: cargo build --features http2
+#   HTTP/3: cargo build --features http3
+#   両方:   cargo build --features all-protocols
+
+# HTTP/2 を有効化（TLS ALPN ネゴシエーション）
+#
+# 効果:
+# - ストリーム多重化によるレイテンシ削減
+# - HPACK ヘッダー圧縮によるオーバーヘッド削減
+# - HTTP/1.1 へのフォールバック対応
+#
+# http2_enabled = true
+
+# HTTP/3 を有効化（QUIC/UDP ベース）
+#
+# 効果:
+# - 0-RTT 接続確立
+# - Head-of-Line ブロッキング解消
+# - 接続マイグレーション
+#
+# 注意:
+# - UDP ベースのため kTLS は使用不可
+# - GSO/GRO による高パフォーマンス UDP 処理を使用
+#
+# http3_enabled = true
+
+# HTTP/3 リスナーアドレス (UDP)
+# 未指定の場合は listen と同じアドレスを使用
+#
+# http3_listen = "0.0.0.0:443"
+
 
 # ====================
 # ログ設定（非同期ログの最適化）

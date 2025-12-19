@@ -17,6 +17,20 @@ default = []
 # ビルド方法: cargo build --features ktls
 ktls = ["ktls2"]
 
+# HTTP/2 サポート
+# ALPN ネゴシエーションにより HTTP/2 (h2) を使用
+# kTLS と併用可能: cargo build --features "ktls,http2"
+http2 = []
+
+# HTTP/3 サポート (QUIC ベース)
+# UDP/QUIC を使用した HTTP/3 プロトコル
+# 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
+# GSO/GRO による高パフォーマンス UDP 処理
+http3 = []
+
+# 全プロトコルサポート
+all-protocols = ["http2", "http3"]
+
 [dependencies]
 monoio = { version = "0.2.2", features = ["poll-io"] }
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）
