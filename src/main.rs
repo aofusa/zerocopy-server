@@ -402,6 +402,14 @@ static CONTENT_LENGTH_HEADER: &[u8] = b"\r\nContent-Length: ";
 static CONNECTION_KEEP_ALIVE: &[u8] = b"\r\nConnection: keep-alive\r\n\r\n";
 static CONNECTION_CLOSE: &[u8] = b"\r\nConnection: close\r\n\r\n";
 
+// HTTPリクエスト構築用定数（ホットパス最適化）
+static HEADER_HTTP11_HOST: &[u8] = b" HTTP/1.1\r\nHost: ";
+static HEADER_COLON: &[u8] = b": ";
+static HEADER_CRLF: &[u8] = b"\r\n";
+static HEADER_SPACE: &[u8] = b" ";
+static HEADER_PORT_COLON: &[u8] = b":";
+static HEADER_CONNECTION_KEEPALIVE_END: &[u8] = b"Connection: keep-alive\r\n\r\n";
+
 // バッファサイズ（ページアライン・L2キャッシュ最適化）
 const BUF_SIZE: usize = 65536;           // 64KB - io_uring最適サイズ
 const HEADER_BUF_CAPACITY: usize = 512;  // HTTPヘッダー用
@@ -3612,20 +3620,21 @@ async fn handle_proxy(
     let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
 
     // HTTPリクエスト構築（Connection: keep-alive を使用）
+    // 定数バイト列を使用してアロケーションを削減
     let mut request = Vec::with_capacity(1024);
     request.extend_from_slice(method);
-    request.extend_from_slice(b" ");
+    request.extend_from_slice(HEADER_SPACE);
     request.extend_from_slice(final_path.as_bytes());
-    request.extend_from_slice(b" HTTP/1.1\r\nHost: ");
+    request.extend_from_slice(HEADER_HTTP11_HOST);
     request.extend_from_slice(target.host.as_bytes());
     
     if !target.is_default_port() {
-        request.extend_from_slice(b":");
+        request.extend_from_slice(HEADER_PORT_COLON);
         let mut port_buf = itoa::Buffer::new();
         request.extend_from_slice(port_buf.format(target.port).as_bytes());
     }
     
-    request.extend_from_slice(b"\r\n");
+    request.extend_from_slice(HEADER_CRLF);
     
     for (name, value) in headers {
         // host と connection ヘッダーは別途処理済みのためスキップ
@@ -3648,12 +3657,12 @@ async fn handle_proxy(
         }
         
         request.extend_from_slice(name);
-        request.extend_from_slice(b": ");
+        request.extend_from_slice(HEADER_COLON);
         request.extend_from_slice(value);
-        request.extend_from_slice(b"\r\n");
+        request.extend_from_slice(HEADER_CRLF);
     }
     // バックエンドにはKeep-Aliveを要求
-    request.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
+    request.extend_from_slice(HEADER_CONNECTION_KEEPALIVE_END);
 
     if target.use_tls {
         proxy_https_pooled(client_stream, target, security, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
