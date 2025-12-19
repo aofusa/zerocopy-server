@@ -9,12 +9,17 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **kTLS**: rustls + ktls2 によるカーネルTLSオフロード対応（Linux 5.15+）
 - **高速アロケータ**: mimalloc による高速メモリ割り当て + Huge Pages対応
 - **高速ルーティング**: Radix Tree (matchit) によるO(log n)パスマッチング
-- **コネクションプール**: バックエンド接続の再利用によるレイテンシ削減
+- **コネクションプール**: バックエンド接続の再利用によるレイテンシ削減（HTTP/HTTPS両対応）
 - **バッファプール**: メモリアロケーションの削減
 - **Keep-Alive**: HTTP/1.1 Keep-Alive完全サポート
-- **Chunked転送**: RFC 7230準拠のChunkedデコーダ
+- **Chunked転送**: RFC 7230準拠のChunkedデコーダ（ステートマシンベース）
 - **CPUアフィニティ**: ワーカースレッドのCPUコアピン留め
 - **CBPF振り分け**: SO_REUSEPORTのクライアントIPベースロードバランシング（Linux 4.6+）
+- **Graceful Shutdown**: SIGINT/SIGTERMによる優雅な終了
+- **非同期ログ**: ftlog による高性能非同期ログ
+- **同時接続数制限**: グローバルな接続数上限設定
+- **レートリミッター**: スライディングウィンドウ方式のレート制限
+- **IP制限**: CIDR対応のIPアドレスフィルタリング
 
 ## ビルド
 
@@ -78,10 +83,23 @@ listen = "0.0.0.0:443"
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
 threads = 4
 
+[logging]
+# ログレベル: "trace", "debug", "info", "warn", "error", "off"
+level = "info"
+# ログチャネルサイズ（高負荷時のログドロップ防止）
+channel_size = 100000
+# フラッシュ間隔（ミリ秒）
+flush_interval_ms = 1000
+# 最大ログファイルサイズ（バイト、0=ローテーションなし）
+max_log_size = 104857600
+# ログファイルパス（オプション、未指定で標準エラー出力）
+# file_path = "/var/log/zerocopy-server.log"
+
 [security]
 # 権限降格設定（Linux専用）
 # drop_privileges_user = "nobody"
 # drop_privileges_group = "nogroup"
+# グローバル同時接続上限（0 = 無制限）
 # max_concurrent_connections = 10000
 
 [performance]
@@ -285,6 +303,32 @@ url = "http://localhost:8080"
 type = "Proxy"
 url = "https://backend.example.com"
 ```
+
+### グローバルセキュリティ設定
+
+`[security]` セクションでサーバー全体のセキュリティ設定を行います。
+
+```toml
+[security]
+# 権限降格設定（Linux専用、root起動時のみ有効）
+drop_privileges_user = "nobody"
+drop_privileges_group = "nogroup"
+
+# グローバル同時接続上限（0 = 無制限）
+max_concurrent_connections = 10000
+```
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `drop_privileges_user` | 起動後に降格するユーザー名 | なし |
+| `drop_privileges_group` | 起動後に降格するグループ名 | なし |
+| `max_concurrent_connections` | 同時接続数の上限 | 0（無制限） |
+
+> **注意**: 特権ポート（1024未満）を使用する場合は、`CAP_NET_BIND_SERVICE` ケイパビリティを付与するか、非特権ポートを使用してください。
+>
+> ```bash
+> sudo setcap 'cap_net_bind_service=+ep' ./target/release/zerocopy-server
+> ```
 
 ### ルートごとのセキュリティ設定
 
@@ -557,16 +601,25 @@ sysctl -w net.core.netdev_max_backlog=65535
 sysctl -w kernel.io_uring_setup_flags=0
 ```
 
-### バッファサイズ
+### バッファサイズとタイムアウト
 
-コード内の定数を調整可能：
+コード内の定数（コンパイル時に設定、再ビルドが必要）：
 
 ```rust
+// バッファサイズ
 const BUF_SIZE: usize = 65536;           // 64KB - io_uring最適サイズ
 const HEADER_BUF_CAPACITY: usize = 512;  // HTTPヘッダー用
 const MAX_HEADER_SIZE: usize = 8192;     // 8KB - ヘッダーサイズ上限
 const MAX_BODY_SIZE: usize = 10485760;   // 10MB - ボディサイズ上限
+
+// タイムアウト
+const READ_TIMEOUT: Duration = Duration::from_secs(30);   // 読み込みタイムアウト
+const WRITE_TIMEOUT: Duration = Duration::from_secs(30);  // 書き込みタイムアウト
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10); // バックエンド接続タイムアウト
+const IDLE_TIMEOUT: Duration = Duration::from_secs(60);   // Keep-Aliveアイドルタイムアウト
 ```
+
+> **注意**: ルートごとのセキュリティ設定で `client_header_timeout_secs` や `backend_connect_timeout_secs` を設定することで、一部のタイムアウトはconfig.tomlから個別に調整可能です。
 
 ## ベンチマーク
 
@@ -588,6 +641,48 @@ cargo build --release --features ktls
 wrk -t4 -c100 -d30s https://localhost/
 ```
 
+## Graceful Shutdown
+
+SIGINT（Ctrl+C）またはSIGTERMを受信すると、サーバーは優雅に終了します：
+
+1. 新規接続の受付を停止
+2. 既存のリクエスト処理を完了
+3. 全ワーカースレッドの終了を待機
+4. プロセス終了
+
+```bash
+# サーバー起動
+./target/release/zerocopy-server &
+
+# 優雅な終了
+kill -SIGTERM $!
+# または Ctrl+C
+```
+
+## ログ設定
+
+ftlogを使用した高性能非同期ログを提供します。ftlogは内部でバックグラウンドスレッドとチャネルを使用しており、ワーカースレッドへの影響を最小化しています。
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `level` | ログレベル（trace/debug/info/warn/error/off） | info |
+| `channel_size` | 内部チャネルバッファサイズ | 100000 |
+| `flush_interval_ms` | ディスクフラッシュ間隔（ミリ秒） | 1000 |
+| `max_log_size` | 最大ログファイルサイズ（バイト、0=無制限） | 104857600 |
+| `file_path` | ログファイルパス（未指定で標準エラー出力） | なし |
+
+### 設定例
+
+```toml
+[logging]
+level = "info"
+channel_size = 100000
+flush_interval_ms = 1000
+file_path = "/var/log/zerocopy-server.log"
+```
+
 ## 参考資料
 
 ### コアライブラリ
@@ -595,12 +690,21 @@ wrk -t4 -c100 -d30s https://localhost/
 - [monoio](https://github.com/bytedance/monoio): io_uringベースの非同期ランタイム
 - [rustls](https://github.com/rustls/rustls): Pure Rust TLS実装
 - [ktls2](https://crates.io/crates/ktls2): rustls用kTLS統合クレート
+- [httparse](https://crates.io/crates/httparse): 高速HTTPパーサー
 
 ### パフォーマンス
 
 - [mimalloc](https://github.com/microsoft/mimalloc): 高速汎用メモリアロケータ
 - [matchit](https://crates.io/crates/matchit): 高速Radix Treeルーター
+- [ftlog](https://crates.io/crates/ftlog): 高性能非同期ログライブラリ
+- [memchr](https://crates.io/crates/memchr): SIMD最適化文字列検索
 - [Linux Huge Pages](https://docs.kernel.org/admin-guide/mm/hugetlbpage.html): Large OS Pages設定ガイド
+
+### 並行制御
+
+- [arc-swap](https://crates.io/crates/arc-swap): ロックフリーなArc交換（設定ホットリロード用）
+- [ctrlc](https://crates.io/crates/ctrlc): シグナルハンドリング（Graceful Shutdown用）
+- [core_affinity](https://crates.io/crates/core_affinity): CPUアフィニティ設定
 
 ### カーネル機能
 
