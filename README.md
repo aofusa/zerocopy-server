@@ -15,7 +15,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **コネクションプール**: バックエンド接続の再利用によるレイテンシ削減（HTTP/HTTPS両対応）
 - **ロードバランシング**: 複数バックエンドへのリクエスト分散（Round Robin/Least Connections/IP Hash）
 - **健康チェック**: HTTPベースのアクティブヘルスチェックによる自動フェイルオーバー
-- **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ
+- **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ（Fixed/Adaptiveポーリングモード）
 - **ヘッダー操作**: リクエスト/レスポンスヘッダーの追加・削除（X-Real-IP, HSTS等）
 - **リダイレクト**: 301/302/307/308 HTTPリダイレクト（パス保持オプション付き）
 
@@ -359,7 +359,9 @@ upstream = "api-pool"
 
 ### WebSocket設定
 
-WebSocketは通常のProxyで自動サポート：
+WebSocketは通常のProxyで自動サポートされます。双方向転送時のポーリング動作を設定でカスタマイズ可能です。
+
+#### 基本設定
 
 ```toml
 # WebSocketアプリケーション
@@ -371,6 +373,71 @@ url = "http://localhost:3000"
 [path_routes."example.com"."/ws-lb/"]
 type = "Proxy"
 upstream = "websocket-pool"
+```
+
+#### ポーリングモード設定
+
+WebSocket双方向転送時のポーリング動作を制御します。
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `websocket_poll_mode` | ポーリングモード（`"fixed"` / `"adaptive"`） | `"adaptive"` |
+| `websocket_poll_timeout_ms` | 初期タイムアウト（ミリ秒） | 1 |
+| `websocket_poll_max_timeout_ms` | 最大タイムアウト（ミリ秒）※adaptiveのみ | 100 |
+| `websocket_poll_backoff_multiplier` | バックオフ倍率 ※adaptiveのみ | 2.0 |
+
+#### ポーリングモードの選択
+
+| モード | 動作 | 用途 |
+|--------|------|------|
+| `fixed` | 常に固定タイムアウトを使用 | リアルタイムゲームなど低レイテンシ最優先 |
+| `adaptive` | アクティブ時は短く、アイドル時は長くなる | チャット、監視ダッシュボードなどバランス重視 |
+
+**Adaptive モードの動作:**
+
+```
+データ転送あり → タイムアウトをリセット（初期値に戻す）
+タイムアウト発生 → タイムアウト × 倍率（最大値まで延長）
+
+例: 初期値=1ms, 最大=100ms, 倍率=2.0 の場合
+1ms → 2ms → 4ms → 8ms → 16ms → 32ms → 64ms → 100ms（最大値で停止）
+↓ データが来たら
+1ms（リセット）
+```
+
+#### WebSocket設定例
+
+```toml
+# リアルタイムゲーム（低レイテンシ最優先）
+[path_routes."game.example.com"."/ws/"]
+type = "Proxy"
+url = "http://localhost:3000"
+
+  [path_routes."game.example.com"."/ws/".security]
+  websocket_poll_mode = "fixed"
+  websocket_poll_timeout_ms = 1
+
+# チャットアプリ（バランス重視）
+[path_routes."chat.example.com"."/ws/"]
+type = "Proxy"
+url = "http://localhost:3001"
+
+  [path_routes."chat.example.com"."/ws/".security]
+  websocket_poll_mode = "adaptive"
+  websocket_poll_timeout_ms = 1
+  websocket_poll_max_timeout_ms = 50
+  websocket_poll_backoff_multiplier = 2.0
+
+# 監視ダッシュボード（CPU効率優先）
+[path_routes."monitor.example.com"."/ws/"]
+type = "Proxy"
+url = "http://localhost:3002"
+
+  [path_routes."monitor.example.com"."/ws/".security]
+  websocket_poll_mode = "adaptive"
+  websocket_poll_timeout_ms = 10
+  websocket_poll_max_timeout_ms = 200
+  websocket_poll_backoff_multiplier = 1.5
 ```
 
 ### グローバルセキュリティ設定
@@ -423,6 +490,10 @@ max_concurrent_connections = 10000
 | | `remove_request_headers` | バックエンドに転送前に削除するヘッダー | なし |
 | | `add_response_headers` | クライアントに返送前に追加するヘッダー | なし |
 | | `remove_response_headers` | クライアントに返送前に削除するヘッダー | なし |
+| WebSocket | `websocket_poll_mode` | ポーリングモード（`"fixed"` / `"adaptive"`） | `"adaptive"` |
+| | `websocket_poll_timeout_ms` | 初期タイムアウト（ミリ秒） | 1 |
+| | `websocket_poll_max_timeout_ms` | 最大タイムアウト（ミリ秒）※adaptiveのみ | 100 |
+| | `websocket_poll_backoff_multiplier` | バックオフ倍率 ※adaptiveのみ | 2.0 |
 
 #### セキュリティ設定例
 
@@ -934,18 +1005,38 @@ WebSocket（RFC 6455）のプロキシに対応しています。
 1. クライアントからの Upgrade リクエストを検出
 2. バックエンドに Upgrade リクエストを転送
 3. 101 Switching Protocols を受信
-4. 双方向のバイパス転送を開始
+4. 双方向のバイパス転送を開始（設定されたポーリングモードで動作）
 5. どちらかの接続が閉じるまで継続
+
+### ポーリングモード
+
+WebSocket双方向転送時のポーリング動作を設定で制御できます。
+
+| モード | 説明 | 用途 |
+|--------|------|------|
+| `adaptive`（デフォルト） | データ転送時は短く、アイドル時は長くなる | 汎用、CPU効率重視 |
+| `fixed` | 常に固定のタイムアウトを使用 | リアルタイムゲーム、低レイテンシ最優先 |
+
+詳細な設定オプションは「[WebSocket設定](#websocket設定)」セクションを参照してください。
 
 ### 設定例
 
 WebSocketは通常のProxyバックエンドで自動的にサポートされます：
 
 ```toml
-# WebSocketアプリケーション
+# WebSocketアプリケーション（デフォルト設定）
 [path_routes."example.com"."/ws/"]
 type = "Proxy"
 url = "http://localhost:3000"
+
+# 低レイテンシ設定（リアルタイムゲーム向け）
+[path_routes."game.example.com"."/ws/"]
+type = "Proxy"
+url = "http://localhost:3001"
+
+  [path_routes."game.example.com"."/ws/".security]
+  websocket_poll_mode = "fixed"
+  websocket_poll_timeout_ms = 1
 ```
 
 ### 対応バックエンド
