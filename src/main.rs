@@ -124,6 +124,10 @@ use memchr::memchr3;
 use time::OffsetDateTime;
 use arc_swap::ArcSwap;
 use once_cell::sync::Lazy;
+use prometheus::{
+    CounterVec, Histogram, HistogramOpts, HistogramVec, IntGaugeVec,
+    Opts, Registry, TextEncoder, Encoder,
+};
 
 // rustls 共通インポート
 use rustls::ServerConfig;
@@ -383,6 +387,141 @@ fn coarse_update() {
 }
 
 // ====================
+// Prometheusメトリクス
+// ====================
+//
+// リクエスト数、レイテンシ、エラー率などを計測し、
+// Prometheusフォーマットでエクスポートします。
+//
+// メトリクスエンドポイント: /__metrics (設定で変更可能)
+//
+// ## 計測対象
+//
+// - http_requests_total: リクエスト総数（method, status, hostラベル付き）
+// - http_request_duration_seconds: リクエスト処理時間のヒストグラム
+// - http_request_size_bytes: リクエストボディサイズのヒストグラム
+// - http_response_size_bytes: レスポンスボディサイズのヒストグラム
+// - http_active_connections: アクティブな接続数（ホスト別）
+// - http_upstream_health: アップストリームの健康状態
+//
+// ====================
+
+/// Prometheusメトリクスレジストリ（グローバル）
+static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(|| {
+    Registry::new()
+});
+
+/// HTTPリクエスト総数カウンター（method, status, host ラベル付き）
+static HTTP_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("http_requests_total", "Total number of HTTP requests")
+        .namespace("zerocopy_proxy");
+    let counter = CounterVec::new(opts, &["method", "status", "host"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// HTTPリクエスト処理時間ヒストグラム（method, host ラベル付き）
+static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
+    let opts = HistogramOpts::new("http_request_duration_seconds", "HTTP request duration in seconds")
+        .namespace("zerocopy_proxy")
+        .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]);
+    let histogram = HistogramVec::new(opts, &["method", "host"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    histogram
+});
+
+/// HTTPリクエストボディサイズヒストグラム
+static HTTP_REQUEST_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new("http_request_size_bytes", "HTTP request body size in bytes")
+        .namespace("zerocopy_proxy")
+        .buckets(vec![100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0]);
+    let histogram = Histogram::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    histogram
+});
+
+/// HTTPレスポンスボディサイズヒストグラム
+static HTTP_RESPONSE_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
+    let opts = HistogramOpts::new("http_response_size_bytes", "HTTP response body size in bytes")
+        .namespace("zerocopy_proxy")
+        .buckets(vec![100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0]);
+    let histogram = Histogram::with_opts(opts).unwrap();
+    METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
+    histogram
+});
+
+/// アクティブ接続数ゲージ（ホスト別）
+/// TODO: 接続開始/終了時にインクリメント/デクリメントを追加
+#[allow(dead_code)]
+static HTTP_ACTIVE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new("http_active_connections", "Number of active HTTP connections")
+        .namespace("zerocopy_proxy");
+    let gauge = IntGaugeVec::new(opts, &["host"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// アップストリーム健康状態ゲージ（upstream, server ラベル付き）
+/// 1 = healthy, 0 = unhealthy
+/// TODO: ヘルスチェック結果に応じて更新
+#[allow(dead_code)]
+static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new("http_upstream_health", "Upstream server health status (1=healthy, 0=unhealthy)")
+        .namespace("zerocopy_proxy");
+    let gauge = IntGaugeVec::new(opts, &["upstream", "server"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// Prometheusメトリクスをテキストフォーマットでエンコード
+fn encode_prometheus_metrics() -> Vec<u8> {
+    let encoder = TextEncoder::new();
+    let metric_families = METRICS_REGISTRY.gather();
+    let mut buffer = Vec::new();
+    encoder.encode(&metric_families, &mut buffer).unwrap_or_default();
+    buffer
+}
+
+/// メトリクスを記録（リクエスト完了時に呼び出し）
+#[inline]
+fn record_request_metrics(
+    method: &str,
+    host: &str,
+    status: u16,
+    req_body_size: u64,
+    resp_body_size: u64,
+    duration_secs: f64,
+) {
+    // リクエスト総数をインクリメント
+    let status_str = status.to_string();
+    HTTP_REQUESTS_TOTAL
+        .with_label_values(&[method, &status_str, host])
+        .inc();
+    
+    // 処理時間を記録
+    HTTP_REQUEST_DURATION_SECONDS
+        .with_label_values(&[method, host])
+        .observe(duration_secs);
+    
+    // リクエスト/レスポンスサイズを記録
+    HTTP_REQUEST_SIZE_BYTES.observe(req_body_size as f64);
+    HTTP_RESPONSE_SIZE_BYTES.observe(resp_body_size as f64);
+}
+
+/// メトリクスエンドポイント用のHTTPレスポンスを生成
+fn build_metrics_response() -> Vec<u8> {
+    let body = encode_prometheus_metrics();
+    let mut response = Vec::with_capacity(256 + body.len());
+    response.extend_from_slice(b"HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: ");
+    
+    let mut num_buf = itoa::Buffer::new();
+    response.extend_from_slice(num_buf.format(body.len()).as_bytes());
+    response.extend_from_slice(b"\r\nConnection: close\r\n\r\n");
+    response.extend_from_slice(&body);
+    response
+}
+
+// ====================
 // 定数定義（パフォーマンスチューニング済み）
 // ====================
 
@@ -399,7 +538,9 @@ static ERR_MSG_GATEWAY_TIMEOUT: &[u8] = b"HTTP/1.1 504 Gateway Timeout\r\nConten
 // HTTP ヘッダー部品（事前計算）
 static HTTP_200_PREFIX: &[u8] = b"HTTP/1.1 200 OK\r\nContent-Type: ";
 static CONTENT_LENGTH_HEADER: &[u8] = b"\r\nContent-Length: ";
+#[allow(dead_code)]
 static CONNECTION_KEEP_ALIVE: &[u8] = b"\r\nConnection: keep-alive\r\n\r\n";
+#[allow(dead_code)]
 static CONNECTION_CLOSE: &[u8] = b"\r\nConnection: close\r\n\r\n";
 
 // HTTPリクエスト構築用定数（ホットパス最適化）
@@ -925,12 +1066,49 @@ pub struct SecurityConfig {
     /// 例: ["192.168.1.100", "10.0.0.0/8"]
     #[serde(default)]
     pub denied_ips: Vec<String>,
+    
+    // ====================
+    // ヘッダー操作設定
+    // ====================
+    
+    /// リクエストに追加するヘッダー（バックエンドへ転送前）
+    /// 例: { "X-Real-IP" = "$client_ip", "X-Forwarded-Proto" = "https" }
+    /// 
+    /// 特殊変数:
+    /// - $client_ip: クライアントのIPアドレス
+    /// - $host: リクエストのHostヘッダー
+    /// - $request_uri: リクエストURI
+    #[serde(default)]
+    pub add_request_headers: HashMap<String, String>,
+    
+    /// リクエストから削除するヘッダー（バックエンドへ転送前）
+    /// 例: ["X-Debug", "X-Internal-Token"]
+    #[serde(default)]
+    pub remove_request_headers: Vec<String>,
+    
+    /// レスポンスに追加するヘッダー（クライアントへ返送前）
+    /// 例: { "X-Frame-Options" = "DENY", "Strict-Transport-Security" = "max-age=31536000" }
+    #[serde(default)]
+    pub add_response_headers: HashMap<String, String>,
+    
+    /// レスポンスから削除するヘッダー（クライアントへ返送前）
+    /// 例: ["Server", "X-Powered-By"]
+    #[serde(default)]
+    pub remove_response_headers: Vec<String>,
 }
 
 impl SecurityConfig {
     /// IP制限フィルターを構築
     pub fn ip_filter(&self) -> IpFilter {
         IpFilter::from_lists(&self.allowed_ips, &self.denied_ips)
+    }
+    
+    /// ヘッダー操作が設定されているかどうか
+    pub fn has_header_operations(&self) -> bool {
+        !self.add_request_headers.is_empty() ||
+        !self.remove_request_headers.is_empty() ||
+        !self.add_response_headers.is_empty() ||
+        !self.remove_response_headers.is_empty()
     }
 }
 
@@ -949,6 +1127,10 @@ impl Default for SecurityConfig {
             max_request_header_size: default_max_header_size(),
             allowed_ips: Vec::new(),
             denied_ips: Vec::new(),
+            add_request_headers: HashMap::new(),
+            remove_request_headers: Vec::new(),
+            add_response_headers: HashMap::new(),
+            remove_response_headers: Vec::new(),
         }
     }
 }
@@ -1917,6 +2099,11 @@ enum BackendConfig {
     /// - index: ディレクトリアクセス時に返すファイル名（デフォルト: "index.html"）
     /// - security: ルートごとのセキュリティ設定
     File { path: String, mode: String, index: Option<String>, security: SecurityConfig },
+    /// Redirect バックエンド設定
+    /// - redirect_url: リダイレクト先URL（$request_uri, $host, $path 変数使用可能）
+    /// - redirect_status: ステータスコード（301, 302, 307, 308）
+    /// - preserve_path: 元のパスをリダイレクト先に追加するか
+    Redirect { redirect_url: String, redirect_status: u16, preserve_path: bool },
 }
 
 impl<'de> serde::Deserialize<'de> for BackendConfig {
@@ -1946,6 +2133,10 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut mode: Option<String> = None;
                 let mut index: Option<String> = None;
                 let mut security: Option<SecurityConfig> = None;
+                // Redirect 用フィールド
+                let mut redirect_url: Option<String> = None;
+                let mut redirect_status: Option<u16> = None;
+                let mut preserve_path: Option<bool> = None;
                 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -1956,6 +2147,9 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "mode" => mode = Some(map.next_value()?),
                         "index" => index = Some(map.next_value()?),
                         "security" => security = Some(map.next_value()?),
+                        "redirect_url" => redirect_url = Some(map.next_value()?),
+                        "redirect_status" => redirect_status = Some(map.next_value()?),
+                        "preserve_path" => preserve_path = Some(map.next_value()?),
                         _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
                     }
                 }
@@ -1972,6 +2166,19 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             let url = url.ok_or_else(|| serde::de::Error::missing_field("url or upstream"))?;
                             Ok(BackendConfig::Proxy { url, security })
                         }
+                    }
+                    "Redirect" => {
+                        let redirect_url = redirect_url.ok_or_else(|| serde::de::Error::missing_field("redirect_url"))?;
+                        let redirect_status = redirect_status.unwrap_or(301);
+                        // ステータスコードの検証（301, 302, 303, 307, 308のみ許可）
+                        if !matches!(redirect_status, 301 | 302 | 303 | 307 | 308) {
+                            return Err(serde::de::Error::custom(format!(
+                                "invalid redirect_status: {}, expected 301, 302, 303, 307, or 308",
+                                redirect_status
+                            )));
+                        }
+                        let preserve_path = preserve_path.unwrap_or(false);
+                        Ok(BackendConfig::Redirect { redirect_url, redirect_status, preserve_path })
                     }
                     "File" | _ => {
                         let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
@@ -2007,16 +2214,25 @@ enum Backend {
     /// - Option<Arc<str>>: インデックスファイル名（None = "index.html"）
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
     SendFile(Arc<PathBuf>, bool, Option<Arc<str>>, Arc<SecurityConfig>),
+    /// Redirect バックエンド
+    /// - Arc<str>: リダイレクト先URL
+    /// - u16: ステータスコード（301, 302, 307, 308）
+    /// - bool: 元のパスを保持するか
+    Redirect(Arc<str>, u16, bool),
 }
 
 impl Backend {
     /// このバックエンドのセキュリティ設定を取得
     #[inline]
     fn security(&self) -> &SecurityConfig {
+        // デフォルトのセキュリティ設定（Redirect用）
+        static DEFAULT_SECURITY: Lazy<SecurityConfig> = Lazy::new(SecurityConfig::default);
+        
         match self {
             Backend::Proxy(_, security) => security,
             Backend::MemoryFile(_, _, security) => security,
             Backend::SendFile(_, _, _, security) => security,
+            Backend::Redirect(_, _, _) => &DEFAULT_SECURITY,
         }
     }
 }
@@ -2622,6 +2838,20 @@ fn validate_backend_config(config: &BackendConfig, route_name: &str) -> io::Resu
                 ));
             }
         }
+        BackendConfig::Redirect { redirect_url, redirect_status, .. } => {
+            if redirect_url.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Empty redirect_url for route '{}'", route_name)
+                ));
+            }
+            if !matches!(*redirect_status, 301 | 302 | 303 | 307 | 308) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("Invalid redirect_status for route '{}': {} (expected 301, 302, 303, 307, or 308)", route_name, redirect_status)
+                ));
+            }
+        }
     }
     
     Ok(())
@@ -2955,6 +3185,9 @@ fn load_backend(
                 "sendfile" | "" => Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security)),
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
+        }
+        BackendConfig::Redirect { redirect_url, redirect_status, preserve_path } => {
+            Ok(Backend::Redirect(Arc::from(redirect_url.as_str()), *redirect_status, *preserve_path))
         }
     }
 }
@@ -3772,6 +4005,26 @@ async fn handle_requests(
                     .collect();
                 
                 drop(req);
+                
+                // メトリクスエンドポイントの処理（/__metrics）
+                // Prometheusスクレイピング用の特別なパス
+                if path_bytes.as_ref() == b"/__metrics" && method_bytes.as_ref() == b"GET" {
+                    let start_instant = Instant::now();
+                    let metrics_response = build_metrics_response();
+                    let resp_size = metrics_response.len() as u64;
+                    
+                    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(metrics_response)).await;
+                    match write_result {
+                        Ok((Ok(_), _)) => {
+                            log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, 200, resp_size, start_instant);
+                        }
+                        _ => {}
+                    }
+                    
+                    // メトリクスエンドポイントは常に接続を閉じる
+                    accumulated.clear();
+                    return;
+                }
 
                 // Backend選択
                 let backend_result = find_backend(
@@ -3878,7 +4131,7 @@ async fn handle_requests(
                         
                         match ws_result {
                             Some((status, resp_size)) => {
-                                log_access(&path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
+                                log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
                             }
                             None => {}
                         }
@@ -3909,7 +4162,7 @@ async fn handle_requests(
 
                 match result {
                     Some((stream_back, status, resp_size, should_close)) => {
-                        log_access(&path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
+                        log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
                         tls_stream = stream_back;
                         
                         // Connection: close が要求された場合、またはエラー時は接続を閉じる
@@ -4073,7 +4326,7 @@ async fn handle_backend(
         Backend::Proxy(upstream_group, security) => {
             handle_proxy(tls_stream, &upstream_group, &security, method, req_path, &prefix, content_length, is_chunked, headers, initial_body, client_wants_close, client_ip).await
         }
-        Backend::MemoryFile(data, mime_type, _security) => {
+        Backend::MemoryFile(data, mime_type, security) => {
             // ファイル完全一致チェック
             // MemoryFileはファイル指定なので、プレフィックス以降にパスがあれば404
             let path_str = std::str::from_utf8(req_path).unwrap_or("/");
@@ -4100,10 +4353,20 @@ async fn handle_backend(
             header.extend_from_slice(CONTENT_LENGTH_HEADER);
             let mut num_buf = itoa::Buffer::new();
             header.extend_from_slice(num_buf.format(data.len()).as_bytes());
+            header.extend_from_slice(b"\r\n");
+            
+            // 追加レスポンスヘッダー（セキュリティヘッダーなど）
+            for (header_name, header_value) in &security.add_response_headers {
+                header.extend_from_slice(header_name.as_bytes());
+                header.extend_from_slice(b": ");
+                header.extend_from_slice(header_value.as_bytes());
+                header.extend_from_slice(b"\r\n");
+            }
+            
             if client_wants_close {
-                header.extend_from_slice(CONNECTION_CLOSE);
+                header.extend_from_slice(b"Connection: close\r\n\r\n");
             } else {
-                header.extend_from_slice(CONNECTION_KEEP_ALIVE);
+                header.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
             }
             
             // ヘッダー送信（タイムアウト付き）
@@ -4124,9 +4387,97 @@ async fn handle_backend(
                 _ => None,
             }
         }
-        Backend::SendFile(base_path, is_dir, index_file, _security) => {
-            handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close).await
+        Backend::SendFile(base_path, is_dir, index_file, security) => {
+            handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close, &security).await
         }
+        Backend::Redirect(redirect_url, status_code, preserve_path) => {
+            handle_redirect(tls_stream, &redirect_url, status_code, preserve_path, req_path, &prefix, client_wants_close).await
+        }
+    }
+}
+
+// ====================
+// リダイレクト処理
+// ====================
+//
+// 設定されたURLへのHTTPリダイレクトを返します。
+// ステータスコード: 301, 302, 303, 307, 308 をサポート
+//
+// 特殊変数:
+// - $request_uri: 元のリクエストURI
+// - $host: リクエストのHostヘッダー
+// - $path: 元のパス（prefix除去後）
+// ====================
+
+/// リダイレクトレスポンスを生成して送信
+async fn handle_redirect(
+    mut tls_stream: ServerTls,
+    redirect_url: &str,
+    status_code: u16,
+    preserve_path: bool,
+    req_path: &[u8],
+    prefix: &[u8],
+    client_wants_close: bool,
+) -> Option<(ServerTls, u16, u64, bool)> {
+    // リダイレクト先URLを構築
+    let path_str = std::str::from_utf8(req_path).unwrap_or("/");
+    let prefix_str = std::str::from_utf8(prefix).unwrap_or("");
+    
+    // パス部分（prefix除去後）
+    let sub_path = if !prefix_str.is_empty() && path_str.starts_with(prefix_str) {
+        &path_str[prefix_str.len()..]
+    } else {
+        path_str
+    };
+    
+    // 変数置換とパス追加
+    let mut final_url = redirect_url
+        .replace("$request_uri", path_str)
+        .replace("$path", sub_path);
+    
+    // preserve_path が true の場合、元のパスを追加
+    if preserve_path && !sub_path.is_empty() {
+        // URLにすでにパスがある場合は結合
+        if final_url.ends_with('/') && sub_path.starts_with('/') {
+            final_url.push_str(&sub_path[1..]);
+        } else if !final_url.ends_with('/') && !sub_path.starts_with('/') {
+            final_url.push('/');
+            final_url.push_str(sub_path);
+        } else {
+            final_url.push_str(sub_path);
+        }
+    }
+    
+    // ステータス行を構築
+    let status_line = match status_code {
+        301 => "HTTP/1.1 301 Moved Permanently\r\n",
+        302 => "HTTP/1.1 302 Found\r\n",
+        303 => "HTTP/1.1 303 See Other\r\n",
+        307 => "HTTP/1.1 307 Temporary Redirect\r\n",
+        308 => "HTTP/1.1 308 Permanent Redirect\r\n",
+        _ => "HTTP/1.1 301 Moved Permanently\r\n",
+    };
+    
+    // レスポンス構築
+    let mut response = Vec::with_capacity(256 + final_url.len());
+    response.extend_from_slice(status_line.as_bytes());
+    response.extend_from_slice(b"Location: ");
+    response.extend_from_slice(final_url.as_bytes());
+    response.extend_from_slice(b"\r\nContent-Length: 0\r\n");
+    
+    if client_wants_close {
+        response.extend_from_slice(b"Connection: close\r\n\r\n");
+    } else {
+        response.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
+    }
+    
+    // レスポンス送信
+    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(response)).await;
+    match write_result {
+        Ok((Ok(_), _)) => {
+            Some((tls_stream, status_code, 0, client_wants_close))
+        }
+        _ => None,
     }
 }
 
@@ -5036,9 +5387,20 @@ async fn handle_proxy(
     
     request.extend_from_slice(HEADER_CRLF);
     
+    // ヘッダー削除リストを小文字で保持（高速比較用）
+    let remove_headers_lower: Vec<Vec<u8>> = security.remove_request_headers.iter()
+        .map(|h| h.to_ascii_lowercase().into_bytes())
+        .collect();
+    
     for (name, value) in headers {
         // host と connection ヘッダーは別途処理済みのためスキップ
         if name.eq_ignore_ascii_case(b"host") || name.eq_ignore_ascii_case(b"connection") {
+            continue;
+        }
+        
+        // 設定で削除が指定されているヘッダーをスキップ
+        let name_lower: Vec<u8> = name.iter().map(|b| b.to_ascii_lowercase()).collect();
+        if remove_headers_lower.iter().any(|h| h == &name_lower) {
             continue;
         }
         
@@ -5061,6 +5423,33 @@ async fn handle_proxy(
         request.extend_from_slice(value);
         request.extend_from_slice(HEADER_CRLF);
     }
+    
+    // 設定で追加が指定されているヘッダーを追加
+    // 特殊変数の置換: $client_ip, $host, $request_uri
+    for (header_name, header_value) in &security.add_request_headers {
+        // 特殊変数を置換
+        let host_str = headers.iter()
+            .find(|(n, _)| n.eq_ignore_ascii_case(b"host"))
+            .map(|(_, v)| std::str::from_utf8(v).unwrap_or("-"))
+            .unwrap_or("-");
+        
+        let value_replaced = header_value
+            .replace("$client_ip", client_ip)
+            .replace("$host", host_str)
+            .replace("$request_uri", path_str);
+        
+        // Header Injection防止チェック
+        if !is_valid_header_value(value_replaced.as_bytes()) {
+            warn!("Invalid add_request_header value: {}", header_name);
+            continue;
+        }
+        
+        request.extend_from_slice(header_name.as_bytes());
+        request.extend_from_slice(HEADER_COLON);
+        request.extend_from_slice(value_replaced.as_bytes());
+        request.extend_from_slice(HEADER_CRLF);
+    }
+    
     // バックエンドにはKeep-Aliveを要求
     request.extend_from_slice(HEADER_CONNECTION_KEEPALIVE_END);
 
@@ -6270,6 +6659,7 @@ async fn handle_sendfile(
     req_path: &[u8],
     prefix: &[u8],
     client_wants_close: bool,
+    security: &SecurityConfig,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
     // 
@@ -6384,7 +6774,7 @@ async fn handle_sendfile(
     let file_size = metadata.len();
     let mime_type = mime_guess::from_path(&final_path).first_or_octet_stream();
     
-    // ヘッダー構築（Keep-Alive対応）
+    // ヘッダー構築（Keep-Alive対応 + カスタムレスポンスヘッダー）
     let mut header_buf = Vec::with_capacity(HEADER_BUF_CAPACITY);
     header_buf.extend_from_slice(HTTP_200_PREFIX);
     header_buf.extend_from_slice(mime_type.as_ref().as_bytes());
@@ -6392,10 +6782,20 @@ async fn handle_sendfile(
     
     let mut num_buf = itoa::Buffer::new();
     header_buf.extend_from_slice(num_buf.format(file_size).as_bytes());
+    header_buf.extend_from_slice(b"\r\n");
+    
+    // 追加レスポンスヘッダー（セキュリティヘッダーなど）
+    for (header_name, header_value) in &security.add_response_headers {
+        header_buf.extend_from_slice(header_name.as_bytes());
+        header_buf.extend_from_slice(b": ");
+        header_buf.extend_from_slice(header_value.as_bytes());
+        header_buf.extend_from_slice(b"\r\n");
+    }
+    
     if client_wants_close {
-        header_buf.extend_from_slice(CONNECTION_CLOSE);
+        header_buf.extend_from_slice(b"Connection: close\r\n\r\n");
     } else {
-        header_buf.extend_from_slice(CONNECTION_KEEP_ALIVE);
+        header_buf.extend_from_slice(b"Connection: keep-alive\r\n\r\n");
     }
 
     // ヘッダー送信（タイムアウト付き）
@@ -6524,20 +6924,39 @@ async fn handle_sendfile_userspace(
 // ロギング
 // ====================
 
-/// アクセスログを記録
+/// アクセスログを記録 + Prometheusメトリクスを記録
 /// 
 /// - 処理時間: `start_instant` からの経過時間を高精度で計測（Instant使用）
 /// - タイムスタンプ: Coarse Timer でキャッシュした時刻を使用（システムコール削減）
-fn log_access(path: &[u8], ua: &[u8], req_body_size: u64, status: u16, resp_body_size: u64, start_instant: Instant) {
+/// - メトリクス: リクエスト数、処理時間、サイズをPrometheus形式で記録
+fn log_access(
+    method: &[u8],
+    host: &[u8],
+    path: &[u8],
+    ua: &[u8],
+    req_body_size: u64,
+    status: u16,
+    resp_body_size: u64,
+    start_instant: Instant,
+) {
     // 処理時間は Instant で高精度計測
-    let duration_ms = start_instant.elapsed().as_millis();
+    let duration = start_instant.elapsed();
+    let duration_ms = duration.as_millis();
+    let duration_secs = duration.as_secs_f64();
+    
     // タイムスタンプは Coarse Timer を使用（システムコール削減）
     let log_time = coarse_now();
     let path_str = std::str::from_utf8(path).unwrap_or("-");
     let ua_str = std::str::from_utf8(ua).unwrap_or("-");
+    let method_str = std::str::from_utf8(method).unwrap_or("GET");
+    let host_str = std::str::from_utf8(host).unwrap_or("-");
     
-    info!("Access: time={} duration={}ms path={} ua={} req_body_size={} status={} resp_body_size={}",
-        log_time, duration_ms, path_str, ua_str, req_body_size, status, resp_body_size);
+    // アクセスログ出力
+    info!("Access: time={} duration={}ms method={} host={} path={} ua={} req_body_size={} status={} resp_body_size={}",
+        log_time, duration_ms, method_str, host_str, path_str, ua_str, req_body_size, status, resp_body_size);
+    
+    // Prometheusメトリクスを記録
+    record_request_metrics(method_str, host_str, status, req_body_size, resp_body_size, duration_secs);
 }
 
 #[allow(dead_code)]
