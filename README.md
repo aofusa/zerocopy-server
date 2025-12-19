@@ -18,6 +18,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ（Fixed/Adaptiveポーリングモード）
 - **ヘッダー操作**: リクエスト/レスポンスヘッダーの追加・削除（X-Real-IP, HSTS等）
 - **リダイレクト**: 301/302/307/308 HTTPリダイレクト（パス保持オプション付き）
+- **SNI設定**: HTTPSバックエンドへのIP直打ち時にSNI名を指定可能（仮想ホスト対応）
 
 ### HTTP処理
 - **Keep-Alive**: HTTP/1.1 Keep-Alive完全サポート
@@ -201,10 +202,11 @@ path = "/var/www/index.html"
 |--------|------|--------|
 | `Proxy` | HTTPリバースプロキシ（単一） | `{ type = "Proxy", url = "http://localhost:8080" }` |
 | `Proxy` | HTTPリバースプロキシ（LB） | `{ type = "Proxy", upstream = "backend-pool" }` |
+| `Proxy` | HTTPSプロキシ（SNI指定） | `{ type = "Proxy", url = "https://192.168.1.100", sni_name = "api.example.com" }` |
 | `File` | 静的ファイル配信 | `{ type = "File", path = "/var/www", mode = "sendfile" }` |
 | `Redirect` | HTTPリダイレクト | `{ type = "Redirect", redirect_url = "https://new.example.com", redirect_status = 301 }` |
 
-> **Note**: `Proxy` タイプは `url`（単一バックエンド）または `upstream`（ロードバランシング）のいずれかを指定します。WebSocketは両方で自動サポートされます。
+> **Note**: `Proxy` タイプは `url`（単一バックエンド）または `upstream`（ロードバランシング）のいずれかを指定します。WebSocketは両方で自動サポートされます。HTTPSバックエンドへのIP直打ち時は `sni_name` でSNI名を指定可能です。
 
 ### ルーティングの挙動（Nginx風）
 
@@ -328,6 +330,25 @@ type = "Proxy"
 url = "https://backend.example.com"
 ```
 
+#### SNI (Server Name Indication) 設定
+
+HTTPSバックエンドへの接続時、バックエンドがIPアドレス指定の場合でもSNIにドメイン名を指定できます。
+これにより、仮想ホスト構成のサーバーでも正しい証明書を取得できます。
+
+```toml
+# IPアドレス指定 + SNI名指定
+[path_routes."example.com"."/internal-api/"]
+type = "Proxy"
+url = "https://192.168.1.100:443"
+sni_name = "api.internal.example.com"
+```
+
+| 設定 | 説明 | デフォルト |
+|------|------|-----------|
+| `sni_name` | TLS接続時のSNI名（省略時はURLのホスト名を使用） | URLのホスト名 |
+
+> **Note**: `sni_name` を指定した場合、TLS証明書の検証もその名前で行われます。バックエンドサーバーの証明書は指定したドメイン名（またはワイルドカード）を含む必要があります。
+
 ### ロードバランシング設定
 
 複数バックエンドへのリクエスト分散：
@@ -356,6 +377,31 @@ servers = [
 type = "Proxy"
 upstream = "api-pool"
 ```
+
+#### UpstreamでのSNI設定
+
+Upstreamのサーバーエントリは文字列形式と構造体形式の両方をサポートします。
+構造体形式を使用すると、IPアドレス指定時にSNI名を指定できます。
+
+```toml
+# HTTPSバックエンドプール（SNI名指定付き）
+[upstreams."https-pool"]
+algorithm = "least_conn"
+servers = [
+  # 構造体形式: IPアドレス + SNI名
+  { url = "https://192.168.1.100:443", sni_name = "api.example.com" },
+  { url = "https://192.168.1.101:443", sni_name = "api.example.com" },
+  # 文字列形式: ドメイン名指定（SNI名は自動的にURLのホスト名）
+  "https://api.example.com:443"
+]
+
+# ルートでUpstreamを参照
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+upstream = "https-pool"
+```
+
+> **Note**: 文字列形式と構造体形式は同一配列内で混在可能です。従来の文字列形式は後方互換性のためそのまま動作します。
 
 ### WebSocket設定
 
@@ -1061,7 +1107,7 @@ url = "http://localhost:3001"
 ### 設定例
 
 ```toml
-# Upstreamグループの定義
+# Upstreamグループの定義（文字列形式）
 [upstreams."backend-pool"]
 algorithm = "round_robin"
 servers = [
@@ -1074,6 +1120,23 @@ servers = [
 [path_routes."example.com"."/api/"]
 type = "Proxy"
 upstream = "backend-pool"  # URLの代わりにupstreamを指定
+```
+
+#### SNI名付きHTTPSバックエンド
+
+IPアドレス指定のHTTPSバックエンドに対してSNI名を指定できます：
+
+```toml
+# HTTPSバックエンドプール（構造体形式と文字列形式の混在）
+[upstreams."https-api-pool"]
+algorithm = "least_conn"
+servers = [
+  # 構造体形式: IPアドレス + SNI名指定
+  { url = "https://192.168.1.100:443", sni_name = "api.internal.example.com" },
+  { url = "https://192.168.1.101:443", sni_name = "api.internal.example.com" },
+  # 文字列形式: ドメイン名指定（SNI名は自動的にURLのホスト名）
+  "https://api.example.com:443"
+]
 ```
 
 ### 単一バックエンドとの互換性
