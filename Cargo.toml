@@ -64,3 +64,4 @@ signal-hook = "0.3.18"
 # Prometheusメトリクス対応
 # リクエスト数、レイテンシ、エラー率などを計測・エクスポート
 prometheus = "0.13"
+clap = { version = "4.5.53", features = ["derive"] }

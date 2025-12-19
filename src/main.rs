@@ -102,10 +102,10 @@ use monoio::io::{AsyncReadRent, AsyncWriteRentExt};
 use monoio::net::{TcpListener, TcpStream};
 use monoio::RuntimeBuilder;
 use monoio::time::timeout;
+use clap::Parser;
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
-use std::env;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -3478,72 +3478,16 @@ fn load_backend(
 // コマンドライン引数パース
 // ====================
 
-/// コマンドライン引数の解析結果
+/// High-Performance Reverse Proxy Server
+/// 
+/// io_uring (monoio) と rustls を使用した高性能リバースプロキシサーバー
+#[derive(Parser, Debug)]
+#[command(name = "zerocopy-server")]
+#[command(author, version, about, long_about = None)]
 struct CliArgs {
     /// 設定ファイルのパス
-    config_path: PathBuf,
-}
-
-/// ヘルプメッセージを表示
-fn print_help() {
-    eprintln!("Usage: zerocopy-server [OPTIONS]");
-    eprintln!();
-    eprintln!("High-Performance Reverse Proxy Server");
-    eprintln!();
-    eprintln!("Options:");
-    eprintln!("  -c, --config <PATH>  設定ファイルのパス");
-    eprintln!("                       (デフォルト: {})", DEFAULT_CONFIG_PATH);
-    eprintln!("  -h, --help           このヘルプメッセージを表示");
-    eprintln!("  -V, --version        バージョン情報を表示");
-}
-
-/// バージョン情報を表示
-fn print_version() {
-    eprintln!("zerocopy-server {}", env!("CARGO_PKG_VERSION"));
-}
-
-/// コマンドライン引数を解析
-fn parse_args() -> Option<CliArgs> {
-    let args: Vec<String> = env::args().collect();
-    let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
-    
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "-h" | "--help" => {
-                print_help();
-                return None;
-            }
-            "-V" | "--version" => {
-                print_version();
-                return None;
-            }
-            "-c" | "--config" => {
-                if i + 1 >= args.len() {
-                    eprintln!("Error: --config オプションには引数が必要です");
-                    print_help();
-                    return None;
-                }
-                config_path = PathBuf::from(&args[i + 1]);
-                i += 2;
-            }
-            arg if arg.starts_with("--config=") => {
-                config_path = PathBuf::from(&arg[9..]);
-                i += 1;
-            }
-            arg if arg.starts_with("-c=") => {
-                config_path = PathBuf::from(&arg[3..]);
-                i += 1;
-            }
-            arg => {
-                eprintln!("Error: 不明なオプション: {}", arg);
-                print_help();
-                return None;
-            }
-        }
-    }
-    
-    Some(CliArgs { config_path })
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    config: PathBuf,
 }
 
 // ====================
@@ -3551,15 +3495,12 @@ fn parse_args() -> Option<CliArgs> {
 // ====================
 
 fn main() {
-    // コマンドライン引数を解析
-    let cli_args = match parse_args() {
-        Some(args) => args,
-        None => return, // --help や --version の場合は終了
-    };
+    // コマンドライン引数を解析（--help, --version は clap が自動処理）
+    let cli_args = CliArgs::parse();
     
     // 設定ファイルパスをグローバル変数に保存（ホットリロード用）
-    CONFIG_PATH.store(Arc::new(cli_args.config_path.clone()));
-    let config_path = cli_args.config_path;
+    CONFIG_PATH.store(Arc::new(cli_args.config.clone()));
+    let config_path = cli_args.config;
     
     // プロセスレベルで暗号プロバイダーをインストール（ring使用）
     CryptoProvider::install_default(rustls::crypto::ring::default_provider())
