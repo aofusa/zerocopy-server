@@ -52,6 +52,31 @@ cargo build --release
 cargo build --release --features ktls
 ```
 
+## 起動
+
+```bash
+# デフォルト設定ファイル（/etc/zerocopy-server/config.toml）で起動
+./zerocopy-server
+
+# 設定ファイルを指定して起動
+./zerocopy-server -c /path/to/config.toml
+./zerocopy-server --config /path/to/config.toml
+
+# ヘルプを表示
+./zerocopy-server --help
+
+# バージョンを表示
+./zerocopy-server --version
+```
+
+### コマンドラインオプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `-c, --config <PATH>` | 設定ファイルのパス | `/etc/zerocopy-server/config.toml` |
+| `-h, --help` | ヘルプメッセージを表示 | - |
+| `-V, --version` | バージョン情報を表示 | - |
+
 ## TLS証明書の生成
 
 開発・テスト用の自己署名証明書を生成するには、以下のコマンドを実行します：
@@ -95,7 +120,10 @@ cargo build --release --features ktls
 
 ## 設定
 
-`config.toml`:
+デフォルトでは `/etc/zerocopy-server/config.toml` を読み込みます。
+`-c` または `--config` オプションで別のパスを指定できます。
+
+設定ファイル例（`config.toml`）:
 
 ```toml
 [server]
@@ -980,13 +1008,13 @@ wrk -t4 -c100 -d30s https://localhost/
 
 # 1. kTLS無効（rustls使用）
 cargo build --release
-./target/release/zerocopy-server &
+./zerocopy-server -c ./config.toml &
 wrk -t4 -c100 -d30s https://localhost/
 
 # 2. kTLS有効（rustls + ktls2使用）
 cargo build --release --features ktls
 # config.tomlでktls_enabled = true
-./target/release/zerocopy-server &
+./zerocopy-server -c ./config.toml &
 wrk -t4 -c100 -d30s https://localhost/
 ```
 
@@ -1001,7 +1029,7 @@ SIGINT（Ctrl+C）またはSIGTERMを受信すると、サーバーは優雅に�
 
 ```bash
 # サーバー起動
-./target/release/zerocopy-server &
+./zerocopy-server -c ./config.toml &
 
 # 優雅な終了
 kill -SIGTERM $!
@@ -1016,10 +1044,12 @@ SIGHUPを受信すると、サーバーは設定ファイルを再読み込み�
 ### 動作
 
 1. SIGHUPシグナルを受信
-2. `config.toml` を再読み込み
+2. 起動時に指定した設定ファイルを再読み込み
 3. 設定のバリデーション
 4. `ArcSwap` によるロックフリーな設定更新
 5. 新規接続は新しい設定を使用
+
+> **Note**: リロード時は起動時に `-c` オプションで指定したパス（またはデフォルトの `/etc/zerocopy-server/config.toml`）が使用されます。
 
 ```bash
 # 設定ファイルを編集
@@ -1270,8 +1300,9 @@ file_path = "/var/log/zerocopy-server.log"
 
 - [prometheus](https://crates.io/crates/prometheus): Prometheusメトリクスライブラリ
 
-### 並行制御
+### CLI・並行制御
 
+- [clap](https://crates.io/crates/clap): コマンドライン引数パーサー
 - [arc-swap](https://crates.io/crates/arc-swap): ロックフリーなArc交換（設定ホットリロード用）
 - [ctrlc](https://crates.io/crates/ctrlc): シグナルハンドリング（Graceful Shutdown用）
 - [signal-hook](https://crates.io/crates/signal-hook): SIGHUPハンドリング（Graceful Reload用）
