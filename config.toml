@@ -299,6 +299,29 @@ url = "http://localhost:9000/"
   allowed_methods = ["GET", "POST"]
 
 # ------------------------------------------
+# WebSocket プロキシ
+# ------------------------------------------
+# Connection: Upgrade と Upgrade: websocket ヘッダーを自動検出
+# 101 Switching Protocols 後は双方向バイパス転送
+# 
+# [path_routes."example.com"."/ws/"]
+# type = "Proxy"
+# url = "http://localhost:3000"
+
+# ------------------------------------------
+# ロードバランシング（Upstream参照）
+# ------------------------------------------
+# upstreams セクションで定義したグループを参照
+# url の代わりに upstream を指定
+#
+# [path_routes."example.com"."/api-lb/"]
+# type = "Proxy"
+# upstream = "backend-pool"
+#
+#   [path_routes."example.com"."/api-lb/".security]
+#   rate_limit_requests_per_min = 100
+
+# ------------------------------------------
 # ルートパス
 # ------------------------------------------
 # "/" は完全一致（/へのリクエストのみマッチ）

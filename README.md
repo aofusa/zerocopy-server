@@ -4,22 +4,39 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 
 ## 特徴
 
+### コア機能
 - **非同期I/O**: monoio (io_uring) による効率的なI/O処理
 - **TLS**: rustls によるメモリ安全な Pure Rust TLS実装
 - **kTLS**: rustls + ktls2 によるカーネルTLSオフロード対応（Linux 5.15+）
 - **高速アロケータ**: mimalloc による高速メモリ割り当て + Huge Pages対応
 - **高速ルーティング**: Radix Tree (matchit) によるO(log n)パスマッチング
+
+### プロキシ機能
 - **コネクションプール**: バックエンド接続の再利用によるレイテンシ削減（HTTP/HTTPS両対応）
-- **バッファプール**: メモリアロケーションの削減
+- **ロードバランシング**: 複数バックエンドへのリクエスト分散（Round Robin/Least Connections/IP Hash）
+- **健康チェック**: HTTPベースのアクティブヘルスチェックによる自動フェイルオーバー
+- **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ
+
+### HTTP処理
 - **Keep-Alive**: HTTP/1.1 Keep-Alive完全サポート
 - **Chunked転送**: RFC 7230準拠のChunkedデコーダ（ステートマシンベース）
+- **バッファプール**: メモリアロケーションの削減
+
+### パフォーマンス
 - **CPUアフィニティ**: ワーカースレッドのCPUコアピン留め
 - **CBPF振り分け**: SO_REUSEPORTのクライアントIPベースロードバランシング（Linux 4.6+）
+
+### 運用機能
 - **Graceful Shutdown**: SIGINT/SIGTERMによる優雅な終了
+- **Graceful Reload**: SIGHUPによる設定のホットリロード（ゼロダウンタイム）
 - **非同期ログ**: ftlog による高性能非同期ログ
+- **設定バリデーション**: 起動時の詳細な設定ファイル検証
+
+### セキュリティ
 - **同時接続数制限**: グローバルな接続数上限設定
 - **レートリミッター**: スライディングウィンドウ方式のレート制限
 - **IP制限**: CIDR対応のIPアドレスフィルタリング
+- **権限降格**: root起動後の非特権ユーザーへの降格
 
 ## ビルド
 
@@ -179,8 +196,11 @@ path = "/var/www/index.html"
 
 | タイプ | 説明 | 設定例 |
 |--------|------|--------|
-| `Proxy` | HTTPリバースプロキシ | `{ type = "Proxy", url = "http://localhost:8080" }` |
+| `Proxy` | HTTPリバースプロキシ（単一） | `{ type = "Proxy", url = "http://localhost:8080" }` |
+| `Proxy` | HTTPリバースプロキシ（LB） | `{ type = "Proxy", upstream = "backend-pool" }` |
 | `File` | 静的ファイル配信 | `{ type = "File", path = "/var/www", mode = "sendfile" }` |
+
+> **Note**: `Proxy` タイプは `url`（単一バックエンド）または `upstream`（ロードバランシング）のいずれかを指定します。WebSocketは両方で自動サポートされます。
 
 ### ルーティングの挙動（Nginx風）
 
@@ -302,6 +322,51 @@ url = "http://localhost:8080"
 [path_routes."example.com"."/secure/"]
 type = "Proxy"
 url = "https://backend.example.com"
+```
+
+### ロードバランシング設定
+
+複数バックエンドへのリクエスト分散：
+
+```toml
+# Upstreamグループの定義
+[upstreams."api-pool"]
+algorithm = "round_robin"  # または "least_conn", "ip_hash"
+servers = [
+  "http://api1:8080",
+  "http://api2:8080",
+  "http://api3:8080"
+]
+
+  # 健康チェック（オプション）
+  [upstreams."api-pool".health_check]
+  interval_secs = 10
+  path = "/health"
+  timeout_secs = 5
+  healthy_statuses = [200]
+  unhealthy_threshold = 3
+  healthy_threshold = 2
+
+# Upstreamを参照するルート
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+upstream = "api-pool"
+```
+
+### WebSocket設定
+
+WebSocketは通常のProxyで自動サポート：
+
+```toml
+# WebSocketアプリケーション
+[path_routes."example.com"."/ws/"]
+type = "Proxy"
+url = "http://localhost:3000"
+
+# ロードバランシング付きWebSocket
+[path_routes."example.com"."/ws-lb/"]
+type = "Proxy"
+upstream = "websocket-pool"
 ```
 
 ### グローバルセキュリティ設定
@@ -659,6 +724,186 @@ kill -SIGTERM $!
 # または Ctrl+C
 ```
 
+## Graceful Reload（ホットリロード）
+
+SIGHUPを受信すると、サーバーは設定ファイルを再読み込みします。
+既存の接続は中断されず、新しい接続から新しい設定が適用されます。
+
+### 動作
+
+1. SIGHUPシグナルを受信
+2. `config.toml` を再読み込み
+3. 設定のバリデーション
+4. `ArcSwap` によるロックフリーな設定更新
+5. 新規接続は新しい設定を使用
+
+```bash
+# 設定ファイルを編集
+vim config.toml
+
+# 設定を再読み込み（ゼロダウンタイム）
+kill -SIGHUP $(pgrep zerocopy-server)
+```
+
+### 対応する変更
+
+| 項目 | ホットリロード対応 |
+|------|-------------------|
+| ルーティング設定 | ✅ |
+| セキュリティ設定 | ✅ |
+| Upstream設定 | ✅ |
+| TLS証明書 | ✅ |
+| リッスンアドレス | ❌（再起動が必要） |
+| ワーカースレッド数 | ❌（再起動が必要） |
+
+## WebSocketサポート
+
+WebSocket（RFC 6455）のプロキシに対応しています。
+`Connection: Upgrade` と `Upgrade: websocket` ヘッダーを自動検出し、
+双方向のデータ転送を行います。
+
+### 動作
+
+1. クライアントからの Upgrade リクエストを検出
+2. バックエンドに Upgrade リクエストを転送
+3. 101 Switching Protocols を受信
+4. 双方向のバイパス転送を開始
+5. どちらかの接続が閉じるまで継続
+
+### 設定例
+
+WebSocketは通常のProxyバックエンドで自動的にサポートされます：
+
+```toml
+# WebSocketアプリケーション
+[path_routes."example.com"."/ws/"]
+type = "Proxy"
+url = "http://localhost:3000"
+```
+
+### 対応バックエンド
+
+| プロトコル | サポート |
+|-----------|---------|
+| HTTP → WS | ✅ |
+| HTTPS → WSS | ✅ |
+
+## ロードバランシング
+
+複数のバックエンドサーバーへのリクエスト分散に対応しています。
+
+### アルゴリズム
+
+| アルゴリズム | 説明 | 用途 |
+|-------------|------|------|
+| `round_robin` | 順番に振り分け（デフォルト） | 汎用 |
+| `least_conn` | 接続数が最小のサーバーを選択 | 長時間接続 |
+| `ip_hash` | クライアントIPでハッシュ | セッション維持 |
+
+### 設定例
+
+```toml
+# Upstreamグループの定義
+[upstreams."backend-pool"]
+algorithm = "round_robin"
+servers = [
+  "http://localhost:8080",
+  "http://localhost:8081",
+  "http://localhost:8082"
+]
+
+# ルートでUpstreamを参照
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+upstream = "backend-pool"  # URLの代わりにupstreamを指定
+```
+
+### 単一バックエンドとの互換性
+
+従来の `url` 指定も引き続き使用可能です：
+
+```toml
+# 従来の単一バックエンド指定
+[path_routes."example.com"."/simple/"]
+type = "Proxy"
+url = "http://localhost:8080"
+```
+
+## 健康チェック（Health Check）
+
+バックエンドサーバーの健康状態を監視し、異常なサーバーを自動的に除外します。
+
+### 動作
+
+1. バックグラウンドスレッドで定期的にHTTPリクエストを送信
+2. レスポンスのステータスコードをチェック
+3. 連続失敗回数が閾値に達したらサーバーを除外
+4. 連続成功回数が閾値に達したらサーバーを復帰
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `interval_secs` | チェック間隔（秒） | 10 |
+| `path` | チェック対象パス | `/` |
+| `timeout_secs` | タイムアウト（秒） | 5 |
+| `healthy_statuses` | 成功と判断するステータスコード | [200, 201, 202, 204, 301, 302, 304] |
+| `unhealthy_threshold` | unhealthyにする連続失敗回数 | 3 |
+| `healthy_threshold` | healthyに戻す連続成功回数 | 2 |
+
+### 設定例
+
+```toml
+[upstreams."api-servers"]
+algorithm = "least_conn"
+servers = [
+  "http://api1.internal:8080",
+  "http://api2.internal:8080",
+  "http://api3.internal:8080"
+]
+
+  [upstreams."api-servers".health_check]
+  interval_secs = 10
+  path = "/health"
+  timeout_secs = 5
+  healthy_statuses = [200]
+  unhealthy_threshold = 3
+  healthy_threshold = 2
+```
+
+### ログ出力
+
+健康状態の変化はログに出力されます：
+
+```
+[INFO] Upstream api1.internal:8080 is now unhealthy
+[INFO] Upstream api1.internal:8080 is now healthy
+```
+
+## 設定ファイルバリデーション
+
+起動時に設定ファイルの詳細な検証を行い、問題があれば明確なエラーメッセージを出力します。
+
+### 検証項目
+
+| 項目 | チェック内容 |
+|------|-------------|
+| TLS証明書 | ファイルの存在確認 |
+| TLS秘密鍵 | ファイルの存在確認 |
+| リッスンアドレス | 有効なソケットアドレス形式 |
+| Upstream URL | 有効なURL形式 |
+| プロキシURL | 有効なURL形式 |
+| ファイルパス | ファイル/ディレクトリの存在確認 |
+| ファイルモード | `sendfile` または `memory` |
+
+### エラーメッセージ例
+
+```
+Error: TLS certificate file not found: /path/to/cert.pem
+Error: Invalid proxy URL for route 'example.com:/api/': invalid-url
+Error: Upstream 'backend-pool' not found
+```
+
 ## ログ設定
 
 ftlogを使用した高性能非同期ログを提供します。ftlogは内部でバックグラウンドスレッドとチャネルを使用しており、ワーカースレッドへの影響を最小化しています。
@@ -704,6 +949,7 @@ file_path = "/var/log/zerocopy-server.log"
 
 - [arc-swap](https://crates.io/crates/arc-swap): ロックフリーなArc交換（設定ホットリロード用）
 - [ctrlc](https://crates.io/crates/ctrlc): シグナルハンドリング（Graceful Shutdown用）
+- [signal-hook](https://crates.io/crates/signal-hook): SIGHUPハンドリング（Graceful Reload用）
 - [core_affinity](https://crates.io/crates/core_affinity): CPUアフィニティ設定
 
 ### カーネル機能
