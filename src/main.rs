@@ -105,6 +105,7 @@ use monoio::time::timeout;
 use serde::Deserialize;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
+use std::env;
 use std::fs;
 use std::fs::File;
 use std::io;
@@ -3238,6 +3239,14 @@ impl Default for RuntimeConfig {
 static CURRENT_CONFIG: Lazy<ArcSwap<RuntimeConfig>> =
     Lazy::new(|| ArcSwap::from_pointee(RuntimeConfig::default()));
 
+/// デフォルトの設定ファイルパス
+const DEFAULT_CONFIG_PATH: &str = "/etc/zerocopy-server/config.toml";
+
+/// グローバルな設定ファイルパス（ホットリロード用）
+/// コマンドライン引数で指定されたパス、またはデフォルトパスを保持
+static CONFIG_PATH: Lazy<ArcSwap<PathBuf>> =
+    Lazy::new(|| ArcSwap::from_pointee(PathBuf::from(DEFAULT_CONFIG_PATH)));
+
 /// 設定をホットリロードする
 /// 
 /// 実行中のリクエストは古い設定を参照し続け、
@@ -3466,17 +3475,99 @@ fn load_backend(
 }
 
 // ====================
+// コマンドライン引数パース
+// ====================
+
+/// コマンドライン引数の解析結果
+struct CliArgs {
+    /// 設定ファイルのパス
+    config_path: PathBuf,
+}
+
+/// ヘルプメッセージを表示
+fn print_help() {
+    eprintln!("Usage: zerocopy-server [OPTIONS]");
+    eprintln!();
+    eprintln!("High-Performance Reverse Proxy Server");
+    eprintln!();
+    eprintln!("Options:");
+    eprintln!("  -c, --config <PATH>  設定ファイルのパス");
+    eprintln!("                       (デフォルト: {})", DEFAULT_CONFIG_PATH);
+    eprintln!("  -h, --help           このヘルプメッセージを表示");
+    eprintln!("  -V, --version        バージョン情報を表示");
+}
+
+/// バージョン情報を表示
+fn print_version() {
+    eprintln!("zerocopy-server {}", env!("CARGO_PKG_VERSION"));
+}
+
+/// コマンドライン引数を解析
+fn parse_args() -> Option<CliArgs> {
+    let args: Vec<String> = env::args().collect();
+    let mut config_path = PathBuf::from(DEFAULT_CONFIG_PATH);
+    
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-h" | "--help" => {
+                print_help();
+                return None;
+            }
+            "-V" | "--version" => {
+                print_version();
+                return None;
+            }
+            "-c" | "--config" => {
+                if i + 1 >= args.len() {
+                    eprintln!("Error: --config オプションには引数が必要です");
+                    print_help();
+                    return None;
+                }
+                config_path = PathBuf::from(&args[i + 1]);
+                i += 2;
+            }
+            arg if arg.starts_with("--config=") => {
+                config_path = PathBuf::from(&arg[9..]);
+                i += 1;
+            }
+            arg if arg.starts_with("-c=") => {
+                config_path = PathBuf::from(&arg[3..]);
+                i += 1;
+            }
+            arg => {
+                eprintln!("Error: 不明なオプション: {}", arg);
+                print_help();
+                return None;
+            }
+        }
+    }
+    
+    Some(CliArgs { config_path })
+}
+
+// ====================
 // メイン関数
 // ====================
 
 fn main() {
+    // コマンドライン引数を解析
+    let cli_args = match parse_args() {
+        Some(args) => args,
+        None => return, // --help や --version の場合は終了
+    };
+    
+    // 設定ファイルパスをグローバル変数に保存（ホットリロード用）
+    CONFIG_PATH.store(Arc::new(cli_args.config_path.clone()));
+    let config_path = cli_args.config_path;
+    
     // プロセスレベルで暗号プロバイダーをインストール（ring使用）
     CryptoProvider::install_default(rustls::crypto::ring::default_provider())
         .expect("Failed to install rustls crypto provider");
     
     // ログ設定を先に読み込む（ログ初期化前）
     // 設定ファイルが読めない場合はデフォルト設定を使用
-    let logging_config = load_logging_config(Path::new("config.toml"))
+    let logging_config = load_logging_config(&config_path)
         .unwrap_or_else(|_| LoggingConfigSection::default());
     
     // ftlogを設定に基づいて初期化
@@ -3484,7 +3575,7 @@ fn main() {
     // 追加の非同期化層（tokio::sync::mpsc等）は不要
     let _guard = init_logging(&logging_config);
 
-    let loaded_config = match load_config(Path::new("config.toml")) {
+    let loaded_config = match load_config(&config_path) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("Config load error: {}", e);
@@ -3533,6 +3624,7 @@ fn main() {
     
     info!("============================================");
     info!("High-Performance Reverse Proxy Server");
+    info!("Config File: {}", config_path.display());
     info!("Hostname: {}", hostname);
     info!("Listen Address: {}", listen_addr);
     info!("Threads: {} (CPU cores: {})", num_threads, num_cpus::get());
@@ -3767,8 +3859,6 @@ fn setup_signal_handler() {
 /// ワーカースレッドは CURRENT_CONFIG を参照するため、
 /// リロード後の新規リクエストは自動的に新しい設定を使用します。
 fn spawn_reload_thread() {
-    use std::path::Path;
-    
     thread::spawn(move || {
         info!("Configuration reload thread started");
         
@@ -3784,7 +3874,10 @@ fn spawn_reload_thread() {
             if RELOAD_FLAG.swap(false, Ordering::SeqCst) {
                 info!("SIGHUP received, reloading configuration...");
                 
-                match reload_config(Path::new("config.toml")) {
+                // グローバル変数から設定ファイルパスを取得
+                let config_path = CONFIG_PATH.load();
+                
+                match reload_config(&config_path) {
                     Ok(()) => {
                         info!("Configuration reloaded successfully");
                         info!("New requests will use updated routes");
