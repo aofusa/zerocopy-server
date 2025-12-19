@@ -1978,6 +1978,69 @@ fn buf_put_vec(mut buf: Vec<u8>) {
 // 設定構造体
 // ====================
 
+/// Upstream サーバーエントリ（文字列または構造体）
+/// 
+/// 以下の2つの形式をサポート:
+/// - 文字列形式: "http://localhost:8080"
+/// - 構造体形式: { url = "https://192.168.1.100:443", sni_name = "api.example.com" }
+#[derive(Clone, Debug)]
+struct UpstreamServerEntry {
+    url: String,
+    sni_name: Option<String>,
+}
+
+impl<'de> serde::Deserialize<'de> for UpstreamServerEntry {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::{MapAccess, Visitor};
+        
+        struct UpstreamServerEntryVisitor;
+        
+        impl<'de> Visitor<'de> for UpstreamServerEntryVisitor {
+            type Value = UpstreamServerEntry;
+            
+            fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+                formatter.write_str("a string URL or an object with 'url' and optional 'sni_name'")
+            }
+            
+            // 文字列形式: "http://localhost:8080"
+            fn visit_str<E>(self, v: &str) -> Result<Self::Value, E>
+            where
+                E: serde::de::Error,
+            {
+                Ok(UpstreamServerEntry {
+                    url: v.to_string(),
+                    sni_name: None,
+                })
+            }
+            
+            // 構造体形式: { url = "...", sni_name = "..." }
+            fn visit_map<M>(self, mut map: M) -> Result<Self::Value, M::Error>
+            where
+                M: MapAccess<'de>,
+            {
+                let mut url: Option<String> = None;
+                let mut sni_name: Option<String> = None;
+                
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "url" => url = Some(map.next_value()?),
+                        "sni_name" => sni_name = Some(map.next_value()?),
+                        _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
+                    }
+                }
+                
+                let url = url.ok_or_else(|| serde::de::Error::missing_field("url"))?;
+                Ok(UpstreamServerEntry { url, sni_name })
+            }
+        }
+        
+        deserializer.deserialize_any(UpstreamServerEntryVisitor)
+    }
+}
+
 /// Upstream 設定（ロードバランシング用）
 #[derive(Deserialize, Clone, Debug)]
 struct UpstreamConfig {
@@ -1987,8 +2050,9 @@ struct UpstreamConfig {
     /// - "ip_hash": クライアントIPハッシュ
     #[serde(default)]
     algorithm: LoadBalanceAlgorithm,
-    /// バックエンドサーバーURL一覧
-    servers: Vec<String>,
+    /// バックエンドサーバーエントリ一覧
+    /// 文字列形式と構造体形式の両方をサポート
+    servers: Vec<UpstreamServerEntry>,
     /// 健康チェック設定（オプション）
     #[serde(default)]
     health_check: Option<HealthCheckConfig>,
@@ -2634,9 +2698,13 @@ pub struct UpstreamGroup {
 
 impl UpstreamGroup {
     /// 新しい Upstream グループを作成
-    fn new(name: String, urls: Vec<String>, algorithm: LoadBalanceAlgorithm, health_check: Option<HealthCheckConfig>) -> Option<Self> {
-        let servers: Vec<UpstreamServer> = urls.iter()
-            .filter_map(|url| ProxyTarget::parse(url).map(UpstreamServer::new))
+    fn new(name: String, entries: Vec<UpstreamServerEntry>, algorithm: LoadBalanceAlgorithm, health_check: Option<HealthCheckConfig>) -> Option<Self> {
+        let servers: Vec<UpstreamServer> = entries.iter()
+            .filter_map(|entry| {
+                ProxyTarget::parse(&entry.url)
+                    .map(|target| target.with_sni_name(entry.sni_name.clone()))
+                    .map(UpstreamServer::new)
+            })
             .collect();
         
         if servers.is_empty() {
@@ -2976,11 +3044,11 @@ fn validate_config(config: &Config) -> io::Result<()> {
                 ));
             }
             
-            for server_url in &upstream.servers {
-                if ProxyTarget::parse(server_url).is_none() {
+            for entry in &upstream.servers {
+                if ProxyTarget::parse(&entry.url).is_none() {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
-                        format!("Invalid server URL in upstream '{}': {}", name, server_url)
+                        format!("Invalid server URL in upstream '{}': {}", name, entry.url)
                     ));
                 }
             }

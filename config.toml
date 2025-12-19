@@ -150,6 +150,24 @@ ktls_fallback_enabled = false
 #   unhealthy_threshold = 3
 #   healthy_threshold = 2
 
+# ------------------------------------------
+# SNI名指定付きHTTPSアップストリーム
+# ------------------------------------------
+# サーバーエントリは文字列と構造体の両方をサポート:
+#   - 文字列形式: "http://localhost:8080"
+#   - 構造体形式: { url = "https://192.168.1.100:443", sni_name = "api.example.com" }
+#
+# IPアドレス指定でHTTPSバックエンドに接続する場合、sni_nameでドメイン名を指定可能
+# これにより、仮想ホスト構成のサーバーでも正しい証明書を取得できます
+#
+# [upstreams."https-pool"]
+# algorithm = "least_conn"
+# servers = [
+#   { url = "https://192.168.1.100:443", sni_name = "api.example.com" },
+#   { url = "https://192.168.1.101:443", sni_name = "api.example.com" },
+#   "https://api.example.com:443"  # 通常のドメイン名指定（sni_name不要）
+# ]
+
 
 # ==========================================
 # ホストベースのルーティング定義
