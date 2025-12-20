@@ -248,6 +248,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // スレッド・プロセス管理
     // ============================================
+    24,  // sched_yield (スレッドスケジューリング)
     56,  // clone (スレッド作成)
     60,  // exit
     186, // gettid
@@ -303,10 +304,11 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ============================================
     // epoll (monoio フォールバック、io_uring 非対応環境)
     // ============================================
-    213, // epoll_create1
+    213, // epoll_create (レガシー)
     232, // epoll_wait
     233, // epoll_ctl
     281, // epoll_pwait
+    291, // epoll_create1 (EPOLL_CLOEXEC対応)
 
     // ============================================
     // ログファイル操作
@@ -315,6 +317,15 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     75,  // fdatasync
     77,  // ftruncate
     285, // fallocate
+
+    // ============================================
+    // イベント・タイマー（monoio io_uring ランタイム必須）
+    // ============================================
+    283, // timerfd_create (monoio enable_timer() 必須)
+    286, // timerfd_settime
+    287, // timerfd_gettime
+    290, // eventfd2 (io_uring イベント通知)
+    293, // pipe2 (内部通信)
 ];
 
 /// 許可するシステムコールのリスト (aarch64)
@@ -444,6 +455,15 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     83,  // fdatasync
     46,  // ftruncate
     47,  // fallocate
+
+    // ============================================
+    // イベント・タイマー（monoio io_uring ランタイム必須）
+    // ============================================
+    85,  // timerfd_create (monoio enable_timer() 必須)
+    86,  // timerfd_settime
+    87,  // timerfd_gettime
+    19,  // eventfd2 (io_uring イベント通知)
+    59,  // pipe2 (内部通信)
 ];
 
 // ====================
@@ -899,6 +919,12 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
     info!("Landlock: ABI version {} detected", abi_version);
 
     // ABIバージョンに応じたアクセス権限を設定
+    // 注意: ABIバージョンと権限の対応
+    //   - ABI v1 (5.13+): 基本ファイルシステム権限
+    //   - ABI v2 (5.19+): REFER権限追加
+    //   - ABI v3 (6.2+):  TRUNCATE権限追加
+    //   - ABI v4 (6.7+):  ネットワーク制限サポート（FSは変更なし）
+    //   - ABI v5 (6.10+): IOCTL_DEV権限追加
     let (read_access, write_access) = match abi_version {
         1 => {
             // ABI v1: 基本権限のみ
@@ -917,8 +943,9 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
                         LANDLOCK_ACCESS_FS_REFER;
             (read, write)
         }
-        3 => {
-            // ABI v3: TRUNCATE権限追加
+        3 | 4 => {
+            // ABI v3-v4: TRUNCATE権限追加
+            // 注: ABI v4はネットワーク制限を追加するが、FS権限は変更なし
             let read = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
             let write = read | LANDLOCK_ACCESS_FS_WRITE_FILE | 
                         LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_REMOVE_DIR |
@@ -927,7 +954,7 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
             (read, write)
         }
         _ => {
-            // ABI v4+: IOCTL_DEV権限追加（最新）
+            // ABI v5+: IOCTL_DEV権限追加（Linux 6.10+）
             let read = LANDLOCK_ACCESS_FS_READ_FILE | LANDLOCK_ACCESS_FS_READ_DIR;
             let write = read | LANDLOCK_ACCESS_FS_WRITE_FILE | 
                         LANDLOCK_ACCESS_FS_REMOVE_FILE | LANDLOCK_ACCESS_FS_REMOVE_DIR |
@@ -959,6 +986,10 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
 
     // 読み取り専用パスのルール追加
     for path in &config.landlock_read_paths {
+        // 空パスをスキップ
+        if path.is_empty() {
+            continue;
+        }
         if let Ok(fd) = std::fs::File::open(path) {
             use std::os::unix::io::AsRawFd;
             let path_attr = LandlockPathBeneathAttr {
@@ -980,6 +1011,10 @@ fn apply_landlock(config: &SecurityConfig) -> io::Result<()> {
 
     // 読み書きパスのルール追加
     for path in &config.landlock_write_paths {
+        // 空パスをスキップ
+        if path.is_empty() {
+            continue;
+        }
         if let Ok(fd) = std::fs::File::open(path) {
             use std::os::unix::io::AsRawFd;
             let path_attr = LandlockPathBeneathAttr {
