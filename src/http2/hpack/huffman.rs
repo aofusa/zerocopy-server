@@ -318,86 +318,65 @@ type DecodeEntry = (u8, u8, u8);
 /// Huffman デコード
 ///
 /// Huffman 符号化されたバイト列をデコードします。
+/// ビットストリームベースの完全な実装。
 pub fn huffman_decode(src: &[u8]) -> Result<Vec<u8>, HpackError> {
     let mut result = Vec::with_capacity(src.len() * 2);
-    let mut state: u32 = 0;
-    let mut accept = true;
-
+    let mut bits: u64 = 0;
+    let mut bits_left: u32 = 0;
+    
     for &byte in src {
-        // 4ビットずつ処理
-        let nibble_hi = (byte >> 4) as usize;
-        let nibble_lo = (byte & 0x0F) as usize;
-
-        // 上位4ビット
-        let (new_state, sym, flags) = decode_nibble(state, nibble_hi);
-        state = new_state;
-        if flags & 0x01 != 0 {
-            result.push(sym);
-        }
-        if flags & 0x02 != 0 {
-            return Err(HpackError::HuffmanDecodeError);
-        }
-        #[allow(unused_assignments)]
-        {
-            accept = flags & 0x04 != 0;
-        }
-
-        // 下位4ビット
-        let (new_state, sym, flags) = decode_nibble(state, nibble_lo);
-        state = new_state;
-        if flags & 0x01 != 0 {
-            result.push(sym);
-        }
-        if flags & 0x02 != 0 {
-            return Err(HpackError::HuffmanDecodeError);
-        }
-        accept = flags & 0x04 != 0;
-    }
-
-    // 最終状態チェック
-    if !accept {
-        return Err(HpackError::HuffmanDecodeError);
-    }
-
-    Ok(result)
-}
-
-/// 4ビット単位のデコード処理
-///
-/// Returns: (新しい状態, 出力シンボル, フラグ)
-/// フラグ: bit0=出力あり, bit1=エラー, bit2=受理状態
-fn decode_nibble(state: u32, nibble: usize) -> (u32, u8, u8) {
-    // 簡略化された状態機械
-    // 完全な実装では、RFC 7541 Appendix B に基づく256状態のテーブルを使用
-    
-    // この実装では、一般的な ASCII 文字のみを高速にデコードし、
-    // それ以外は状態遷移テーブルを使用
-    
-    #[allow(dead_code)]
-    static DECODE_TABLE: &[&[(u32, u8, u8)]; 256] = &[&[]; 256]; // プレースホルダー
-    
-    // 簡略実装: ビット列を蓄積してシンボルを検索
-    let bits = (state << 4) | (nibble as u32);
-    
-    for (sym, &(code, len)) in HUFFMAN_ENCODE_TABLE.iter().enumerate() {
-        if len <= 12 && sym < 256 {
-            let shift = 12 - len as u32;
-            let mask = (1u32 << len) - 1;
-            if (bits >> shift) & mask == code {
-                // マッチ
-                let remaining = bits & ((1u32 << shift) - 1);
-                let flags = 0x01 | 0x04; // 出力あり + 受理
-                return (remaining, sym as u8, flags);
+        bits = (bits << 8) | (byte as u64);
+        bits_left += 8;
+        
+        // ビットが十分にある間、シンボルをデコード
+        while bits_left >= 5 {
+            // 最も長い符号は30ビットだが、ほとんどは短い
+            // 上位ビットから符号を探す
+            let mut found = false;
+            
+            for (sym, &(code, len)) in HUFFMAN_ENCODE_TABLE.iter().enumerate() {
+                if sym >= 256 {
+                    continue; // EOS (256) はスキップ
+                }
+                
+                let len = len as u32;
+                if bits_left >= len {
+                    // 上位 len ビットを取り出して比較
+                    let shift = bits_left - len;
+                    let extracted = (bits >> shift) as u32;
+                    let mask = (1u32 << len) - 1;
+                    
+                    if (extracted & mask) == code {
+                        result.push(sym as u8);
+                        bits_left -= len;
+                        bits &= (1u64 << bits_left) - 1;
+                        found = true;
+                        break;
+                    }
+                }
+            }
+            
+            if !found {
+                // 5ビット以上あるのにマッチしない場合、さらにビットが必要
+                break;
             }
         }
     }
     
-    // 継続
-    if bits < (1 << 28) {
-        (bits, 0, 0x04) // 受理状態
-    } else {
-        (0, 0, 0x02) // エラー
+    // 残りビットのチェック（パディング）
+    // パディングは全て1のビットで構成される（EOS プレフィックス）
+    if bits_left > 0 {
+        if bits_left > 7 {
+            return Err(HpackError::HuffmanDecodeError);
+        }
+        // パディングビットは全て1であるべき
+        let padding_mask = (1u64 << bits_left) - 1;
+        if (bits & padding_mask) != padding_mask {
+            return Err(HpackError::HuffmanDecodeError);
+        }
     }
+    
+    Ok(result)
 }
 
 /// エンコード後のサイズを計算 (実際にエンコードせずに)

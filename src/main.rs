@@ -148,7 +148,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::atomic::AtomicUsize;
 use std::thread;
 use std::time::Duration;
-use ftlog::{info, error, warn, LevelFilter};
+use ftlog::{info, error, warn, debug, LevelFilter};
 use memchr::memchr3;
 use time::OffsetDateTime;
 use arc_swap::ArcSwap;
@@ -2182,12 +2182,14 @@ pub struct Http2ConfigSection {
     pub connection_window_size: u32,
 }
 
-fn default_h2_header_table_size() -> u32 { 4096 }
-fn default_h2_max_concurrent_streams() -> u32 { 100 }
-fn default_h2_initial_window_size() -> u32 { 65535 }
-fn default_h2_max_frame_size() -> u32 { 16384 }
-fn default_h2_max_header_list_size() -> u32 { 16384 }
-fn default_h2_connection_window_size() -> u32 { 65535 }
+// HTTP/2 設定のデフォルト値（high_performance と同等）
+// HPACK動的テーブルサイズを大きくすることで、ヘッダー圧縮効率が向上
+fn default_h2_header_table_size() -> u32 { 65536 }      // 64KB (より多くのヘッダーをキャッシュ)
+fn default_h2_max_concurrent_streams() -> u32 { 256 }   // より多くの同時ストリーム
+fn default_h2_initial_window_size() -> u32 { 1048576 }  // 1MB (より大きなウィンドウ)
+fn default_h2_max_frame_size() -> u32 { 65536 }         // 64KB (より大きなフレーム)
+fn default_h2_max_header_list_size() -> u32 { 65536 }   // 64KB
+fn default_h2_connection_window_size() -> u32 { 1048576 } // 1MB
 
 impl Default for Http2ConfigSection {
     fn default() -> Self {
@@ -4856,7 +4858,16 @@ where
                     if let Some(stream) = conn.get_stream(stream_id) {
                         let method = stream.method().map(|m| m.to_vec()).unwrap_or_else(|| b"GET".to_vec());
                         let path = stream.path().map(|p| p.to_vec()).unwrap_or_else(|| b"/".to_vec());
-                        let authority = stream.authority().map(|a| a.to_vec()).unwrap_or_default();
+                        // :authority を取得、見つからない場合は host ヘッダーにフォールバック
+                        let authority = stream.authority()
+                            .map(|a| a.to_vec())
+                            .or_else(|| {
+                                // :authority が無い場合は host ヘッダーを確認
+                                stream.request_headers.iter()
+                                    .find(|h| h.name.eq_ignore_ascii_case(b"host"))
+                                    .map(|h| h.value.clone())
+                            })
+                            .unwrap_or_default();
                         let body_len = stream.request_body.len();
                         (method, path, authority, body_len)
                     } else {
@@ -4924,6 +4935,16 @@ async fn handle_http2_single_request<S>(
 where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
 {
+    // デバッグログ: リクエスト情報を出力
+    debug!(
+        "[HTTP/2] Request: stream={} method={} path={} authority={} (len={})",
+        stream_id,
+        String::from_utf8_lossy(method),
+        String::from_utf8_lossy(path),
+        String::from_utf8_lossy(authority),
+        authority.len()
+    );
+    
     // メトリクスエンドポイントの処理（/__metrics）
     if path == b"/__metrics" && method == b"GET" {
         let body = encode_prometheus_metrics();
@@ -4939,11 +4960,27 @@ where
     }
     
     // Backend選択（HTTP/1.1と同じロジック）
-    let backend_result = find_backend(authority, path, host_routes, path_routes);
+    // まず authority でルート検索、見つからない場合は空の authority でデフォルトルートを検索
+    let backend_result = find_backend(authority, path, host_routes, path_routes)
+        .or_else(|| {
+            // authority が空でない場合、デフォルトルートを検索
+            if !authority.is_empty() {
+                debug!("[HTTP/2] No route found for authority '{}', trying default routes", 
+                    String::from_utf8_lossy(authority));
+                find_backend(b"", path, host_routes, path_routes)
+            } else {
+                None
+            }
+        });
     
     let (prefix, backend) = match backend_result {
         Some(b) => b,
         None => {
+            warn!(
+                "[HTTP/2] No backend found for authority='{}' path='{}'",
+                String::from_utf8_lossy(authority),
+                String::from_utf8_lossy(path)
+            );
             let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
             let _ = conn.send_response(stream_id, 400, headers, Some(b"Bad Request")).await;
             return Some((400, 11));
