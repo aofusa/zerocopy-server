@@ -572,6 +572,8 @@ where
     }
 
     /// レスポンスを送信
+    /// 
+    /// HTTP/2 RFC 7540 Section 8.1.2 に従い、ヘッダー名は小文字に変換されます。
     pub async fn send_response(
         &mut self,
         stream_id: u32,
@@ -579,29 +581,50 @@ where
         headers: &[(&[u8], &[u8])],
         body: Option<&[u8]>,
     ) -> Http2Result<()> {
-        // ステータスとヘッダーをエンコード
-        let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 1);
+        // :status 用のバッファ（動的ステータスコード用）
+        let mut status_buf = [0u8; 3];
         
-        // :status
-        let status_str = match status {
-            200 => b"200".as_slice(),
-            204 => b"204".as_slice(),
-            206 => b"206".as_slice(),
-            304 => b"304".as_slice(),
-            400 => b"400".as_slice(),
-            404 => b"404".as_slice(),
-            500 => b"500".as_slice(),
+        // ステータスコードを文字列に変換
+        let status_str: &[u8] = match status {
+            200 => b"200",
+            204 => b"204",
+            206 => b"206",
+            301 => b"301",
+            302 => b"302",
+            304 => b"304",
+            400 => b"400",
+            401 => b"401",
+            403 => b"403",
+            404 => b"404",
+            500 => b"500",
+            502 => b"502",
+            503 => b"503",
+            504 => b"504",
             _ => {
-                // 動的に生成 (このケースは稀)
-                // ここでは簡略化のため 200 にフォールバック
-                b"200".as_slice()
+                // 動的に生成（3桁のステータスコード）
+                let s = status.min(999);
+                status_buf[0] = b'0' + (s / 100) as u8;
+                status_buf[1] = b'0' + ((s / 10) % 10) as u8;
+                status_buf[2] = b'0' + (s % 10) as u8;
+                &status_buf
             }
         };
+        
+        // HTTP/2 RFC 7540 Section 8.1.2:
+        // "header field names MUST be converted to lowercase prior to their encoding in HTTP/2"
+        // ヘッダー名を小文字に変換するためのストレージ
+        let mut lowercase_names: Vec<Vec<u8>> = Vec::with_capacity(headers.len());
+        for &(name, _) in headers {
+            lowercase_names.push(name.to_ascii_lowercase());
+        }
+        
+        // ステータスとヘッダーをエンコード
+        let mut header_list: Vec<(&[u8], &[u8], bool)> = Vec::with_capacity(headers.len() + 1);
         header_list.push((b":status", status_str, false));
-
-        // その他のヘッダー
-        for &(name, value) in headers {
-            header_list.push((name, value, false));
+        
+        // その他のヘッダー（小文字変換済み）
+        for (i, &(_, value)) in headers.iter().enumerate() {
+            header_list.push((&lowercase_names[i], value, false));
         }
 
         let end_stream = body.is_none() || body.map(|b| b.is_empty()).unwrap_or(true);
