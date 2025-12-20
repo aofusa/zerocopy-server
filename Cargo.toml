@@ -88,3 +88,8 @@ quiche = { version = "0.23", optional = true }
 # - rustls の依存として使用（TLS 1.2/1.3）
 # - quiche (HTTP/3) でも使用（乱数生成、暗号化）
 ring = "0.17"
+
+# nix: Unix システムコール用のRustラッパー
+# - uname() でカーネルバージョン取得
+# - セキュリティモジュールで使用
+nix = { version = "0.29", features = ["uio", "process", "feature"] }

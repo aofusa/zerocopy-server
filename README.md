@@ -45,6 +45,9 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **レートリミッター**: スライディングウィンドウ方式のレート制限
 - **IP制限**: CIDR対応のIPアドレスフィルタリング
 - **権限降格**: root起動後の非特権ユーザーへの降格
+- **seccompフィルタ**: BPFベースのシステムコール制限（オプション）
+- **Landlockサンドボックス**: ファイルシステムアクセス制限（Linux 5.13+）
+- **systemdサンドボックス**: 名前空間隔離・システムコール制限対応
 
 ## ビルド
 
@@ -1540,6 +1543,287 @@ flush_interval_ms = 1000
 file_path = "/var/log/zerocopy-server.log"
 ```
 
+## 自己サンドボックス化（Self-Sandboxing）
+
+このサーバーは、bubblewrapなどの外部ツールを使用せずに、**コード内から自己隔離**する機能を内蔵しています。
+
+### なぜ外部ツールではなくコード内実装か？
+
+| 方式 | メリット | デメリット |
+|------|---------|-----------|
+| bubblewrap (外部) | 柔軟な設定、既存ツール | 追加の依存、設定の複雑さ |
+| **本サーバー (内蔵)** | ゼロ依存、コードで宣言、自動継承 | Linuxカーネル依存 |
+
+### 実装済みの自己隔離機能
+
+#### 1. Landlock ファイルシステム制限 (Linux 5.13+)
+
+プロセスが「これ以降、このディレクトリ以外は見ません」と宣言できます。
+
+```toml
+[security]
+enable_landlock = true
+landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64"]
+landlock_write_paths = ["/var/log/zerocopy-server"]
+```
+
+**対応ABIバージョン:**
+
+| ABI | カーネル | 機能 |
+|-----|---------|------|
+| v1 | 5.13+ | 基本的なファイルシステムアクセス制御 |
+| v2 | 5.19+ | ファイル参照権限 (REFER) |
+| v3 | 6.2+ | TRUNCATE権限 |
+| v4 | 6.7+ | ioctl権限 |
+
+#### 2. seccomp システムコール制限
+
+許可リストに基づいてシステムコールを制限します。
+
+```toml
+[security]
+enable_seccomp = true
+seccomp_mode = "filter"  # "log" / "filter" / "strict"
+```
+
+**推奨導入手順:**
+
+```bash
+# 1. まずログモードで動作確認
+enable_seccomp = true
+seccomp_mode = "log"
+
+# 2. ブロックされるシステムコールを確認
+journalctl -f | grep -i seccomp
+
+# 3. 問題なければfilterモードに変更
+seccomp_mode = "filter"
+```
+
+#### 3. 権限降格 (Privilege Dropping)
+
+root起動後、リスナー作成後に非特権ユーザーへ降格します。
+
+```toml
+[security]
+drop_privileges_user = "zerocopy"
+drop_privileges_group = "zerocopy"
+```
+
+### Namespace隔離について
+
+> **注意**: `unshare(CLONE_NEWNET)` などのNamespace隔離は、リバースプロキシでは**非推奨**です。
+> ネットワーク名前空間を分離するとプロキシ機能が失われます。
+> 
+> Namespace隔離が必要な場合は、**systemdレベル**で行うことを推奨します（下記参照）。
+
+## セキュリティ強化（systemd サンドボックス化）
+
+io_uringは強力な非同期I/Oインターフェースですが、悪用されるとカーネル権限を奪われるリスクがあります。
+このサーバーはsystemdのサンドボックス機能と組み合わせることで、堅牢なセキュリティを実現できます。
+
+### セキュリティアーキテクチャ（多層防御）
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│ systemd (PID 1) - 外側の隔離層                                   │
+│ ┌─────────────────────────────────────────────────────────────┐ │
+│ │ Namespace 隔離 (ProtectSystem, PrivateTmp, PrivateDevices)  │ │
+│ │ ┌─────────────────────────────────────────────────────────┐ │ │
+│ │ │ zerocopy-server 内蔵セキュリティ                        │ │ │
+│ │ │ ┌─────────────────────────────────────────────────────┐ │ │ │
+│ │ │ │ Landlock (ファイルシステム制限)                     │ │ │ │
+│ │ │ │ ┌─────────────────────────────────────────────────┐ │ │ │ │
+│ │ │ │ │ seccomp (システムコール制限)                    │ │ │ │ │
+│ │ │ │ │ ┌─────────────────────────────────────────────┐ │ │ │ │ │
+│ │ │ │ │ │ アプリケーション (io_uring + rustls)        │ │ │ │ │ │
+│ │ │ │ │ │ - 許可: io_uring_*, socket, read, write...  │ │ │ │ │ │
+│ │ │ │ │ │ - 拒否: fork, execve, ptrace, mount...      │ │ │ │ │ │
+│ │ │ │ │ └─────────────────────────────────────────────┘ │ │ │ │ │
+│ │ │ │ └─────────────────────────────────────────────────┘ │ │ │ │
+│ │ │ └─────────────────────────────────────────────────────┘ │ │ │
+│ │ └─────────────────────────────────────────────────────────┘ │ │
+│ └─────────────────────────────────────────────────────────────┘ │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### 必須システムコール一覧
+
+このサーバーが動作するために必要な最小限のシステムコールです：
+
+| カテゴリ | システムコール | 用途 |
+|---------|---------------|------|
+| **io_uring** | `io_uring_setup`, `io_uring_enter`, `io_uring_register` | monoio ランタイム |
+| **ネットワーク** | `socket`, `bind`, `listen`, `accept4`, `connect`, `sendto`, `recvfrom`, `sendmsg`, `recvmsg`, `setsockopt`, `getsockopt` | TCP/UDP ソケット |
+| **ファイルI/O** | `openat`, `read`, `write`, `close`, `fstat`, `readv`, `writev` | 設定、証明書、ログ |
+| **メモリ** | `mmap`, `munmap`, `mprotect`, `brk`, `madvise`, `mremap`, `mlock`, `mlock2` | mimalloc、Huge Pages、io_uring登録バッファ |
+| **スレッド** | `clone`, `clone3`, `futex`, `exit_group`, `set_tid_address` | ワーカースレッド |
+| **CPUアフィニティ** | `sched_setaffinity`, `sched_getaffinity` | CPUピンニング |
+| **シグナル** | `rt_sigaction`, `rt_sigprocmask`, `rt_sigreturn` | SIGTERM/SIGHUP |
+| **時間** | `clock_gettime`, `nanosleep` | タイムアウト |
+| **その他** | `prctl`, `ioctl`, `getrandom`, `fcntl`, `uname` | 各種制御 |
+
+### systemd サービスファイル
+
+`contrib/systemd/zerocopy-server.service` にサンドボックス化対応のサービスファイルを用意しています。
+
+#### インストール
+
+```bash
+# 1. 専用ユーザーを作成
+sudo useradd -r -s /sbin/nologin zerocopy
+
+# 2. ディレクトリを作成
+sudo mkdir -p /etc/zerocopy-server
+sudo mkdir -p /var/log/zerocopy-server
+sudo chown zerocopy:zerocopy /var/log/zerocopy-server
+
+# 3. 設定ファイルをコピー
+sudo cp config.toml /etc/zerocopy-server/
+sudo cp server.crt server.key /etc/zerocopy-server/
+sudo chmod 600 /etc/zerocopy-server/server.key
+sudo chown -R zerocopy:zerocopy /etc/zerocopy-server
+
+# 4. バイナリをインストール
+sudo cp target/release/zerocopy-server /usr/local/bin/
+
+# 5. サービスファイルをインストール
+sudo cp contrib/systemd/zerocopy-server.service /etc/systemd/system/
+sudo systemctl daemon-reload
+
+# 6. サービスを有効化・起動
+sudo systemctl enable zerocopy-server
+sudo systemctl start zerocopy-server
+```
+
+#### 重要な設定項目
+
+```ini
+[Service]
+# === ユーザー ===
+User=zerocopy
+Group=zerocopy
+
+# === リソース制限 ===
+# io_uring 登録バッファにはメモリロックが必要
+LimitMEMLOCK=infinity
+LimitNOFILE=1048576
+
+# === ファイルシステム隔離 ===
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadOnlyPaths=/etc/zerocopy-server
+ReadWritePaths=/var/log/zerocopy-server
+
+# === 名前空間隔離 ===
+RestrictNamespaces=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectKernelTunables=yes
+
+# === ネットワーク ===
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+
+# === セキュリティ強化 ===
+NoNewPrivileges=yes
+MemoryDenyWriteExecute=yes
+RestrictSUIDSGID=yes
+
+# === システムコール制限 ===
+# @system-service + io_uring + mlock
+SystemCallFilter=@system-service
+SystemCallFilter=io_uring_setup io_uring_enter io_uring_register
+SystemCallFilter=mlock mlock2 mlockall munlock munlockall
+SystemCallFilter=sched_setaffinity sched_getaffinity
+SystemCallErrorNumber=EPERM
+```
+
+### Huge Pages の有効化
+
+io_uring と mimalloc のパフォーマンスを最大化するには、Huge Pages を有効化します。
+
+```bash
+# 1. Huge Pages を確保（128 * 2MB = 256MB）
+echo 128 | sudo tee /proc/sys/vm/nr_hugepages
+
+# 2. 永続化
+echo "vm.nr_hugepages=128" | sudo tee -a /etc/sysctl.d/99-zerocopy.conf
+sudo sysctl -p /etc/sysctl.d/99-zerocopy.conf
+
+# 3. systemd で MEMLOCK 制限を解除
+# zerocopy-server.service に LimitMEMLOCK=infinity を設定
+```
+
+### セキュリティ検証
+
+サービスのセキュリティ状態を確認する方法：
+
+```bash
+# systemd-analyze で設定を検証
+systemd-analyze security zerocopy-server.service
+
+# 実行中のセキュリティ状態を確認
+cat /proc/$(pgrep zerocopy-server)/status | grep -E "Seccomp|NoNewPrivs|CapBnd"
+
+# 期待される出力:
+# Seccomp:        2                    # seccomp フィルタが有効
+# NoNewPrivs:     1                    # 新規特権取得不可
+# CapBnd:         0000000000000c00     # CAP_NET_BIND_SERVICE のみ
+```
+
+### トラブルシューティング
+
+#### io_uring が動作しない
+
+```bash
+# 原因: システムコールがブロックされている
+# 解決: SystemCallFilter に io_uring_* を追加
+journalctl -u zerocopy-server | grep -i "seccomp"
+
+# 手動テスト
+sudo strace -f -e trace=io_uring_setup /usr/local/bin/zerocopy-server -c /etc/zerocopy-server/config.toml
+```
+
+#### メモリロックに失敗
+
+```bash
+# 原因: MEMLOCK 制限が低い
+# 解決: LimitMEMLOCK=infinity を設定
+cat /proc/$(pgrep zerocopy-server)/limits | grep "locked memory"
+```
+
+#### 特権ポート (443/80) にバインドできない
+
+```bash
+# 原因: CAP_NET_BIND_SERVICE がない
+# 解決 1: systemd で設定
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+# 解決 2: バイナリにケイパビリティを付与
+sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/zerocopy-server
+```
+
+### 代替: bubblewrap との併用
+
+より厳格な隔離が必要な場合は、systemd と bubblewrap を併用できます：
+
+```ini
+[Service]
+ExecStart=/usr/bin/bwrap \
+    --ro-bind /usr /usr \
+    --ro-bind /lib /lib \
+    --ro-bind /lib64 /lib64 \
+    --ro-bind /etc/zerocopy-server /etc/zerocopy-server \
+    --bind /var/log/zerocopy-server /var/log/zerocopy-server \
+    --unshare-pid \
+    --die-with-parent \
+    /usr/local/bin/zerocopy-server -c /etc/zerocopy-server/config.toml
+```
+
+この構成では、systemd が外側の「器」を作り、bubblewrap がさらに厳格なファイルシステムビューを提供します。
+
 ## 参考資料
 
 ### コアライブラリ
@@ -1575,6 +1859,14 @@ file_path = "/var/log/zerocopy-server.log"
 - [Linux Kernel TLS](https://docs.kernel.org/networking/tls.html): kTLSドキュメント
 - [io_uring](https://kernel.dk/io_uring.pdf): io_uring設計ドキュメント
 - [SO_REUSEPORT](https://lwn.net/Articles/542629/): ポート共有とロードバランシング
+
+### セキュリティ
+
+- [systemd.exec](https://www.freedesktop.org/software/systemd/man/systemd.exec.html): systemdセキュリティ設定
+- [seccomp](https://docs.kernel.org/userspace-api/seccomp_filter.html): Seccomp BPFフィルタ
+- [Landlock](https://docs.kernel.org/userspace-api/landlock.html): ファイルシステムサンドボックス
+- [io_uring Security](https://www.kernel.org/doc/html/latest/userspace-api/io_uring.html): io_uringセキュリティ考慮事項
+- [bubblewrap](https://github.com/containers/bubblewrap): 非特権サンドボックスツール
 
 ## ライセンス
 

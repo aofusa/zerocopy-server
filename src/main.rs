@@ -123,6 +123,12 @@ pub mod http2;
 #[cfg(feature = "http3")]
 pub mod http3_server;
 
+/// セキュリティ強化モジュール
+/// - io_uring操作制限（IORING_REGISTER_RESTRICTIONS）
+/// - seccompシステムコール制限
+/// - Landlockファイルシステム制限
+pub mod security;
+
 use httparse::{Request, Status};
 use monoio::fs::OpenOptions;
 use monoio::buf::{IoBuf, IoBufMut};
@@ -1340,6 +1346,55 @@ pub struct GlobalSecurityConfig {
     /// グローバル同時接続上限（0 = 無制限）
     #[serde(default)]
     pub max_concurrent_connections: usize,
+    
+    // ====================
+    // io_uring / seccomp セキュリティ設定
+    // ====================
+    
+    /// seccompフィルタを有効化（Linux専用）
+    /// システムコールを制限してio_uringの悪用を防止
+    #[serde(default)]
+    pub enable_seccomp: bool,
+    
+    /// seccompモード
+    /// - "disabled": 無効
+    /// - "log": 違反をログに記録（ブロックしない）
+    /// - "filter": 違反をEPERMで拒否
+    /// - "strict": 違反したプロセスをSIGKILL
+    #[serde(default = "default_seccomp_mode")]
+    pub seccomp_mode: String,
+    
+    /// Landlockファイルシステム制限を有効化（Linux 5.13+）
+    #[serde(default)]
+    pub enable_landlock: bool,
+    
+    /// Landlock読み取り専用パス
+    #[serde(default = "default_landlock_read_paths")]
+    pub landlock_read_paths: Vec<String>,
+    
+    /// Landlock読み書きパス
+    #[serde(default = "default_landlock_write_paths")]
+    pub landlock_write_paths: Vec<String>,
+}
+
+fn default_seccomp_mode() -> String {
+    "disabled".to_string()
+}
+
+fn default_landlock_read_paths() -> Vec<String> {
+    vec![
+        "/etc".to_string(),
+        "/usr".to_string(),
+        "/lib".to_string(),
+        "/lib64".to_string(),
+    ]
+}
+
+fn default_landlock_write_paths() -> Vec<String> {
+    vec![
+        "/var/log".to_string(),
+        "/tmp".to_string(),
+    ]
 }
 
 // ====================
@@ -4169,6 +4224,52 @@ fn main() {
     if let Err(e) = drop_privileges(&loaded_config.global_security) {
         error!("Failed to drop privileges: {}", e);
         return;
+    }
+
+    // ====================
+    // io_uring / seccomp セキュリティ制限
+    // ====================
+    //
+    // 権限降格後、ワーカースレッド起動前にセキュリティ制限を適用します。
+    // これにより、io_uringの悪用リスクを低減します。
+    //
+    // 注意: seccompはプロセス全体に適用され、不可逆です。
+    // ワーカースレッド起動後は新しいスレッドにも自動的に継承されます。
+    // ====================
+    
+    // セキュリティ機能のサポート状況をレポート
+    security::report_security_status();
+    
+    // セキュリティ設定を構築
+    let security_config = security::SecurityConfig {
+        enable_io_uring_restrictions: false, // monoioでは現在未サポート
+        enable_seccomp: loaded_config.global_security.enable_seccomp,
+        seccomp_mode: security::SeccompMode::from_str(&loaded_config.global_security.seccomp_mode),
+        enable_landlock: loaded_config.global_security.enable_landlock,
+        landlock_read_paths: loaded_config.global_security.landlock_read_paths.clone(),
+        landlock_write_paths: loaded_config.global_security.landlock_write_paths.clone(),
+    };
+    
+    // セキュリティ制限を適用
+    if security_config.enable_seccomp || security_config.enable_landlock {
+        match security::apply_security_restrictions(&security_config) {
+            Ok(()) => {
+                info!("Security restrictions applied successfully");
+                if security_config.enable_seccomp {
+                    info!("seccomp: mode={:?}", security_config.seccomp_mode);
+                }
+                if security_config.enable_landlock {
+                    info!("Landlock: read_paths={:?}, write_paths={:?}",
+                          security_config.landlock_read_paths,
+                          security_config.landlock_write_paths);
+                }
+            }
+            Err(e) => {
+                // セキュリティ制限の適用失敗は警告として扱い、続行する
+                // 本番環境ではエラー扱いにすることも検討
+                warn!("Failed to apply security restrictions: {} - continuing without them", e);
+            }
+        }
     }
 
     // 同時接続数制限
