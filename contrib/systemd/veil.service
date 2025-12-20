@@ -1,27 +1,27 @@
 # ============================================
-# zerocopy-server systemd サービスファイル
+# veil systemd サービスファイル
 # ============================================
 #
 # io_uring ベースの高性能リバースプロキシサーバー用
 # サンドボックス化による堅牢なセキュリティを提供
 #
 # インストール:
-#   sudo cp zerocopy-server.service /etc/systemd/system/
+#   sudo cp veil.service /etc/systemd/system/
 #   sudo systemctl daemon-reload
-#   sudo systemctl enable zerocopy-server
-#   sudo systemctl start zerocopy-server
+#   sudo systemctl enable veil
+#   sudo systemctl start veil
 #
 # ============================================
 
 [Unit]
-Description=High-Performance Reverse Proxy Server (io_uring + rustls)
-Documentation=https://github.com/your-org/zerocopy-server
+Description=Veil - High-Performance Reverse Proxy Server (io_uring + rustls)
+Documentation=https://github.com/aofusa/veil
 After=network-online.target
 Wants=network-online.target
 
 [Service]
 Type=simple
-ExecStart=/usr/local/bin/zerocopy-server -c /etc/zerocopy-server/config.toml
+ExecStart=/usr/local/bin/veil -c /etc/veil/config.toml
 ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
@@ -29,9 +29,9 @@ RestartSec=5s
 # ============================================
 # ユーザー・グループ設定
 # ============================================
-# 専用ユーザーで実行（要作成: useradd -r -s /sbin/nologin zerocopy）
-User=zerocopy
-Group=zerocopy
+# 専用ユーザーで実行（要作成: useradd -r -s /sbin/nologin veil）
+User=veil
+Group=veil
 
 # ============================================
 # リソース制限
@@ -75,8 +75,8 @@ PrivateTmp=yes
 PrivateDevices=yes
 
 # 設定ファイル、証明書、ログへのアクセスを許可
-ReadOnlyPaths=/etc/zerocopy-server
-ReadWritePaths=/var/log/zerocopy-server
+ReadOnlyPaths=/etc/veil
+ReadWritePaths=/var/log/veil
 
 # ============================================
 # 名前空間隔離

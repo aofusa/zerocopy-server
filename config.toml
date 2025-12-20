@@ -93,7 +93,7 @@ max_log_size = 104857600
 
 # ログファイルパス（オプション）
 # 指定しない場合は標準エラー出力に出力
-# file_path = "/var/log/zerocopy-server.log"
+# file_path = "/var/log/veil.log"
 
 
 # ==========================================
@@ -106,7 +106,7 @@ max_log_size = 104857600
 # 
 # 注意: 特権ポート（1024未満）を使用する場合は、以下のいずれかが必要:
 #   1. CAP_NET_BIND_SERVICEケイパビリティを付与:
-#      sudo setcap 'cap_net_bind_service=+ep' ./target/release/zerocopy-server
+#      sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 #   2. または非特権ポート（1024以上）を使用
 #
 # drop_privileges_user = "nobody"
@@ -189,8 +189,8 @@ max_log_size = 104857600
 # enable_seccomp = true
 # seccomp_mode = "filter"
 # enable_landlock = true
-# landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64"]
-# landlock_write_paths = ["/var/log/zerocopy-server"]
+# landlock_read_paths = ["/etc/veil", "/usr", "/lib", "/lib64"]
+# landlock_write_paths = ["/var/log/veil"]
 
 # ============================================
 # サンドボックス設定（bubblewrap相当）
@@ -265,8 +265,8 @@ max_log_size = 104857600
 # 読み書きバインドマウント（source:dest 形式）
 # 設定ファイル、ログディレクトリなどを指定
 # sandbox_rw_bind_mounts = [
-#   "/var/log/zerocopy-server:/var/log/zerocopy-server",
-#   "/etc/zerocopy-server:/etc/zerocopy-server"
+#   "/var/log/veil:/var/log/veil",
+#   "/etc/veil:/etc/veil"
 # ]
 
 # tmpfsマウント先（メモリファイルシステム）
@@ -291,7 +291,7 @@ max_log_size = 104857600
 # その他の設定
 # -------------------
 # サンドボックス内のホスト名
-# sandbox_hostname = "zerocopy-sandbox"
+# sandbox_hostname = "veil-sandbox"
 
 # PR_SET_NO_NEW_PRIVS を設定（デフォルト: true）
 # sandbox_no_new_privs = true
@@ -320,7 +320,7 @@ max_log_size = 104857600
 #   "/run/systemd/resolve:/run/systemd/resolve"
 # ]
 # sandbox_rw_bind_mounts = [
-#   "/var/log/zerocopy-server:/var/log/zerocopy-server"
+#   "/var/log/veil:/var/log/veil"
 # ]
 # sandbox_tmpfs_mounts = ["/tmp"]
 #
@@ -330,8 +330,8 @@ max_log_size = 104857600
 #
 # # Landlock（ファイルシステム制限）
 # enable_landlock = true
-# landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64", "/etc/ssl"]
-# landlock_write_paths = ["/var/log/zerocopy-server"]
+# landlock_read_paths = ["/etc/veil", "/usr", "/lib", "/lib64", "/etc/ssl"]
+# landlock_write_paths = ["/var/log/veil"]
 #
 # # seccomp（システムコール制限）
 # enable_seccomp = true
@@ -601,12 +601,12 @@ connection_window_size = 16777216
 # Prometheusスクレイピング用のメトリクスエンドポイントを提供します。
 #
 # 利用可能なメトリクス:
-#   zerocopy_proxy_http_requests_total          リクエスト総数（method, status, hostラベル付き）
-#   zerocopy_proxy_http_request_duration_seconds リクエスト処理時間のヒストグラム
-#   zerocopy_proxy_http_request_size_bytes      リクエストボディサイズ
-#   zerocopy_proxy_http_response_size_bytes     レスポンスボディサイズ
-#   zerocopy_proxy_http_active_connections      アクティブな接続数
-#   zerocopy_proxy_http_upstream_health         アップストリームの健康状態
+#   veil_proxy_http_requests_total          リクエスト総数（method, status, hostラベル付き）
+#   veil_proxy_http_request_duration_seconds リクエスト処理時間のヒストグラム
+#   veil_proxy_http_request_size_bytes      リクエストボディサイズ
+#   veil_proxy_http_response_size_bytes     レスポンスボディサイズ
+#   veil_proxy_http_active_connections      アクティブな接続数
+#   veil_proxy_http_upstream_health         アップストリームの健康状態
 #
 # 設定例:
 #

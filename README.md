@@ -1,4 +1,4 @@
-# High-Performance Reverse Proxy Server
+# Veil - High-Performance Reverse Proxy Server
 
 io_uring (monoio) と rustls を使用した高性能リバースプロキシサーバー。
 
@@ -74,6 +74,8 @@ cargo build --release --features "ktls,http2"
 cargo build --release --features "ktls,all-protocols"
 ```
 
+ビルド後のバイナリは `target/release/veil` に生成されます。
+
 ### フィーチャーフラグ一覧
 
 | フィーチャー | 説明 | 備考 |
@@ -88,25 +90,25 @@ cargo build --release --features "ktls,all-protocols"
 ## 起動
 
 ```bash
-# デフォルト設定ファイル（/etc/zerocopy-server/config.toml）で起動
-./zerocopy-server
+# デフォルト設定ファイル（/etc/veil/config.toml）で起動
+./veil
 
 # 設定ファイルを指定して起動
-./zerocopy-server -c /path/to/config.toml
-./zerocopy-server --config /path/to/config.toml
+./veil -c /path/to/config.toml
+./veil --config /path/to/config.toml
 
 # ヘルプを表示
-./zerocopy-server --help
+./veil --help
 
 # バージョンを表示
-./zerocopy-server --version
+./veil --version
 ```
 
 ### コマンドラインオプション
 
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
-| `-c, --config <PATH>` | 設定ファイルのパス | `/etc/zerocopy-server/config.toml` |
+| `-c, --config <PATH>` | 設定ファイルのパス | `/etc/veil/config.toml` |
 | `-h, --help` | ヘルプメッセージを表示 | - |
 | `-V, --version` | バージョン情報を表示 | - |
 
@@ -142,7 +144,7 @@ http = "0.0.0.0:80"  # HTTPリダイレクトを有効化
 
 ```bash
 # ケイパビリティを付与する場合
-sudo setcap 'cap_net_bind_service=+ep' ./target/release/zerocopy-server
+sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 ```
 
 ## TLS証明書の生成
@@ -188,7 +190,7 @@ cargo build --release --features ktls
 
 ## 設定
 
-デフォルトでは `/etc/zerocopy-server/config.toml` を読み込みます。
+デフォルトでは `/etc/veil/config.toml` を読み込みます。
 `-c` または `--config` オプションで別のパスを指定できます。
 
 設定ファイル例（`config.toml`）:
@@ -217,7 +219,7 @@ flush_interval_ms = 1000
 # 最大ログファイルサイズ（バイト、0=ローテーションなし）
 max_log_size = 104857600
 # ログファイルパス（オプション、未指定で標準エラー出力）
-# file_path = "/var/log/zerocopy-server.log"
+# file_path = "/var/log/veil.log"
 
 [security]
 # 権限降格設定（Linux専用）
@@ -233,8 +235,8 @@ seccomp_mode = "filter"  # "disabled" / "log" / "filter" / "strict"
 
 # Landlock ファイルシステム制限（Linux 5.13+）
 enable_landlock = true
-landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64"]
-landlock_write_paths = ["/var/log/zerocopy-server"]
+landlock_read_paths = ["/etc/veil", "/usr", "/lib", "/lib64"]
+landlock_write_paths = ["/var/log/veil"]
 
 [performance]
 # SO_REUSEPORT の振り分け方式
@@ -629,8 +631,8 @@ url = "http://localhost:3002"
 ```toml
 [security]
 # 権限降格設定（Linux専用、root起動時のみ有効）
-drop_privileges_user = "zerocopy"
-drop_privileges_group = "zerocopy"
+drop_privileges_user = "veil"
+drop_privileges_group = "veil"
 
 # グローバル同時接続上限（0 = 無制限）
 max_concurrent_connections = 10000
@@ -641,8 +643,8 @@ seccomp_mode = "filter"
 
 # Landlock ファイルシステム制限（Linux 5.13+）
 enable_landlock = true
-landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64"]
-landlock_write_paths = ["/var/log/zerocopy-server"]
+landlock_read_paths = ["/etc/veil", "/usr", "/lib", "/lib64"]
+landlock_write_paths = ["/var/log/veil"]
 ```
 
 #### 権限・接続制限
@@ -704,7 +706,7 @@ Linuxのnamespace分離、bind mounts、capabilities制限を適用すること�
 | `sandbox_tmpfs_mounts` | tmpfsマウント先 | ["/tmp"] |
 | `sandbox_mount_proc` | /procをマウント | true |
 | `sandbox_mount_dev` | /devを作成 | true |
-| `sandbox_hostname` | サンドボックス内のホスト名 | "zerocopy-sandbox" |
+| `sandbox_hostname` | サンドボックス内のホスト名 | "veil-sandbox" |
 | `sandbox_no_new_privs` | PR_SET_NO_NEW_PRIVSを設定 | true |
 
 ```toml
@@ -723,7 +725,7 @@ sandbox_tmpfs_mounts = ["/tmp"]
 > **注意**: 特権ポート（1024未満）を使用する場合は、`CAP_NET_BIND_SERVICE` ケイパビリティを付与するか、非特権ポートを使用してください。
 >
 > ```bash
-> sudo setcap 'cap_net_bind_service=+ep' ./target/release/zerocopy-server
+> sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 > ```
 
 ### ルートごとのセキュリティ設定
@@ -942,28 +944,28 @@ GET /__metrics
 
 | メトリクス | タイプ | ラベル | 説明 |
 |-----------|--------|--------|------|
-| `zerocopy_proxy_http_requests_total` | Counter | method, status, host | リクエスト総数 |
-| `zerocopy_proxy_http_request_duration_seconds` | Histogram | method, host | リクエスト処理時間（秒） |
-| `zerocopy_proxy_http_request_size_bytes` | Histogram | - | リクエストボディサイズ |
-| `zerocopy_proxy_http_response_size_bytes` | Histogram | - | レスポンスボディサイズ |
-| `zerocopy_proxy_http_active_connections` | Gauge | host | アクティブな接続数 |
-| `zerocopy_proxy_http_upstream_health` | Gauge | upstream, server | アップストリーム健康状態（1=healthy, 0=unhealthy） |
+| `veil_proxy_http_requests_total` | Counter | method, status, host | リクエスト総数 |
+| `veil_proxy_http_request_duration_seconds` | Histogram | method, host | リクエスト処理時間（秒） |
+| `veil_proxy_http_request_size_bytes` | Histogram | - | リクエストボディサイズ |
+| `veil_proxy_http_response_size_bytes` | Histogram | - | レスポンスボディサイズ |
+| `veil_proxy_http_active_connections` | Gauge | host | アクティブな接続数 |
+| `veil_proxy_http_upstream_health` | Gauge | upstream, server | アップストリーム健康状態（1=healthy, 0=unhealthy） |
 
 ### Grafanaダッシュボード例
 
 ```promql
 # リクエストレート（リクエスト/秒）
-rate(zerocopy_proxy_http_requests_total[5m])
+rate(veil_proxy_http_requests_total[5m])
 
 # エラー率（4xx + 5xx）
-sum(rate(zerocopy_proxy_http_requests_total{status=~"4..|5.."}[5m])) 
-  / sum(rate(zerocopy_proxy_http_requests_total[5m]))
+sum(rate(veil_proxy_http_requests_total{status=~"4..|5.."}[5m])) 
+  / sum(rate(veil_proxy_http_requests_total[5m]))
 
 # レイテンシP95
-histogram_quantile(0.95, rate(zerocopy_proxy_http_request_duration_seconds_bucket[5m]))
+histogram_quantile(0.95, rate(veil_proxy_http_request_duration_seconds_bucket[5m]))
 
 # ホスト別リクエストレート
-sum by (host) (rate(zerocopy_proxy_http_requests_total[5m]))
+sum by (host) (rate(veil_proxy_http_requests_total[5m]))
 ```
 
 ### 設定例（config.toml）
@@ -1004,7 +1006,7 @@ allowed_ips = [
 ```yaml
 # prometheus.yml
 scrape_configs:
-  - job_name: 'zerocopy-proxy'
+  - job_name: 'veil-proxy'
     static_configs:
       - targets: ['your-proxy-server:443']
     scheme: https
@@ -1362,13 +1364,13 @@ wrk -t4 -c100 -d30s https://localhost/
 
 # 1. kTLS無効（rustls使用）
 cargo build --release
-./zerocopy-server -c ./config.toml &
+./veil -c ./config.toml &
 wrk -t4 -c100 -d30s https://localhost/
 
 # 2. kTLS有効（rustls + ktls2使用）
 cargo build --release --features ktls
 # config.tomlでktls_enabled = true
-./zerocopy-server -c ./config.toml &
+./veil -c ./config.toml &
 wrk -t4 -c100 -d30s https://localhost/
 ```
 
@@ -1383,7 +1385,7 @@ SIGINT（Ctrl+C）またはSIGTERMを受信すると、サーバーは優雅に�
 
 ```bash
 # サーバー起動
-./zerocopy-server -c ./config.toml &
+./veil -c ./config.toml &
 
 # 優雅な終了
 kill -SIGTERM $!
@@ -1403,14 +1405,14 @@ SIGHUPを受信すると、サーバーは設定ファイルを再読み込み�
 4. `ArcSwap` によるロックフリーな設定更新
 5. 新規接続は新しい設定を使用
 
-> **Note**: リロード時は起動時に `-c` オプションで指定したパス（またはデフォルトの `/etc/zerocopy-server/config.toml`）が使用されます。
+> **Note**: リロード時は起動時に `-c` オプションで指定したパス（またはデフォルトの `/etc/veil/config.toml`）が使用されます。
 
 ```bash
 # 設定ファイルを編集
 vim config.toml
 
 # 設定を再読み込み（ゼロダウンタイム）
-kill -SIGHUP $(pgrep zerocopy-server)
+kill -SIGHUP $(pgrep veil)
 ```
 
 ### 対応する変更
@@ -1630,7 +1632,7 @@ ftlogを使用した高性能非同期ログを提供します。ftlogは内部�
 level = "info"
 channel_size = 100000
 flush_interval_ms = 1000
-file_path = "/var/log/zerocopy-server.log"
+file_path = "/var/log/veil.log"
 ```
 
 ## 自己サンドボックス化（Self-Sandboxing）
@@ -1653,8 +1655,8 @@ file_path = "/var/log/zerocopy-server.log"
 ```toml
 [security]
 enable_landlock = true
-landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64"]
-landlock_write_paths = ["/var/log/zerocopy-server"]
+landlock_read_paths = ["/etc/veil", "/usr", "/lib", "/lib64"]
+landlock_write_paths = ["/var/log/veil"]
 ```
 
 **対応ABIバージョン:**
@@ -1696,8 +1698,8 @@ root起動後、リスナー作成後に非特権ユーザーへ降格します�
 
 ```toml
 [security]
-drop_privileges_user = "zerocopy"
-drop_privileges_group = "zerocopy"
+drop_privileges_user = "veil"
+drop_privileges_group = "veil"
 ```
 
 ### Namespace隔離について
@@ -1720,7 +1722,7 @@ io_uringは強力な非同期I/Oインターフェースですが、悪用され
 │ ┌─────────────────────────────────────────────────────────────┐ │
 │ │ Namespace 隔離 (ProtectSystem, PrivateTmp, PrivateDevices)  │ │
 │ │ ┌─────────────────────────────────────────────────────────┐ │ │
-│ │ │ zerocopy-server 内蔵セキュリティ                        │ │ │
+│ │ │ veil 内蔵セキュリティ                        │ │ │
 │ │ │ ┌─────────────────────────────────────────────────────┐ │ │ │
 │ │ │ │ Landlock (ファイルシステム制限)                     │ │ │ │
 │ │ │ │ ┌─────────────────────────────────────────────────┐ │ │ │ │
@@ -1755,35 +1757,35 @@ io_uringは強力な非同期I/Oインターフェースですが、悪用され
 
 ### systemd サービスファイル
 
-`contrib/systemd/zerocopy-server.service` にサンドボックス化対応のサービスファイルを用意しています。
+`contrib/systemd/veil.service` にサンドボックス化対応のサービスファイルを用意しています。
 
 #### インストール
 
 ```bash
 # 1. 専用ユーザーを作成
-sudo useradd -r -s /sbin/nologin zerocopy
+sudo useradd -r -s /sbin/nologin veil
 
 # 2. ディレクトリを作成
-sudo mkdir -p /etc/zerocopy-server
-sudo mkdir -p /var/log/zerocopy-server
-sudo chown zerocopy:zerocopy /var/log/zerocopy-server
+sudo mkdir -p /etc/veil
+sudo mkdir -p /var/log/veil
+sudo chown veil:veil /var/log/veil
 
 # 3. 設定ファイルをコピー
-sudo cp config.toml /etc/zerocopy-server/
-sudo cp server.crt server.key /etc/zerocopy-server/
-sudo chmod 600 /etc/zerocopy-server/server.key
-sudo chown -R zerocopy:zerocopy /etc/zerocopy-server
+sudo cp config.toml /etc/veil/
+sudo cp server.crt server.key /etc/veil/
+sudo chmod 600 /etc/veil/server.key
+sudo chown -R veil:veil /etc/veil
 
 # 4. バイナリをインストール
-sudo cp target/release/zerocopy-server /usr/local/bin/
+sudo cp target/release/veil /usr/local/bin/
 
 # 5. サービスファイルをインストール
-sudo cp contrib/systemd/zerocopy-server.service /etc/systemd/system/
+sudo cp contrib/systemd/veil.service /etc/systemd/system/
 sudo systemctl daemon-reload
 
 # 6. サービスを有効化・起動
-sudo systemctl enable zerocopy-server
-sudo systemctl start zerocopy-server
+sudo systemctl enable veil
+sudo systemctl start veil
 ```
 
 #### 重要な設定項目
@@ -1791,8 +1793,8 @@ sudo systemctl start zerocopy-server
 ```ini
 [Service]
 # === ユーザー ===
-User=zerocopy
-Group=zerocopy
+User=veil
+Group=veil
 
 # === リソース制限 ===
 # io_uring 登録バッファにはメモリロックが必要
@@ -1804,8 +1806,8 @@ ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
 PrivateDevices=yes
-ReadOnlyPaths=/etc/zerocopy-server
-ReadWritePaths=/var/log/zerocopy-server
+ReadOnlyPaths=/etc/veil
+ReadWritePaths=/var/log/veil
 
 # === 名前空間隔離 ===
 RestrictNamespaces=yes
@@ -1839,11 +1841,11 @@ io_uring と mimalloc のパフォーマンスを最大化するには、Huge Pa
 echo 128 | sudo tee /proc/sys/vm/nr_hugepages
 
 # 2. 永続化
-echo "vm.nr_hugepages=128" | sudo tee -a /etc/sysctl.d/99-zerocopy.conf
-sudo sysctl -p /etc/sysctl.d/99-zerocopy.conf
+echo "vm.nr_hugepages=128" | sudo tee -a /etc/sysctl.d/99-veil.conf
+sudo sysctl -p /etc/sysctl.d/99-veil.conf
 
 # 3. systemd で MEMLOCK 制限を解除
-# zerocopy-server.service に LimitMEMLOCK=infinity を設定
+# veil.service に LimitMEMLOCK=infinity を設定
 ```
 
 ### セキュリティ検証
@@ -1852,10 +1854,10 @@ sudo sysctl -p /etc/sysctl.d/99-zerocopy.conf
 
 ```bash
 # systemd-analyze で設定を検証
-systemd-analyze security zerocopy-server.service
+systemd-analyze security veil.service
 
 # 実行中のセキュリティ状態を確認
-cat /proc/$(pgrep zerocopy-server)/status | grep -E "Seccomp|NoNewPrivs|CapBnd"
+cat /proc/$(pgrep veil)/status | grep -E "Seccomp|NoNewPrivs|CapBnd"
 
 # 期待される出力:
 # Seccomp:        2                    # seccomp フィルタが有効
@@ -1870,10 +1872,10 @@ cat /proc/$(pgrep zerocopy-server)/status | grep -E "Seccomp|NoNewPrivs|CapBnd"
 ```bash
 # 原因: システムコールがブロックされている
 # 解決: SystemCallFilter に io_uring_* を追加
-journalctl -u zerocopy-server | grep -i "seccomp"
+journalctl -u veil | grep -i "seccomp"
 
 # 手動テスト
-sudo strace -f -e trace=io_uring_setup /usr/local/bin/zerocopy-server -c /etc/zerocopy-server/config.toml
+sudo strace -f -e trace=io_uring_setup /usr/local/bin/veil -c /etc/veil/config.toml
 ```
 
 #### メモリロックに失敗
@@ -1881,7 +1883,7 @@ sudo strace -f -e trace=io_uring_setup /usr/local/bin/zerocopy-server -c /etc/ze
 ```bash
 # 原因: MEMLOCK 制限が低い
 # 解決: LimitMEMLOCK=infinity を設定
-cat /proc/$(pgrep zerocopy-server)/limits | grep "locked memory"
+cat /proc/$(pgrep veil)/limits | grep "locked memory"
 ```
 
 #### 特権ポート (443/80) にバインドできない
@@ -1892,7 +1894,7 @@ cat /proc/$(pgrep zerocopy-server)/limits | grep "locked memory"
 #   AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 # 解決 2: バイナリにケイパビリティを付与
-sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/zerocopy-server
+sudo setcap 'cap_net_bind_service=+ep' /usr/local/bin/veil
 ```
 
 ### 代替: bubblewrap との併用
@@ -1905,11 +1907,11 @@ ExecStart=/usr/bin/bwrap \
     --ro-bind /usr /usr \
     --ro-bind /lib /lib \
     --ro-bind /lib64 /lib64 \
-    --ro-bind /etc/zerocopy-server /etc/zerocopy-server \
-    --bind /var/log/zerocopy-server /var/log/zerocopy-server \
+    --ro-bind /etc/veil /etc/veil \
+    --bind /var/log/veil /var/log/veil \
     --unshare-pid \
     --die-with-parent \
-    /usr/local/bin/zerocopy-server -c /etc/zerocopy-server/config.toml
+    /usr/local/bin/veil -c /etc/veil/config.toml
 ```
 
 この構成では、systemd が外側の「器」を作り、bubblewrap がさらに厳格なファイルシステムビューを提供します。

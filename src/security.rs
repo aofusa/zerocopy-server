@@ -138,7 +138,7 @@ pub const ALLOWED_URING_OPCODES: &[u8] = &[
 /// ```
 pub const SYSTEMD_SYSCALL_FILTER: &str = r#"
 # ============================================
-# zerocopy-server 必須システムコール一覧
+# veil 必須システムコール一覧
 # ============================================
 # systemd SystemCallFilter 形式
 # 
@@ -560,8 +560,8 @@ impl Default for SecurityConfig {
     /// enable_seccomp = true
     /// seccomp_mode = "filter"
     /// enable_landlock = true
-    /// landlock_read_paths = ["/etc/zerocopy-server", "/usr", "/lib", "/lib64"]
-    /// landlock_write_paths = ["/var/log/zerocopy-server"]
+    /// landlock_read_paths = ["/etc/veil", "/usr", "/lib", "/lib64"]
+    /// landlock_write_paths = ["/var/log/veil"]
     /// ```
     /// 
     /// # 導入時の推奨手順
@@ -1918,7 +1918,7 @@ pub fn recommended_sandbox_config() -> SandboxConfig {
         keep_capabilities: vec![
             "CAP_NET_BIND_SERVICE".to_string(),
         ],
-        hostname: Some("zerocopy-sandbox".to_string()),
+        hostname: Some("veil-sandbox".to_string()),
         no_new_privs: true,
     }
 }

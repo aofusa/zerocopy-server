@@ -806,7 +806,7 @@ where
                     // リクエストが完了 - デフォルトレスポンスを送信
                     let headers: &[(&[u8], &[u8])] = &[
                         (b"content-type", b"text/plain"),
-                        (b"server", b"zerocopy-server/http2"),
+                        (b"server", b"veil/http2"),
                     ];
                     if let Err(e) = self.send_response(req.stream_id, 200, headers, Some(b"HTTP/2 OK")).await {
                         // ストリームエラーの場合は RST_STREAM を送信

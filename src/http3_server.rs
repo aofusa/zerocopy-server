@@ -408,7 +408,7 @@ impl Http3Handler {
                 self.send_response(stream_id, 200, &[
                     (b":status", b"200"),
                     (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
-                    (b"server", b"zerocopy-server/http3"),
+                    (b"server", b"veil/http3"),
                 ], Some(&body))?;
                 
                 self.record_metrics(&method, &authority, 200, request_body.len(), body.len(), start_time);
@@ -484,7 +484,7 @@ impl Http3Handler {
                 } else {
                     let mut resp_headers: Vec<(&[u8], &[u8])> = vec![
                         (b"content-type", mime_type.as_bytes()),
-                        (b"server", b"zerocopy-server/http3"),
+                        (b"server", b"veil/http3"),
                     ];
                     
                     // セキュリティヘッダー追加
@@ -604,7 +604,7 @@ impl Http3Handler {
         debug!("[HTTP/3] Sending error response: status={}, body_len={}", status, body.len());
         let result = self.send_response(stream_id, status, &[
             (b"content-type", b"text/plain"),
-            (b"server", b"zerocopy-server/http3"),
+            (b"server", b"veil/http3"),
         ], Some(body));
         debug!("[HTTP/3] Error response send result: {:?}", result.is_ok());
         result
@@ -912,7 +912,7 @@ impl Http3Handler {
         
         // ヘッダーをパース
         let mut resp_headers: Vec<(&[u8], &[u8])> = Vec::new();
-        resp_headers.push((b"server", b"zerocopy-server/http3"));
+        resp_headers.push((b"server", b"veil/http3"));
         
         // レスポンスヘッダーを抽出（ステータス行をスキップ）
         if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
@@ -1007,7 +1007,7 @@ impl Http3Handler {
         
         let mut resp_headers: Vec<(&[u8], &[u8])> = vec![
             (b"content-type", mime_str.as_bytes()),
-            (b"server", b"zerocopy-server/http3"),
+            (b"server", b"veil/http3"),
         ];
         
         // セキュリティヘッダー追加
@@ -1061,7 +1061,7 @@ impl Http3Handler {
         
         self.send_response(stream_id, status_code, &[
             (b"location", final_url.as_bytes()),
-            (b"server", b"zerocopy-server/http3"),
+            (b"server", b"veil/http3"),
         ], None)?;
         
         Ok((status_code, 0))

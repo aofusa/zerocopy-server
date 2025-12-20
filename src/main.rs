@@ -67,13 +67,13 @@
 //! ```bash
 //! # 1. ベースライン（kTLS無効 / rustls使用）
 //! cargo build --release
-//! ./target/release/zerocopy-server &
+//! ./target/release/veil &
 //! wrk -t4 -c100 -d30s https://localhost/
 //!
 //! # 2. kTLS有効（rustls + ktls2使用）
 //! cargo build --release --features ktls
 //! # config.tomlでktls_enabled = true
-//! ./target/release/zerocopy-server &
+//! ./target/release/veil &
 //! wrk -t4 -c100 -d30s https://localhost/
 //!
 //! # CPU使用率の比較
@@ -436,7 +436,7 @@ static METRICS_REGISTRY: Lazy<Registry> = Lazy::new(|| {
 /// HTTPリクエスト総数カウンター（method, status, host ラベル付き）
 static HTTP_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
     let opts = Opts::new("http_requests_total", "Total number of HTTP requests")
-        .namespace("zerocopy_proxy");
+        .namespace("veil_proxy");
     let counter = CounterVec::new(opts, &["method", "status", "host"]).unwrap();
     METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
     counter
@@ -445,7 +445,7 @@ static HTTP_REQUESTS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
 /// HTTPリクエスト処理時間ヒストグラム（method, host ラベル付き）
 static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
     let opts = HistogramOpts::new("http_request_duration_seconds", "HTTP request duration in seconds")
-        .namespace("zerocopy_proxy")
+        .namespace("veil_proxy")
         .buckets(vec![0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 2.5, 5.0, 10.0]);
     let histogram = HistogramVec::new(opts, &["method", "host"]).unwrap();
     METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
@@ -455,7 +455,7 @@ static HTTP_REQUEST_DURATION_SECONDS: Lazy<HistogramVec> = Lazy::new(|| {
 /// HTTPリクエストボディサイズヒストグラム
 static HTTP_REQUEST_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new("http_request_size_bytes", "HTTP request body size in bytes")
-        .namespace("zerocopy_proxy")
+        .namespace("veil_proxy")
         .buckets(vec![100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0]);
     let histogram = Histogram::with_opts(opts).unwrap();
     METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
@@ -465,7 +465,7 @@ static HTTP_REQUEST_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
 /// HTTPレスポンスボディサイズヒストグラム
 static HTTP_RESPONSE_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
     let opts = HistogramOpts::new("http_response_size_bytes", "HTTP response body size in bytes")
-        .namespace("zerocopy_proxy")
+        .namespace("veil_proxy")
         .buckets(vec![100.0, 1000.0, 10000.0, 100000.0, 1000000.0, 10000000.0, 100000000.0]);
     let histogram = Histogram::with_opts(opts).unwrap();
     METRICS_REGISTRY.register(Box::new(histogram.clone())).unwrap();
@@ -477,7 +477,7 @@ static HTTP_RESPONSE_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
 #[allow(dead_code)]
 static HTTP_ACTIVE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("http_active_connections", "Number of active HTTP connections")
-        .namespace("zerocopy_proxy");
+        .namespace("veil_proxy");
     let gauge = IntGaugeVec::new(opts, &["host"]).unwrap();
     METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
@@ -489,7 +489,7 @@ static HTTP_ACTIVE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
 #[allow(dead_code)]
 static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("http_upstream_health", "Upstream server health status (1=healthy, 0=unhealthy)")
-        .namespace("zerocopy_proxy");
+        .namespace("veil_proxy");
     let gauge = IntGaugeVec::new(opts, &["upstream", "server"]).unwrap();
     METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
     gauge
@@ -1503,7 +1503,7 @@ fn default_sandbox_tmpfs() -> Vec<String> {
 }
 
 fn default_sandbox_hostname() -> Option<String> {
-    Some("zerocopy-sandbox".to_string())
+    Some("veil-sandbox".to_string())
 }
 
 fn default_seccomp_mode() -> String {
@@ -1651,7 +1651,7 @@ impl PrometheusConfig {
 // 非特権ポート（1024以上）を使用することを推奨します。
 //
 // ケイパビリティ付与例:
-//   sudo setcap 'cap_net_bind_service=+ep' ./target/release/zerocopy-server
+//   sudo setcap 'cap_net_bind_service=+ep' ./target/release/veil
 // ====================
 
 /// ユーザー名からUIDを取得
@@ -3954,7 +3954,7 @@ static CURRENT_CONFIG: Lazy<ArcSwap<RuntimeConfig>> =
     Lazy::new(|| ArcSwap::from_pointee(RuntimeConfig::default()));
 
 /// デフォルトの設定ファイルパス
-const DEFAULT_CONFIG_PATH: &str = "/etc/zerocopy-server/config.toml";
+const DEFAULT_CONFIG_PATH: &str = "/etc/veil/config.toml";
 
 /// グローバルな設定ファイルパス（ホットリロード用）
 /// コマンドライン引数で指定されたパス、またはデフォルトパスを保持
@@ -4432,7 +4432,7 @@ async fn handle_http_redirect(mut stream: TcpStream) {
 /// 
 /// io_uring (monoio) と rustls を使用した高性能リバースプロキシサーバー
 #[derive(Parser, Debug)]
-#[command(name = "zerocopy-server")]
+#[command(name = "veil")]
 #[command(author, version, about, long_about = None)]
 struct CliArgs {
     /// 設定ファイルのパス
@@ -5691,7 +5691,7 @@ where
         {
             // IPアドレス制限チェック
             if !prom_config.is_ip_allowed(client_ip) {
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
                 let _ = conn.send_response(stream_id, 403, headers, Some(b"Forbidden")).await;
                 return Some((403, 9));
             }
@@ -5699,7 +5699,7 @@ where
             let body = encode_prometheus_metrics();
             let headers: &[(&[u8], &[u8])] = &[
                 (b"content-type", b"text/plain; version=0.0.4; charset=utf-8"),
-                (b"server", b"zerocopy-server/http2"),
+                (b"server", b"veil/http2"),
             ];
             if let Err(e) = conn.send_response(stream_id, 200, headers, Some(&body)).await {
                 warn!("[HTTP/2] Metrics response error: {}", e);
@@ -5731,7 +5731,7 @@ where
                 String::from_utf8_lossy(authority),
                 String::from_utf8_lossy(path)
             );
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 400, headers, Some(b"Bad Request")).await;
             return Some((400, 11));
         }
@@ -5744,7 +5744,7 @@ where
     if check_result != SecurityCheckResult::Allowed {
         let status = check_result.status_code();
         let msg = check_result.message();
-        let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+        let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
         let _ = conn.send_response(stream_id, status, headers, Some(msg)).await;
         return Some((status, msg.len() as u64));
     }
@@ -5767,14 +5767,14 @@ where
             
             let clean_remainder = remainder.trim_matches('/');
             if !clean_remainder.is_empty() {
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
                 let _ = conn.send_response(stream_id, 404, headers, Some(b"Not Found")).await;
                 return Some((404, 9));
             }
             
             let mut headers: Vec<(&[u8], &[u8])> = vec![
                 (b"content-type", mime_type.as_bytes()),
-                (b"server", b"zerocopy-server/http2"),
+                (b"server", b"veil/http2"),
             ];
             
             // セキュリティヘッダー追加
@@ -5819,7 +5819,7 @@ where
     let server = match upstream_group.select(client_ip) {
         Some(s) => s,
         None => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
@@ -5939,12 +5939,12 @@ where
         }
         Ok(Err(e)) => {
             warn!("[HTTP/2] Backend connect error: {}", e);
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
         Err(_) => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
             return Some((504, 15));
         }
@@ -5953,7 +5953,7 @@ where
     // リクエスト送信
     let (write_res, _) = backend.write_all(request).await;
     if write_res.is_err() {
-        let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+        let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
         let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
         return Some((502, 11));
     }
@@ -5968,7 +5968,7 @@ where
         let (res, mut returned_buf) = match read_result {
             Ok(r) => r,
             Err(_) => {
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
                 let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
                 return Some((504, 15));
             }
@@ -5982,7 +5982,7 @@ where
             Ok(n) => n,
             Err(_) => {
                 buf_put(returned_buf);
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
                 let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
                 return Some((502, 11));
             }
@@ -6006,7 +6006,7 @@ where
             
             // HTTP/2用のヘッダーを構築（ホップバイホップヘッダー除外）
             let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-            h2_headers.push((b"server", b"zerocopy-server/http2"));
+            h2_headers.push((b"server", b"veil/http2"));
             
             for header in resp.headers.iter() {
                 if header.name.is_empty() {
@@ -6063,14 +6063,14 @@ where
         
         // ヘッダーが大きすぎる
         if response_buf.len() > MAX_HEADER_SIZE {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
     }
     
     // ストリーム終了（空レスポンス）
-    let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+    let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
     let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
     Some((502, 11))
 }
@@ -6097,12 +6097,12 @@ where
         }
         Ok(Err(e)) => {
             warn!("[HTTP/2] Backend connect error: {}", e);
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
         Err(_) => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
             return Some((504, 15));
         }
@@ -6116,12 +6116,12 @@ where
         Ok(Ok(stream)) => stream,
         Ok(Err(e)) => {
             warn!("[HTTP/2] TLS handshake error: {}", e);
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
             return Some((502, 11));
         }
         Err(_) => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
             return Some((504, 15));
         }
@@ -6130,7 +6130,7 @@ where
     // リクエスト送信
     let (write_res, _) = backend.write_all(request).await;
     if write_res.is_err() {
-        let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+        let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
         let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
         return Some((502, 11));
     }
@@ -6145,7 +6145,7 @@ where
         let (res, mut returned_buf) = match read_result {
             Ok(r) => r,
             Err(_) => {
-                let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+                let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
                 let _ = conn.send_response(stream_id, 504, headers, Some(b"Gateway Timeout")).await;
                 return Some((504, 15));
             }
@@ -6180,7 +6180,7 @@ where
             
             // HTTP/2用のヘッダーを構築
             let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-            h2_headers.push((b"server", b"zerocopy-server/http2"));
+            h2_headers.push((b"server", b"veil/http2"));
             
             for header in resp.headers.iter() {
                 if header.name.is_empty() {
@@ -6233,7 +6233,7 @@ where
         }
     }
     
-    let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+    let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
     let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
     Some((502, 11))
 }
@@ -6267,7 +6267,7 @@ where
     
     // パストラバーサル防止
     if clean_sub.contains("..") {
-        let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+        let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
         let _ = conn.send_response(stream_id, 403, headers, Some(b"Forbidden")).await;
         return Some((403, 9));
     }
@@ -6286,7 +6286,7 @@ where
         p
     } else {
         if !clean_sub.is_empty() {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 404, headers, Some(b"Not Found")).await;
             return Some((404, 9));
         }
@@ -6297,7 +6297,7 @@ where
     let data = match std::fs::read(&file_path) {
         Ok(d) => d,
         Err(_) => {
-            let headers: &[(&[u8], &[u8])] = &[(b"server", b"zerocopy-server/http2")];
+            let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
             let _ = conn.send_response(stream_id, 404, headers, Some(b"Not Found")).await;
             return Some((404, 9));
         }
@@ -6308,7 +6308,7 @@ where
     
     let mut headers: Vec<(&[u8], &[u8])> = vec![
         (b"content-type", mime_str.as_bytes()),
-        (b"server", b"zerocopy-server/http2"),
+        (b"server", b"veil/http2"),
     ];
     
     // セキュリティヘッダー追加
@@ -6370,7 +6370,7 @@ where
     
     let headers: &[(&[u8], &[u8])] = &[
         (b"location", final_url.as_bytes()),
-        (b"server", b"zerocopy-server/http2"),
+        (b"server", b"veil/http2"),
     ];
     
     if let Err(e) = conn.send_response(stream_id, status_code, headers, None).await {
