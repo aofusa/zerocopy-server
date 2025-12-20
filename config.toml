@@ -168,6 +168,102 @@ ktls_fallback_enabled = false
 
 
 # ==========================================
+# HTTP/2 詳細設定 (RFC 7540)
+# ==========================================
+#
+# HTTP/2 プロトコルの詳細なパラメータを設定できます。
+# server.http2_enabled = true と併用してください。
+#
+# 注意: --features http2 でビルドする必要があります
+#
+[http2]
+# HTTP/2を有効化（ALPNでネゴシエート）
+# server.http2_enabled と同等（こちらが優先）
+enabled = false
+
+# SETTINGS_HEADER_TABLE_SIZE (HPACK動的テーブルサイズ)
+# デフォルト: 4096 (4KB)
+# 高パフォーマンス: 65536 (64KB) - メモリ使用増加と引き換えに圧縮効率向上
+# header_table_size = 65536
+
+# SETTINGS_MAX_CONCURRENT_STREAMS (同時ストリーム数)
+# デフォルト: 100
+# 高負荷サーバー: 1000 - 並列リクエスト処理能力向上
+# max_concurrent_streams = 1000
+
+# SETTINGS_INITIAL_WINDOW_SIZE (ストリームウィンドウサイズ)
+# デフォルト: 65535 (64KB - 1)
+# 高スループット: 4194304 (4MB) - 大きなファイル転送時のパフォーマンス向上
+# initial_window_size = 4194304
+
+# SETTINGS_MAX_FRAME_SIZE (最大フレームサイズ)
+# デフォルト: 16384 (16KB)
+# 高パフォーマンス: 65536 (64KB) - フレーム分割オーバーヘッド削減
+# max_frame_size = 65536
+
+# SETTINGS_MAX_HEADER_LIST_SIZE (最大ヘッダーリストサイズ)
+# デフォルト: 16384 (16KB)
+# 大きなCookie/ヘッダー対応: 65536 (64KB)
+# max_header_list_size = 65536
+
+# コネクションウィンドウサイズ（コネクション全体のフロー制御）
+# デフォルト: 65535 (64KB - 1)
+# 高スループット: 16777216 (16MB)
+# connection_window_size = 16777216
+
+
+# ==========================================
+# HTTP/3 詳細設定 (RFC 9114, QUIC RFC 9000)
+# ==========================================
+#
+# HTTP/3 (QUIC) プロトコルの詳細なパラメータを設定できます。
+# server.http3_enabled = true と併用してください。
+#
+# 注意:
+#   - --features http3 でビルドする必要があります
+#   - HTTP/3 は UDP ベースのため kTLS は使用不可
+#   - quiche (Cloudflare製) を使用
+#
+[http3]
+# HTTP/3を有効化（UDPリスナー）
+# server.http3_enabled と同等（こちらが優先）
+enabled = false
+
+# HTTP/3リッスンアドレス（UDP）
+# server.http3_listen が設定されている場合はそちらを優先
+# listen = "0.0.0.0:443"
+
+# 最大アイドルタイムアウト（ミリ秒）
+# デフォルト: 30000 (30秒)
+# 長寿命接続: 60000 (60秒)
+# max_idle_timeout = 30000
+
+# 最大UDPペイロードサイズ
+# デフォルト: 1350 (MTU考慮)
+# ジャンボフレーム環境: 9000
+# max_udp_payload_size = 1350
+
+# 初期最大データサイズ（コネクション全体）
+# デフォルト: 10000000 (10MB)
+# initial_max_data = 10000000
+
+# 初期最大ストリームデータサイズ（双方向ローカル）
+# initial_max_stream_data_bidi_local = 1000000
+
+# 初期最大ストリームデータサイズ（双方向リモート）
+# initial_max_stream_data_bidi_remote = 1000000
+
+# 初期最大ストリームデータサイズ（単方向）
+# initial_max_stream_data_uni = 1000000
+
+# 初期最大双方向ストリーム数
+# initial_max_streams_bidi = 100
+
+# 初期最大単方向ストリーム数
+# initial_max_streams_uni = 100
+
+
+# ==========================================
 # Upstream グループ定義（ロードバランシング）
 # ==========================================
 # 複数のバックエンドサーバーを定義し、リクエストを分散できます。
@@ -437,6 +533,26 @@ url = "http://localhost:9000/"
 # [path_routes."example.com"."/ws/"]
 # type = "Proxy"
 # url = "http://localhost:3000"
+
+# ------------------------------------------
+# H2C (HTTP/2 over cleartext) 対応プロキシ
+# ------------------------------------------
+# バックエンドがH2C (HTTP/2 prior knowledge) をサポートしている場合、
+# use_h2c = true を指定することで HTTP/2 で通信できます。
+#
+# 効果:
+#   - HTTP/2 の多重化とヘッダー圧縮をバックエンド通信でも活用
+#   - gRPC バックエンドへの接続に適している
+#
+# 注意:
+#   - バックエンドが H2C (HTTP/2 without TLS) をサポートしている必要があります
+#   - HTTPS バックエンド（use_tls=true）では use_h2c は無効です
+#   - Prior Knowledge モードを使用（Upgrade経由ではない）
+#
+# [path_routes."example.com"."/grpc/"]
+# type = "Proxy"
+# url = "http://localhost:50051"
+# use_h2c = true
 
 # ------------------------------------------
 # ヘッダー操作付きプロキシ
