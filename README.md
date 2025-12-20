@@ -682,7 +682,43 @@ landlock_write_paths = ["/var/log/zerocopy-server"]
 | v1 | 5.13+ | 基本的なファイルシステムアクセス制御 |
 | v2 | 5.19+ | ファイル参照権限 (REFER) |
 | v3 | 6.2+ | TRUNCATE権限 |
-| v4 | 6.7+ | ioctl権限 |
+| v4 | 6.7+ | ネットワーク制限（FSは変更なし） |
+| v5+ | 6.10+ | IOCTL_DEV権限 |
+
+#### サンドボックス設定（bubblewrap相当）
+
+Linuxのnamespace分離、bind mounts、capabilities制限を適用することで、bubblewrapと同等のセキュリティ分離を実現します。
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enable_sandbox` | サンドボックスを有効化 | false |
+| `sandbox_unshare_mount` | Mount namespace分離 | true |
+| `sandbox_unshare_uts` | UTS namespace分離（ホスト名隔離） | true |
+| `sandbox_unshare_ipc` | IPC namespace分離 | true |
+| `sandbox_unshare_pid` | PID namespace分離 | false |
+| `sandbox_unshare_user` | User namespace分離 | false |
+| `sandbox_unshare_net` | Network namespace分離（**警告: 通信不可**） | false |
+| `sandbox_keep_capabilities` | 保持するケイパビリティ | [] |
+| `sandbox_ro_bind_mounts` | 読み取り専用バインドマウント（source:dest形式） | 標準パス |
+| `sandbox_rw_bind_mounts` | 読み書きバインドマウント | [] |
+| `sandbox_tmpfs_mounts` | tmpfsマウント先 | ["/tmp"] |
+| `sandbox_mount_proc` | /procをマウント | true |
+| `sandbox_mount_dev` | /devを作成 | true |
+| `sandbox_hostname` | サンドボックス内のホスト名 | "zerocopy-sandbox" |
+| `sandbox_no_new_privs` | PR_SET_NO_NEW_PRIVSを設定 | true |
+
+```toml
+[security]
+enable_sandbox = true
+sandbox_unshare_mount = true
+sandbox_unshare_uts = true
+sandbox_unshare_ipc = true
+sandbox_keep_capabilities = ["CAP_NET_BIND_SERVICE"]
+sandbox_ro_bind_mounts = ["/usr:/usr", "/lib:/lib", "/lib64:/lib64"]
+sandbox_tmpfs_mounts = ["/tmp"]
+```
+
+> **注意**: `sandbox_unshare_net = true` にするとネットワーク通信ができなくなります。リバースプロキシでは通常 `false` のままにしてください。
 
 > **注意**: 特権ポート（1024未満）を使用する場合は、`CAP_NET_BIND_SERVICE` ケイパビリティを付与するか、非特権ポートを使用してください。
 >
@@ -884,11 +920,13 @@ Prometheusメトリクスはデフォルトで**無効**です。`[prometheus]` 
 enabled = true
 ```
 
+> **Note**: `[prometheus]` セクション自体が存在しない場合も、メトリクスは無効です。
+
 ### 設定オプション
 
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
-| `enabled` | メトリクスエンドポイントを有効化 | false |
+| `enabled` | メトリクスエンドポイントを有効化 | **false** |
 | `path` | メトリクスエンドポイントのパス | `/__metrics` |
 | `allowed_ips` | アクセスを許可するIP/CIDR（配列） | []（すべて許可） |
 
