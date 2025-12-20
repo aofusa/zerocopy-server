@@ -8,6 +8,8 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **非同期I/O**: monoio (io_uring) による効率的なI/O処理
 - **TLS**: rustls によるメモリ安全な Pure Rust TLS実装
 - **kTLS**: rustls + ktls2 によるカーネルTLSオフロード対応（Linux 5.15+）
+- **HTTP/2**: TLS ALPNネゴシエーションによるHTTP/2サポート（ストリーム多重化、HPACK圧縮）
+- **HTTP/3**: QUIC/UDPベースのHTTP/3サポート（quiche使用、0-RTT接続確立）
 - **高速アロケータ**: mimalloc による高速メモリ割り当て + Huge Pages対応
 - **高速ルーティング**: Radix Tree (matchit) によるO(log n)パスマッチング
 
@@ -16,6 +18,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **ロードバランシング**: 複数バックエンドへのリクエスト分散（Round Robin/Least Connections/IP Hash）
 - **健康チェック**: HTTPベースのアクティブヘルスチェックによる自動フェイルオーバー
 - **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ（Fixed/Adaptiveポーリングモード）
+- **H2C (HTTP/2 over cleartext)**: TLSなしのHTTP/2バックエンド接続（gRPC対応）
 - **ヘッダー操作**: リクエスト/レスポンスヘッダーの追加・削除（X-Real-IP, HSTS等）
 - **リダイレクト**: 301/302/307/308 HTTPリダイレクト（パス保持オプション付き）
 - **SNI設定**: HTTPSバックエンドへのIP直打ち時にSNI名を指定可能（仮想ホスト対応）
@@ -46,12 +49,38 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 ## ビルド
 
 ```bash
-# 通常ビルド（rustls使用）
+# 通常ビルド（rustls使用、HTTP/1.1のみ）
 cargo build --release
 
 # kTLSサポート付きビルド（rustls + ktls2）
 cargo build --release --features ktls
+
+# HTTP/2サポート付きビルド
+cargo build --release --features http2
+
+# HTTP/3サポート付きビルド（quiche使用）
+cargo build --release --features http3
+
+# 全プロトコルサポート（HTTP/2 + HTTP/3）
+cargo build --release --features all-protocols
+
+# kTLS + HTTP/2（推奨構成）
+cargo build --release --features "ktls,http2"
+
+# フルビルド（kTLS + 全プロトコル）
+cargo build --release --features "ktls,all-protocols"
 ```
+
+### フィーチャーフラグ一覧
+
+| フィーチャー | 説明 | 備考 |
+|-------------|------|------|
+| `ktls` | kTLSカーネルオフロード | Linux 5.15+、要`modprobe tls` |
+| `http2` | HTTP/2 (ALPN h2) | TLS接続でのHTTP/2サポート |
+| `http3` | HTTP/3 (QUIC) | UDP/QUICベース、quiche使用 |
+| `all-protocols` | http2 + http3 | 全プロトコル有効化 |
+
+> **Note**: HTTP/3はUDPベースのため、kTLSとの併用はできません（HTTP/3はTCP/TLSを使用しないため）。
 
 ## 起動
 
@@ -170,6 +199,10 @@ http = "0.0.0.0:80"
 # ワーカースレッド数（オプション）
 # 未指定または0の場合はCPUコア数と同じスレッド数を使用
 threads = 4
+# HTTP/2を有効化（--features http2 でビルド時のみ）
+http2_enabled = true
+# HTTP/3を有効化（--features http3 でビルド時のみ）
+http3_enabled = true
 
 [logging]
 # ログレベル: "trace", "debug", "info", "warn", "error", "off"
@@ -396,6 +429,29 @@ url = "http://localhost:8080"
 type = "Proxy"
 url = "https://backend.example.com"
 ```
+
+### H2C (HTTP/2 over cleartext) プロキシ
+
+バックエンドがH2C（TLSなしのHTTP/2）をサポートしている場合、`use_h2c = true` を指定することでHTTP/2で通信できます。
+
+```toml
+# gRPCバックエンドへのH2C接続
+[path_routes."example.com"."/grpc/"]
+type = "Proxy"
+url = "http://localhost:50051"
+use_h2c = true
+```
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `use_h2c` | H2C (HTTP/2 without TLS) を使用 | false |
+
+**H2Cの用途：**
+- gRPCバックエンドへの接続（内部ネットワーク）
+- HTTP/2の多重化とヘッダー圧縮をバックエンド通信でも活用
+- Prior Knowledgeモードを使用（Upgrade経由ではない）
+
+> **Note**: H2CはHTTPSバックエンド（TLS接続）では使用できません。内部ネットワークでのgRPC通信など、TLSが不要な環境でのみ使用してください。
 
 #### SNI (Server Name Indication) 設定
 
@@ -780,6 +836,8 @@ GET /__metrics
 | `zerocopy_proxy_http_request_duration_seconds` | Histogram | method, host | リクエスト処理時間（秒） |
 | `zerocopy_proxy_http_request_size_bytes` | Histogram | - | リクエストボディサイズ |
 | `zerocopy_proxy_http_response_size_bytes` | Histogram | - | レスポンスボディサイズ |
+| `zerocopy_proxy_http_active_connections` | Gauge | host | アクティブな接続数 |
+| `zerocopy_proxy_http_upstream_health` | Gauge | upstream, server | アップストリーム健康状態（1=healthy, 0=unhealthy） |
 
 ### Grafanaダッシュボード例
 
@@ -811,6 +869,120 @@ scrape_configs:
       insecure_skip_verify: true  # 自己署名証明書の場合
     metrics_path: /__metrics
 ```
+
+## HTTP/2サポート
+
+HTTP/2（RFC 7540）をTLS ALPNネゴシエーションによりサポートします。
+
+### 特徴
+
+| 項目 | 効果 |
+|------|------|
+| ストリーム多重化 | 単一接続で複数リクエストを並列処理 |
+| HPACKヘッダー圧縮 | ヘッダーオーバーヘッドを大幅削減 |
+| サーバープッシュ | 先行リソース送信によるレイテンシ削減 |
+| フロー制御 | ストリーム・コネクションレベルの制御 |
+
+### 有効化
+
+```bash
+# HTTP/2フィーチャー付きでビルド
+cargo build --release --features http2
+```
+
+```toml
+# config.toml
+[server]
+listen = "0.0.0.0:443"
+http2_enabled = true  # HTTP/2を有効化（ALPN h2）
+```
+
+### 詳細設定
+
+`[http2]` セクションでHTTP/2プロトコルの詳細パラメータを設定できます：
+
+```toml
+[http2]
+# HPACK動的テーブルサイズ（デフォルト: 4096）
+header_table_size = 65536
+
+# 同時ストリーム数（デフォルト: 100）
+max_concurrent_streams = 1000
+
+# ストリームウィンドウサイズ（デフォルト: 65535）
+initial_window_size = 4194304
+
+# 最大フレームサイズ（デフォルト: 16384）
+max_frame_size = 65536
+
+# 最大ヘッダーリストサイズ（デフォルト: 16384）
+max_header_list_size = 65536
+
+# コネクションウィンドウサイズ（デフォルト: 65535）
+connection_window_size = 16777216
+```
+
+### HTTP/1.1フォールバック
+
+HTTP/2をサポートしないクライアントは自動的にHTTP/1.1にフォールバックします。
+
+## HTTP/3サポート
+
+HTTP/3（RFC 9114）をQUIC/UDPベースでサポートします。Cloudflare製の[quiche](https://github.com/cloudflare/quiche)を使用。
+
+### 特徴
+
+| 項目 | 効果 |
+|------|------|
+| 0-RTT接続確立 | TLSハンドシェイク不要で即時通信 |
+| Head-of-Lineブロッキング解消 | パケットロスが他ストリームに影響しない |
+| 接続マイグレーション | ネットワーク切り替え時も接続維持 |
+| GSO/GRO最適化 | 高パフォーマンスUDP処理 |
+
+### 有効化
+
+```bash
+# HTTP/3フィーチャー付きでビルド
+cargo build --release --features http3
+```
+
+```toml
+# config.toml
+[server]
+listen = "0.0.0.0:443"
+http3_enabled = true  # HTTP/3を有効化（QUIC/UDP）
+```
+
+### 詳細設定
+
+`[http3]` セクションでHTTP/3（QUIC）プロトコルの詳細パラメータを設定できます：
+
+```toml
+[http3]
+# HTTP/3リッスンアドレス（UDP、未指定時はserver.listenと同じ）
+listen = "0.0.0.0:443"
+
+# 最大アイドルタイムアウト（ミリ秒、デフォルト: 30000）
+max_idle_timeout = 30000
+
+# 最大UDPペイロードサイズ（デフォルト: 1350）
+max_udp_payload_size = 1350
+
+# 初期最大データサイズ（コネクション全体、デフォルト: 10000000）
+initial_max_data = 10000000
+
+# 初期最大双方向ストリーム数
+initial_max_streams_bidi = 100
+
+# 初期最大単方向ストリーム数
+initial_max_streams_uni = 100
+```
+
+### 注意事項
+
+- HTTP/3はUDPベースのため、**kTLSは使用不可**です（TCPを使用しないため）
+- UDPポート443をファイアウォールで開放する必要があります
+- Alt-SvcヘッダーでブラウザにHTTP/3対応を通知できます
 
 ## kTLS（Kernel TLS）サポート
 
@@ -1326,6 +1498,7 @@ file_path = "/var/log/zerocopy-server.log"
 - [rustls](https://github.com/rustls/rustls): Pure Rust TLS実装
 - [ktls2](https://crates.io/crates/ktls2): rustls用kTLS統合クレート
 - [httparse](https://crates.io/crates/httparse): 高速HTTPパーサー
+- [quiche](https://github.com/cloudflare/quiche): Cloudflare製 QUIC/HTTP/3実装
 
 ### パフォーマンス
 
