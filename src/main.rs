@@ -114,27 +114,18 @@ pub mod protocol;
 #[cfg(feature = "http2")]
 pub mod http2;
 
-/// HTTP/3 プロトコル実装 (RFC 9114)
-/// - QUIC プロトコル (RFC 9000)
-/// - QPACK ヘッダー圧縮 (RFC 9204)
-/// - HTTP/3 フレーム処理
-/// 
-/// 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
-/// GSO/GRO による高パフォーマンス UDP 処理を使用
-#[cfg(feature = "http3")]
-pub mod http3;
+// 旧 HTTP/3 自前実装（現在は quiche ベースの http3_server を使用）
+// #[cfg(feature = "http3")]
+// pub mod http3;
+// #[cfg(feature = "http3")]
+// pub mod udp;
 
-/// UDP ソケット (HTTP/3 用)
-/// - monoio io_uring 統合
-/// - GSO (Generic Segmentation Offload) サポート
-/// - GRO (Generic Receive Offload) サポート
-#[cfg(feature = "http3")]
-pub mod udp;
-
-/// HTTP/3 サーバー (quiche ベース)
+/// HTTP/3 サーバー (monoio + quiche ベース)
 /// - QUIC プロトコル (RFC 9000)
 /// - HTTP/3 (RFC 9114)
-/// - mio イベントループで動作
+/// - monoio io_uring で UDP I/O を処理
+/// - タイマー管理 (quiche::timeout + monoio::time::timeout)
+/// - H3 インスタンスの永続化 (QPACK 動的テーブル等の状態維持)
 #[cfg(feature = "http3")]
 pub mod http3_server;
 

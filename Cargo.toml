@@ -84,8 +84,7 @@ clap = { version = "4.5.53", features = ["derive"] }
 # 実績のある QUIC/HTTP/3 実装を使用
 quiche = { version = "0.23", optional = true }
 
-# リング型バッファ（HTTP/3 パケット処理用）
+# ring: 暗号化ライブラリ
+# - rustls の依存として使用（TLS 1.2/1.3）
+# - quiche (HTTP/3) でも使用（乱数生成、暗号化）
 ring = "0.17"
-
-# mio (HTTP/3 UDP イベントループ用)
-mio = { version = "1.0", features = ["net", "os-poll"] }
