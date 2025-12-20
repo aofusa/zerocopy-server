@@ -4912,6 +4912,48 @@ fn check_security(
 // ALPN ネゴシエーションで h2 が選択された場合に呼び出されます。
 // HTTP/1.1 と同等のセキュリティ機能とルーティングをサポート。
 
+/// I/Oエラーが接続終了を示すものかどうかを判定
+/// 
+/// kTLSを使用している場合、クライアントが正常に接続を閉じた後でも
+/// 次のフレーム読み込み時に以下のエラーが発生することがあります:
+/// 
+/// - EIO (os error 5): Input/output error - kTLS特有のエラー
+///   kTLSではTLSレコードの処理がカーネル空間で行われるため、
+///   クライアントがTLS close_notifyを送信せずに接続を閉じた場合や、
+///   タイミングによってこのエラーが発生します。
+/// - ConnectionReset: 接続がリセットされた（RST受信）
+/// - BrokenPipe: パイプが壊れた（相手側が閉じた後の書き込み試行）
+/// - UnexpectedEof: 予期しないEOF（相手側が閉じた）
+/// - ConnectionAborted: 接続が中断された
+/// 
+/// **重要**: これらのエラーはクライアントが接続を閉じた場合の正常な動作であり、
+/// サーバー側の問題ではありません。リクエスト処理は正常に完了しています。
+/// ログには警告として出力しますが、接続は正常終了として扱います。
+#[cfg(feature = "http2")]
+#[inline]
+fn is_connection_closed_error(e: &std::io::Error) -> bool {
+    use std::io::ErrorKind;
+    
+    match e.kind() {
+        ErrorKind::ConnectionReset => true,
+        ErrorKind::BrokenPipe => true,
+        ErrorKind::UnexpectedEof => true,
+        ErrorKind::ConnectionAborted => true,
+        _ => {
+            // kTLS使用時のEIO (os error 5) をチェック
+            // これはkTLS特有の動作であり、クライアントが接続を閉じた後に
+            // 次のフレームを読み込もうとした際に発生します。
+            // リクエスト処理自体は正常に完了しているため、問題ありません。
+            if let Some(os_error) = e.raw_os_error() {
+                // EIO = 5 (Linux)
+                os_error == 5
+            } else {
+                false
+            }
+        }
+    }
+}
+
 /// HTTP/2 リクエストを処理
 /// 
 /// HTTP/2 コネクションのメインループを実行し、各ストリームのリクエストを処理します。
@@ -4972,8 +5014,22 @@ where
             Ok(f) => f,
             Err(Http2Error::ConnectionClosed) => break,
             Err(Http2Error::Io(e)) if e.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(Http2Error::Io(ref e)) if is_connection_closed_error(e) => {
+                // クライアントが接続を閉じた場合に発生するエラー
+                // kTLS使用時はEIO (os error 5) が発生することがある
+                // 
+                // 注意: このエラーはクライアントが正常に接続を閉じた場合の動作であり、
+                // サーバー側の問題ではありません。リクエスト処理は正常に完了しています。
+                // HTTP/2では、クライアントがレスポンス受信後にGOAWAYを送信せずに
+                // 接続を閉じることがあり、その場合に次のフレーム読み込みでこのエラーが発生します。
+                warn!(
+                    "[HTTP/2] Connection closed by client (expected behavior): {} (client: {})",
+                    e, client_ip
+                );
+                break;
+            }
             Err(e) => {
-                // エラー時は GOAWAY を送信
+                // その他のエラー時は GOAWAY を送信
                 let _ = conn.send_goaway(e.error_code(), e.to_string().as_bytes()).await;
                 return Err(e);
             }
