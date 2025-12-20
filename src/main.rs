@@ -195,7 +195,7 @@ type ClientTls = simple_tls::SimpleTlsClientStream;
 // kTLS設定情報
 // ====================
 //
-// kTLSはs2n-tls経由でサポートされています。
+// kTLSはrustls + ktls2経由でサポートされています。
 // `cargo build --features ktls` でビルドしてください。
 //
 
