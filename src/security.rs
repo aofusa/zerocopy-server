@@ -201,12 +201,15 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     0,   // read
     1,   // write
     3,   // close
+    4,   // stat (DNS解決: /etc/resolv.conf等)
     5,   // fstat
+    6,   // lstat (DNS解決: シンボリックリンク確認)
     8,   // lseek
     17,  // pread64
     18,  // pwrite64
     19,  // readv
     20,  // writev
+    21,  // access (DNS解決: ファイルアクセス権確認)
     40,  // sendfile (kTLS ゼロコピー転送)
     72,  // fcntl
     79,  // getcwd (canonicalize() で使用)
@@ -214,6 +217,12 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     257, // openat
     262, // newfstatat
     275, // splice (kTLS ゼロコピー転送)
+    
+    // ============================================
+    // DNS名前解決 (getaddrinfo)
+    // ============================================
+    7,   // poll (DNS応答待機)
+    53,  // socketpair (NSS内部通信)
     
     // ============================================
     // ネットワーク（TCP/UDP ソケット）
@@ -233,6 +242,8 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     54,  // setsockopt
     55,  // getsockopt
     288, // accept4
+    299, // recvmmsg (DNS解決: 複数メッセージ受信)
+    307, // sendmmsg (DNS解決: 複数メッセージ送信)
 
     // ============================================
     // メモリ管理（mimalloc、Huge Pages、io_uring）
@@ -347,6 +358,7 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     // ファイル I/O
     // ============================================
     17,  // getcwd (canonicalize() で使用)
+    48,  // faccessat (DNS解決: ファイルアクセス権確認)
     56,  // openat
     57,  // close
     62,  // lseek
@@ -357,10 +369,12 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     67,  // pread64
     68,  // pwrite64
     71,  // sendfile (kTLS ゼロコピー転送)
+    73,  // ppoll (DNS応答待機)
     76,  // splice (kTLS ゼロコピー転送)
     78,  // readlinkat (canonicalize() で使用)
     79,  // fstatat
     80,  // fstat
+    199, // socketpair (NSS内部通信)
 
     // ============================================
     // ネットワーク
@@ -380,6 +394,8 @@ pub const ALLOWED_SYSCALLS: &[i64] = &[
     211, // sendmsg
     212, // recvmsg
     242, // accept4
+    243, // recvmmsg (DNS解決: 複数メッセージ受信)
+    269, // sendmmsg (DNS解決: 複数メッセージ送信)
 
     // ============================================
     // メモリ管理
