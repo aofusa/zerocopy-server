@@ -1896,15 +1896,21 @@ pub fn recommended_sandbox_config() -> SandboxConfig {
             BindMount::new("/lib", "/lib"),
             BindMount::new("/lib64", "/lib64"),
             BindMount::new("/etc/ssl", "/etc/ssl"),
+            // DNS解決に必要なファイル
             BindMount::new("/etc/resolv.conf", "/etc/resolv.conf"),
             BindMount::new("/etc/hosts", "/etc/hosts"),
+            BindMount::new("/etc/nsswitch.conf", "/etc/nsswitch.conf"),
+            BindMount::new("/etc/gai.conf", "/etc/gai.conf"),
+            // systemd-resolved使用時に必要
+            BindMount::new("/run/systemd/resolve", "/run/systemd/resolve"),
+            // ユーザー/グループ情報
             BindMount::new("/etc/passwd", "/etc/passwd"),
             BindMount::new("/etc/group", "/etc/group"),
         ],
         rw_bind_mounts: vec![],
         tmpfs_mounts: vec![
             "/tmp".to_string(),
-            "/run".to_string(),
+            // 注: /run はsystemd-resolvedのために除外
         ],
         mount_proc: true,
         mount_dev: true,

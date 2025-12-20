@@ -244,13 +244,20 @@ max_log_size = 104857600
 # バインドマウント設定
 # -------------------
 # 読み取り専用バインドマウント（source:dest 形式）
+# DNS解決に必要なファイルを含める必要があります
 # sandbox_ro_bind_mounts = [
 #   "/usr:/usr",
 #   "/lib:/lib",
 #   "/lib64:/lib64",
 #   "/etc/ssl:/etc/ssl",
+#   # DNS解決に必要
 #   "/etc/resolv.conf:/etc/resolv.conf",
 #   "/etc/hosts:/etc/hosts",
+#   "/etc/nsswitch.conf:/etc/nsswitch.conf",
+#   "/etc/gai.conf:/etc/gai.conf",
+#   # systemd-resolved使用時に必要
+#   "/run/systemd/resolve:/run/systemd/resolve",
+#   # ユーザー/グループ情報
 #   "/etc/passwd:/etc/passwd",
 #   "/etc/group:/etc/group"
 # ]
@@ -263,7 +270,8 @@ max_log_size = 104857600
 # ]
 
 # tmpfsマウント先（メモリファイルシステム）
-# sandbox_tmpfs_mounts = ["/tmp", "/run"]
+# 注: /run はsystemd-resolvedのDNS解決に必要なため除外推奨
+# sandbox_tmpfs_mounts = ["/tmp"]
 
 # /proc をマウント（デフォルト: true）
 # sandbox_mount_proc = true
@@ -304,11 +312,17 @@ max_log_size = 104857600
 #   "/lib:/lib",
 #   "/lib64:/lib64",
 #   "/etc/ssl:/etc/ssl",
-#   "/etc/resolv.conf:/etc/resolv.conf"
+#   # DNS解決に必要
+#   "/etc/resolv.conf:/etc/resolv.conf",
+#   "/etc/hosts:/etc/hosts",
+#   "/etc/nsswitch.conf:/etc/nsswitch.conf",
+#   "/etc/gai.conf:/etc/gai.conf",
+#   "/run/systemd/resolve:/run/systemd/resolve"
 # ]
 # sandbox_rw_bind_mounts = [
 #   "/var/log/zerocopy-server:/var/log/zerocopy-server"
 # ]
+# sandbox_tmpfs_mounts = ["/tmp"]
 #
 # # 権限降格
 # drop_privileges_user = "www-data"

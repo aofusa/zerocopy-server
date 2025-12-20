@@ -1481,8 +1481,14 @@ fn default_sandbox_ro_binds() -> Vec<String> {
         "/lib:/lib".to_string(),
         "/lib64:/lib64".to_string(),
         "/etc/ssl:/etc/ssl".to_string(),
+        // DNS解決に必要なファイル
         "/etc/resolv.conf:/etc/resolv.conf".to_string(),
         "/etc/hosts:/etc/hosts".to_string(),
+        "/etc/nsswitch.conf:/etc/nsswitch.conf".to_string(),
+        "/etc/gai.conf:/etc/gai.conf".to_string(),
+        // systemd-resolved使用時に必要（存在しない場合は無視される）
+        "/run/systemd/resolve:/run/systemd/resolve".to_string(),
+        // ユーザー/グループ情報
         "/etc/passwd:/etc/passwd".to_string(),
         "/etc/group:/etc/group".to_string(),
     ]
@@ -1491,7 +1497,8 @@ fn default_sandbox_ro_binds() -> Vec<String> {
 fn default_sandbox_tmpfs() -> Vec<String> {
     vec![
         "/tmp".to_string(),
-        "/run".to_string(),
+        // 注: /run はsystemd-resolvedのDNS解決に必要なため除外
+        // 必要な場合は明示的に追加してください
     ]
 }
 
