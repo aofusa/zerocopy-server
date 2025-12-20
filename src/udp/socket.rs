@@ -3,6 +3,8 @@
 //! monoio と統合した UDP ソケット実装。
 //! Linux GSO/GRO をサポートして高スループットを実現。
 
+#![allow(unused_imports)]
+
 use std::io;
 use std::net::SocketAddr;
 use std::os::unix::io::AsRawFd;

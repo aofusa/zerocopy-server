@@ -102,8 +102,11 @@ impl HpackDecoder {
 
     /// Literal Header Field with Incremental Indexing (Section 6.2.1)
     fn decode_literal_indexed(&mut self, buf: &[u8], pos: &mut usize) -> HpackResult<HeaderField> {
+        // ローカルオフセットで処理
+        let mut local_pos = 0usize;
+        
         let (index, consumed) = decode_integer(buf, 6)?;
-        *pos += consumed;
+        local_pos += consumed;
 
         let name = if index > 0 {
             // 名前はインデックス参照
@@ -112,11 +115,18 @@ impl HpackDecoder {
             name.to_vec()
         } else {
             // 名前はリテラル
-            self.decode_string(&buf[consumed..], pos)?
+            let mut name_pos = 0usize;
+            let name = self.decode_string(&buf[local_pos..], &mut name_pos)?;
+            local_pos += name_pos;
+            name
         };
 
-        let remaining = buf.len() - (*pos - consumed);
-        let value = self.decode_string(&buf[consumed + (*pos - consumed - consumed)..], pos)?;
+        // 値をデコード
+        let mut value_pos = 0usize;
+        let value = self.decode_string(&buf[local_pos..], &mut value_pos)?;
+        local_pos += value_pos;
+
+        *pos += local_pos;
 
         // 動的テーブルに追加
         self.dynamic_table.insert(name.clone(), value.clone());
@@ -126,19 +136,29 @@ impl HpackDecoder {
 
     /// Literal Header Field without Indexing (Section 6.2.2)
     fn decode_literal_without_indexing(&self, buf: &[u8], pos: &mut usize) -> HpackResult<HeaderField> {
+        // ローカルオフセットで処理
+        let mut local_pos = 0usize;
+        
         let (index, consumed) = decode_integer(buf, 4)?;
-        *pos += consumed;
+        local_pos += consumed;
 
         let name = if index > 0 {
             let (name, _) = get_indexed(&StaticTable, &self.dynamic_table, index)
                 .ok_or(HpackError::InvalidIndex(index))?;
             name.to_vec()
         } else {
-            self.decode_string(&buf[consumed..], pos)?
+            let mut name_pos = 0usize;
+            let name = self.decode_string(&buf[local_pos..], &mut name_pos)?;
+            local_pos += name_pos;
+            name
         };
 
-        let remaining = buf.len() - (*pos - consumed);
-        let value = self.decode_string(&buf[consumed + (*pos - consumed - consumed)..], pos)?;
+        // 値をデコード
+        let mut value_pos = 0usize;
+        let value = self.decode_string(&buf[local_pos..], &mut value_pos)?;
+        local_pos += value_pos;
+
+        *pos += local_pos;
 
         Ok(HeaderField::new(name, value))
     }

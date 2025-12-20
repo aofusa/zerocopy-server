@@ -46,6 +46,7 @@ impl FrameType {
 }
 
 /// フレームフラグ
+#[allow(non_snake_case)]
 pub mod FrameFlags {
     /// END_STREAM (DATA, HEADERS)
     pub const END_STREAM: u8 = 0x01;

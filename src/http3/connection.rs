@@ -183,7 +183,7 @@ impl Http3Connection {
                 self.remote_settings = Some(remote);
                 self.remote_control_stream = Some(stream_id);
             }
-            H3Frame::GoAway(stream_id) => {
+            H3Frame::GoAway(_stream_id) => {
                 self.goaway_received = true;
             }
             _ => {
@@ -230,7 +230,7 @@ impl Http3Connection {
     /// レスポンスを送信
     pub fn send_response(
         &mut self,
-        stream_id: u64,
+        _stream_id: u64,
         status: u16,
         headers: &[(&[u8], &[u8])],
         body: Option<&[u8]>,

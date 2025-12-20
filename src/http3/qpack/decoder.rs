@@ -4,6 +4,7 @@ use super::{QpackError, QpackResult, decode_integer};
 use super::table::{StaticTable, DynamicTable, HeaderField};
 
 /// QPACK デコーダ
+#[allow(dead_code)]
 pub struct QpackDecoder {
     /// 動的テーブル
     dynamic_table: DynamicTable,
@@ -29,11 +30,11 @@ impl QpackDecoder {
         let mut pos = 0;
 
         // Required Insert Count
-        let (ric, ric_len) = decode_integer(buf, 8)?;
+        let (_ric, ric_len) = decode_integer(buf, 8)?;
         pos += ric_len;
 
         // Delta Base
-        let (delta_base, db_len) = decode_integer(&buf[pos..], 7)?;
+        let (_delta_base, db_len) = decode_integer(&buf[pos..], 7)?;
         pos += db_len;
 
         let mut headers = Vec::new();

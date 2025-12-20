@@ -52,6 +52,7 @@ pub struct Http2Connection<S> {
     /// バッファ内の有効データ終了位置
     buf_end: usize,
     /// 送信キュー
+    #[allow(dead_code)]
     send_queue: VecDeque<Vec<u8>>,
 }
 
@@ -218,7 +219,7 @@ where
 
     /// データを送信
     async fn write_all(&mut self, data: &[u8]) -> Http2Result<()> {
-        let mut written = 0;
+        let written = 0;
         while written < data.len() {
             let buf = data[written..].to_vec();
             let (result, _) = self.stream.write_all(buf).await;
@@ -511,7 +512,7 @@ where
             // コネクションレベル
             let new_window = self.conn_send_window.checked_add(increment as i32);
             match new_window {
-                Some(w) if w <= 0x7FFFFFFF => {
+                Some(w) if (w as i64) <= 0x7FFFFFFF => {
                     self.conn_send_window = w;
                 }
                 _ => {

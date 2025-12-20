@@ -66,6 +66,8 @@ pub struct KtlsServerStream {
     conn: Option<ServerConnection>,
     /// 現在の TLS モード
     mode: TlsMode,
+    /// ALPN でネゴシエートされたプロトコル（kTLS 有効化後も保持）
+    alpn_protocol: Option<Vec<u8>>,
 }
 
 impl KtlsServerStream {
@@ -107,6 +109,27 @@ impl KtlsServerStream {
     /// rustls コネクションへの参照を取得（kTLS 有効化後は None）
     pub fn rustls_conn(&self) -> Option<&ServerConnection> {
         self.conn.as_ref()
+    }
+    
+    /// ALPN でネゴシエートされたプロトコルを取得
+    /// 
+    /// TLS ハンドシェイク完了後に呼び出すことで、
+    /// クライアントと合意したプロトコルを取得できます。
+    /// kTLS 有効化後もキャッシュされた値を返します。
+    /// 
+    /// # Returns
+    /// 
+    /// - `Some(b"h2")`: HTTP/2 がネゴシエートされた
+    /// - `Some(b"http/1.1")`: HTTP/1.1 がネゴシエートされた
+    /// - `None`: ALPN 未設定または未ネゴシエート
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.alpn_protocol.as_deref()
+    }
+    
+    /// HTTP/2 がネゴシエートされたかどうか
+    #[inline]
+    pub fn is_http2(&self) -> bool {
+        self.alpn_protocol() == Some(b"h2")
     }
 }
 
@@ -550,6 +573,9 @@ pub async fn accept(
 
     // ハンドシェイクを実行
     do_server_handshake(&stream, &mut conn).await?;
+    
+    // ALPN 情報をキャッシュ（kTLS 有効化後も参照できるように）
+    let alpn_protocol = conn.alpn_protocol().map(|p| p.to_vec());
 
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
@@ -598,6 +624,7 @@ pub async fn accept(
         inner: stream,
         conn: conn_option,
         mode,
+        alpn_protocol,
     })
 }
 

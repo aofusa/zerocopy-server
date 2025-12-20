@@ -4,6 +4,7 @@ use super::{QpackResult, encode_integer};
 use super::table::{StaticTable, DynamicTable};
 
 /// QPACK エンコーダ
+#[allow(dead_code)]
 pub struct QpackEncoder {
     /// 動的テーブル
     dynamic_table: DynamicTable,

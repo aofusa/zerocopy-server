@@ -65,6 +65,26 @@ impl SimpleTlsServerStream {
     pub fn is_ktls_send_enabled(&self) -> bool {
         false
     }
+    
+    /// ALPN でネゴシエートされたプロトコルを取得
+    /// 
+    /// TLS ハンドシェイク完了後に呼び出すことで、
+    /// クライアントと合意したプロトコルを取得できます。
+    /// 
+    /// # Returns
+    /// 
+    /// - `Some(b"h2")`: HTTP/2 がネゴシエートされた
+    /// - `Some(b"http/1.1")`: HTTP/1.1 がネゴシエートされた
+    /// - `None`: ALPN 未設定または未ネゴシエート
+    pub fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.conn.alpn_protocol()
+    }
+    
+    /// HTTP/2 がネゴシエートされたかどうか
+    #[inline]
+    pub fn is_http2(&self) -> bool {
+        self.alpn_protocol() == Some(b"h2")
+    }
 }
 
 impl AsRawFd for SimpleTlsServerStream {

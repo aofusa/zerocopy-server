@@ -26,6 +26,7 @@ pub enum ConnectionState {
 }
 
 /// QUIC コネクション
+#[allow(dead_code)]
 pub struct QuicConnection {
     /// ローカル接続 ID
     pub local_cid: ConnectionId,

@@ -275,7 +275,7 @@ impl Stream {
     pub fn recv_window_update(&mut self, increment: u32) -> Result<(), Http2Error> {
         let new_window = self.send_window.checked_add(increment as i32);
         match new_window {
-            Some(w) if w <= 0x7FFFFFFF => {
+            Some(w) if (w as i64) <= 0x7FFFFFFF => {
                 self.send_window = w;
                 Ok(())
             }
@@ -434,7 +434,7 @@ impl StreamManager {
         for stream in self.streams.values_mut() {
             let new_window = stream.send_window.checked_add(delta);
             match new_window {
-                Some(w) if w <= 0x7FFFFFFF => {
+                Some(w) if (w as i64) <= 0x7FFFFFFF => {
                     stream.send_window = w;
                 }
                 _ => {

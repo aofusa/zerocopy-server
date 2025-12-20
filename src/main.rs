@@ -3217,7 +3217,11 @@ fn validate_backend_config(config: &BackendConfig, route_name: &str) -> io::Resu
 }
 
 // rustls 用の TLS 設定読み込み（統一）
-fn load_tls_config(tls_config: &TlsConfigSection, ktls_enabled: bool) -> io::Result<Arc<ServerConfig>> {
+fn load_tls_config(
+    tls_config: &TlsConfigSection, 
+    ktls_enabled: bool,
+    #[allow(unused_variables)] http2_enabled: bool,
+) -> io::Result<Arc<ServerConfig>> {
     let cert_file = File::open(&tls_config.cert_path)?;
     let key_file = File::open(&tls_config.key_path)?;
 
@@ -3247,6 +3251,13 @@ fn load_tls_config(tls_config: &TlsConfigSection, ktls_enabled: bool) -> io::Res
     #[cfg(not(feature = "ktls"))]
     let _ = ktls_enabled;
 
+    // HTTP/2 有効時は ALPN を設定
+    #[cfg(feature = "http2")]
+    if http2_enabled {
+        config = protocol::configure_alpn_h2(config, false);
+        info!("HTTP/2 enabled via ALPN negotiation (h2, http/1.1)");
+    }
+
     Ok(Arc::new(config))
 }
 
@@ -3269,6 +3280,12 @@ struct LoadedConfig {
     logging: LoggingConfigSection,
     /// Upstream グループ（健康チェック用）
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
+    /// HTTP/2 を有効化するかどうか
+    http2_enabled: bool,
+    /// HTTP/3 を有効化するかどうか
+    http3_enabled: bool,
+    /// HTTP/3 リスナーアドレス (UDP)
+    http3_listen: Option<String>,
 }
 
 // ====================
@@ -3307,6 +3324,8 @@ struct RuntimeConfig {
     global_security: Arc<GlobalSecurityConfig>,
     /// Upstream グループ（健康チェック用）
     upstream_groups: Arc<HashMap<String, Arc<UpstreamGroup>>>,
+    /// HTTP/2 有効化フラグ
+    http2_enabled: bool,
 }
 
 impl Default for RuntimeConfig {
@@ -3318,6 +3337,7 @@ impl Default for RuntimeConfig {
             ktls_config: Arc::new(KtlsConfig::default()),
             global_security: Arc::new(GlobalSecurityConfig::default()),
             upstream_groups: Arc::new(HashMap::new()),
+            http2_enabled: false,
         }
     }
 }
@@ -3350,6 +3370,7 @@ fn reload_config(path: &Path) -> io::Result<()> {
         ktls_config: Arc::new(loaded.ktls_config),
         global_security: Arc::new(loaded.global_security),
         upstream_groups: loaded.upstream_groups,
+        http2_enabled: loaded.http2_enabled,
     };
     
     // アトミックに設定を入れ替え
@@ -3375,8 +3396,13 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         fallback_enabled: config.tls.ktls_fallback_enabled,
     };
 
-    // TLS設定（kTLS有効時はシークレット抽出を有効化）
-    let tls_config = load_tls_config(&config.tls, ktls_config.enabled)?;
+    // HTTP/2・HTTP/3 設定を読み込み
+    let http2_enabled = config.server.http2_enabled;
+    let http3_enabled = config.server.http3_enabled;
+    let http3_listen = config.server.http3_listen.clone();
+    
+    // TLS設定（kTLS有効時はシークレット抽出を有効化、HTTP/2有効時はALPN設定）
+    let tls_config = load_tls_config(&config.tls, ktls_config.enabled, http2_enabled)?;
     
     // Upstream グループを構築（ロードバランシング用）
     let mut upstream_groups: HashMap<String, Arc<UpstreamGroup>> = HashMap::new();
@@ -3459,6 +3485,9 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         global_security: config.security,
         logging: config.logging,
         upstream_groups: Arc::new(upstream_groups),
+        http2_enabled,
+        http3_enabled,
+        http3_listen,
     })
 }
 
@@ -3731,9 +3760,19 @@ fn main() {
         ktls_config: ktls_config.clone(),
         global_security: Arc::new(loaded_config.global_security.clone()),
         upstream_groups: loaded_config.upstream_groups.clone(),
+        http2_enabled: loaded_config.http2_enabled,
     };
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
+    
+    // HTTP/2・HTTP/3 の設定ログ
+    if loaded_config.http2_enabled {
+        info!("HTTP/2 enabled via ALPN negotiation");
+    }
+    if loaded_config.http3_enabled {
+        info!("HTTP/3 enabled (UDP listener: {})", 
+              loaded_config.http3_listen.as_deref().unwrap_or(&loaded_config.listen_addr));
+    }
 
     let hostname = hostname::get()
         .map(|h| h.to_string_lossy().into_owned())
@@ -4413,6 +4452,8 @@ async fn handle_connection(
     let config = CURRENT_CONFIG.load();
     let host_routes = config.host_routes.clone();
     let path_routes = config.path_routes.clone();
+    #[cfg(feature = "http2")]
+    let http2_enabled = config.http2_enabled;
     
     // TLSハンドシェイクにタイムアウトを設定
     // rustls でハンドシェイク後、ktls2 で kTLS を有効化
@@ -4433,6 +4474,14 @@ async fn handle_connection(
     // クライアントIPアドレスを文字列に変換
     let client_ip = peer_addr.ip().to_string();
 
+    // HTTP/2 が有効かつネゴシエートされた場合は HTTP/2 ハンドラーを使用
+    #[cfg(feature = "http2")]
+    if http2_enabled && tls_stream.is_http2() {
+        handle_http2_connection(tls_stream, &host_routes, &path_routes, &client_ip).await;
+        return;
+    }
+
+    // HTTP/1.1 ハンドラー
     handle_requests(tls_stream, &host_routes, &path_routes, &client_ip).await;
 }
 
@@ -4448,6 +4497,8 @@ async fn handle_connection(
     let config = CURRENT_CONFIG.load();
     let host_routes = config.host_routes.clone();
     let path_routes = config.path_routes.clone();
+    #[cfg(feature = "http2")]
+    let http2_enabled = config.http2_enabled;
     
     // TLSハンドシェイクにタイムアウトを設定
     let tls_result = timeout(CONNECT_TIMEOUT, acceptor.accept(stream)).await;
@@ -4467,6 +4518,14 @@ async fn handle_connection(
     // クライアントIPアドレスを文字列に変換
     let client_ip = peer_addr.ip().to_string();
 
+    // HTTP/2 が有効かつネゴシエートされた場合は HTTP/2 ハンドラーを使用
+    #[cfg(feature = "http2")]
+    if http2_enabled && tls_stream.is_http2() {
+        handle_http2_connection(tls_stream, &host_routes, &path_routes, &client_ip).await;
+        return;
+    }
+
+    // HTTP/1.1 ハンドラー
     handle_requests(tls_stream, &host_routes, &path_routes, &client_ip).await;
 }
 

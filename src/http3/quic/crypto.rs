@@ -15,6 +15,7 @@ pub struct PacketKeys {
 }
 
 /// QUIC 暗号化コンテキスト
+#[allow(dead_code)]
 pub struct QuicCrypto {
     /// 初期シークレット
     initial_secret: Option<Vec<u8>>,
@@ -69,7 +70,7 @@ impl QuicCrypto {
     pub fn encrypt_packet(
         &self,
         _level: EncryptionLevel,
-        pn: u64,
+        _pn: u64,
         header: &[u8],
         payload: &[u8],
     ) -> Result<Vec<u8>, &'static str> {
@@ -88,7 +89,7 @@ impl QuicCrypto {
         &self,
         _level: EncryptionLevel,
         _pn: u64,
-        header: &[u8],
+        _header: &[u8],
         encrypted: &[u8],
     ) -> Result<Vec<u8>, &'static str> {
         // 簡略化: 実際には AEAD 復号を実行
@@ -106,7 +107,7 @@ impl QuicCrypto {
     pub fn apply_header_protection(
         &self,
         _level: EncryptionLevel,
-        header: &mut [u8],
+        _header: &mut [u8],
         _sample: &[u8],
     ) {
         // 簡略化: 実際にはヘッダー保護を適用
@@ -118,7 +119,7 @@ impl QuicCrypto {
     pub fn remove_header_protection(
         &self,
         _level: EncryptionLevel,
-        header: &mut [u8],
+        _header: &mut [u8],
         _sample: &[u8],
     ) {
         // 簡略化: 実際にはヘッダー保護を解除

@@ -296,6 +296,7 @@ pub fn huffman_encode(src: &[u8]) -> Vec<u8> {
 }
 
 /// Huffman デコード状態
+#[allow(dead_code)]
 struct HuffmanDecoder {
     /// 状態
     state: u8,
@@ -308,6 +309,7 @@ struct HuffmanDecoder {
 /// Huffman デコードテーブルエントリ
 /// (次の状態, 出力シンボル, フラグ)
 /// フラグ: 0=継続, 1=出力あり, 2=エラー, 3=最終状態許可
+#[allow(dead_code)]
 type DecodeEntry = (u8, u8, u8);
 
 // 状態機械ベースのデコードテーブル (簡略版)
@@ -335,7 +337,10 @@ pub fn huffman_decode(src: &[u8]) -> Result<Vec<u8>, HpackError> {
         if flags & 0x02 != 0 {
             return Err(HpackError::HuffmanDecodeError);
         }
-        accept = flags & 0x04 != 0;
+        #[allow(unused_assignments)]
+        {
+            accept = flags & 0x04 != 0;
+        }
 
         // 下位4ビット
         let (new_state, sym, flags) = decode_nibble(state, nibble_lo);
@@ -368,6 +373,7 @@ fn decode_nibble(state: u32, nibble: usize) -> (u32, u8, u8) {
     // この実装では、一般的な ASCII 文字のみを高速にデコードし、
     // それ以外は状態遷移テーブルを使用
     
+    #[allow(dead_code)]
     static DECODE_TABLE: &[&[(u32, u8, u8)]; 256] = &[&[]; 256]; // プレースホルダー
     
     // 簡略実装: ビット列を蓄積してシンボルを検索
