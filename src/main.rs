@@ -2159,13 +2159,12 @@ struct Config {
 // HTTP/2 設定セクション (RFC 7540)
 // ====================
 
-/// HTTP/2 設定
+/// HTTP/2 詳細設定
+/// 
+/// HTTP/2 プロトコルのパラメータを設定します。
+/// 有効化は `server.http2_enabled` で行います。
 #[derive(Deserialize, Clone)]
 pub struct Http2ConfigSection {
-    /// HTTP/2を有効化（ALPNでネゴシエート）
-    #[serde(default)]
-    pub enabled: bool,
-    
     /// SETTINGS_HEADER_TABLE_SIZE (HPACK動的テーブルサイズ)
     /// デフォルト: 4096 (4KB)
     /// 高パフォーマンス: 65536 (64KB)
@@ -2208,7 +2207,6 @@ fn default_h2_connection_window_size() -> u32 { 65535 }
 impl Default for Http2ConfigSection {
     fn default() -> Self {
         Self {
-            enabled: false,
             header_table_size: default_h2_header_table_size(),
             max_concurrent_streams: default_h2_max_concurrent_streams(),
             initial_window_size: default_h2_initial_window_size(),
@@ -2238,14 +2236,14 @@ impl Http2ConfigSection {
 // HTTP/3 設定セクション (RFC 9114, QUIC RFC 9000)
 // ====================
 
-/// HTTP/3 設定
+/// HTTP/3 詳細設定
+/// 
+/// HTTP/3 (QUIC) プロトコルのパラメータを設定します。
+/// 有効化は `server.http3_enabled` で行います。
 #[derive(Deserialize, Clone)]
 pub struct Http3ConfigSection {
-    /// HTTP/3を有効化（UDPリスナー）
-    #[serde(default)]
-    pub enabled: bool,
-    
     /// HTTP/3リッスンアドレス（UDP）
+    /// 未指定の場合は server.listen と同じアドレスを使用
     #[serde(default)]
     pub listen: Option<String>,
     
@@ -2294,7 +2292,6 @@ fn default_h3_max_streams() -> u64 { 100 }
 impl Default for Http3ConfigSection {
     fn default() -> Self {
         Self {
-            enabled: false,
             listen: None,
             max_idle_timeout: default_h3_max_idle_timeout(),
             max_udp_payload_size: default_h3_max_udp_payload_size(),
@@ -2374,16 +2371,9 @@ struct ServerConfigSection {
     /// - `--features http3` でビルドする必要があります
     /// - HTTP/3 は UDP ベースのため kTLS は使用不可
     /// - GSO/GRO による高パフォーマンス UDP 処理を使用
+    /// - リッスンアドレスは [http3].listen で設定
     #[serde(default)]
     http3_enabled: bool,
-    
-    /// HTTP/3 リスナーアドレス (UDP)
-    /// 
-    /// HTTP/3 用の UDP ソケットをバインドするアドレス。
-    /// 未指定の場合は `listen` と同じアドレスを使用します。
-    /// 例: "0.0.0.0:443"
-    #[serde(default)]
-    http3_listen: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -3608,30 +3598,11 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     };
 
     // HTTP/2・HTTP/3 設定を読み込み
-    // 互換性のため、server.http2_enabled と [http2].enabled の両方をサポート
-    // [http2] セクションの enabled が優先され、なければ server.http2_enabled を使用
-    let http2_config = {
-        let mut cfg = config.http2.clone();
-        // [http2].enabled が明示的に設定されていない場合、server.http2_enabled を使用
-        if !cfg.enabled && config.server.http2_enabled {
-            cfg.enabled = true;
-        }
-        cfg
-    };
-    let http3_config = {
-        let mut cfg = config.http3.clone();
-        // [http3].enabled が明示的に設定されていない場合、server.http3_enabled を使用
-        if !cfg.enabled && config.server.http3_enabled {
-            cfg.enabled = true;
-        }
-        // [http3].listen が設定されていない場合、server.http3_listen を使用
-        if cfg.listen.is_none() && config.server.http3_listen.is_some() {
-            cfg.listen = config.server.http3_listen.clone();
-        }
-        cfg
-    };
-    let http2_enabled = http2_config.enabled;
-    let http3_enabled = http3_config.enabled;
+    // 有効化フラグは server セクションで管理、詳細設定は [http2]/[http3] セクション
+    let http2_enabled = config.server.http2_enabled;
+    let http3_enabled = config.server.http3_enabled;
+    let http2_config = config.http2.clone();
+    let http3_config = config.http3.clone();
     let http3_listen = http3_config.listen.clone();
     
     // TLS設定（kTLS有効時はシークレット抽出を有効化、HTTP/2有効時はALPN設定）

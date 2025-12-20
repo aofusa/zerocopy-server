@@ -56,11 +56,6 @@ threads = 4
 #
 # http3_enabled = true
 
-# HTTP/3 リスナーアドレス (UDP)
-# 未指定の場合は listen と同じアドレスを使用
-#
-# http3_listen = "0.0.0.0:443"
-
 
 # ====================
 # ログ設定（非同期ログの最適化）
@@ -172,15 +167,11 @@ ktls_fallback_enabled = false
 # ==========================================
 #
 # HTTP/2 プロトコルの詳細なパラメータを設定できます。
-# server.http2_enabled = true と併用してください。
+# server.http2_enabled = true で有効化してください。
 #
 # 注意: --features http2 でビルドする必要があります
 #
 [http2]
-# HTTP/2を有効化（ALPNでネゴシエート）
-# server.http2_enabled と同等（こちらが優先）
-enabled = false
-
 # SETTINGS_HEADER_TABLE_SIZE (HPACK動的テーブルサイズ)
 # デフォルト: 4096 (4KB)
 # 高パフォーマンス: 65536 (64KB) - メモリ使用増加と引き換えに圧縮効率向上
@@ -217,7 +208,7 @@ enabled = false
 # ==========================================
 #
 # HTTP/3 (QUIC) プロトコルの詳細なパラメータを設定できます。
-# server.http3_enabled = true と併用してください。
+# server.http3_enabled = true で有効化してください。
 #
 # 注意:
 #   - --features http3 でビルドする必要があります
@@ -225,12 +216,8 @@ enabled = false
 #   - quiche (Cloudflare製) を使用
 #
 [http3]
-# HTTP/3を有効化（UDPリスナー）
-# server.http3_enabled と同等（こちらが優先）
-enabled = false
-
 # HTTP/3リッスンアドレス（UDP）
-# server.http3_listen が設定されている場合はそちらを優先
+# 未指定の場合は server.listen と同じアドレスを使用
 # listen = "0.0.0.0:443"
 
 # 最大アイドルタイムアウト（ミリ秒）
