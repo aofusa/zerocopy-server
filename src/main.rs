@@ -6269,10 +6269,20 @@ where
         return Some((status, msg.len() as u64));
     }
     
+    // Accept-Encoding を取得
+    let client_encoding = if let Some(stream) = conn.get_stream(stream_id) {
+        stream.request_headers.iter()
+            .find(|h| h.name.eq_ignore_ascii_case(b"accept-encoding"))
+            .map(|h| AcceptedEncoding::parse(&h.value))
+            .unwrap_or(AcceptedEncoding::Identity)
+    } else {
+        AcceptedEncoding::Identity
+    };
+    
     // Backend処理
     match backend {
-        Backend::Proxy(upstream_group, _, _) => {
-            handle_http2_proxy(conn, stream_id, &upstream_group, method, path, &prefix, client_ip).await
+        Backend::Proxy(upstream_group, _, compression) => {
+            handle_http2_proxy(conn, stream_id, &upstream_group, &compression, client_encoding, method, path, &prefix, client_ip).await
         }
         Backend::MemoryFile(data, mime_type, security) => {
             // ファイル完全一致チェック
@@ -6327,6 +6337,8 @@ async fn handle_http2_proxy<S>(
     conn: &mut http2::Http2Connection<S>,
     stream_id: u32,
     upstream_group: &Arc<UpstreamGroup>,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
     method: &[u8],
     req_path: &[u8],
     prefix: &[u8],
@@ -6429,9 +6441,9 @@ where
     // バックエンドに接続して転送
     let addr = format!("{}:{}", target.host, target.port);
     let result = if target.use_tls {
-        handle_http2_proxy_https(conn, stream_id, &addr, target.sni(), request).await
+        handle_http2_proxy_https(conn, stream_id, &addr, target.sni(), request, compression, client_encoding).await
     } else {
-        handle_http2_proxy_http(conn, stream_id, &addr, request).await
+        handle_http2_proxy_http(conn, stream_id, &addr, request, compression, client_encoding).await
     };
     
     server.release();
@@ -6445,6 +6457,8 @@ async fn handle_http2_proxy_http<S>(
     stream_id: u32,
     addr: &str,
     request: Vec<u8>,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
 ) -> Option<(u16, u64)>
 where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
@@ -6524,28 +6538,42 @@ where
             let mut resp = httparse::Response::new(&mut headers_storage);
             let _ = resp.parse(&response_buf);
             
-            // HTTP/2用のヘッダーを構築（ホップバイホップヘッダー除外）
-            let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-            h2_headers.push((b"server", b"veil/http2"));
-            
-            for header in resp.headers.iter() {
-                if header.name.is_empty() {
-                    continue;
-                }
-                // ホップバイホップヘッダーを除外
-                if header.name.eq_ignore_ascii_case("connection") ||
-                   header.name.eq_ignore_ascii_case("keep-alive") ||
-                   header.name.eq_ignore_ascii_case("transfer-encoding") ||
-                   header.name.eq_ignore_ascii_case("upgrade") {
-                    continue;
-                }
-                h2_headers.push((header.name.as_bytes(), header.value));
-            }
+            // Content-Type と Content-Encoding を取得
+            let content_type = resp.headers.iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+                .map(|h| h.value);
+            let existing_encoding = resp.headers.iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
+                .map(|h| h.value);
             
             // Content-Length が chunked の場合は計算
             let final_body = if parsed.is_chunked {
-                // TODO: Chunkedデコード
-                body.to_vec()
+                // Chunked レスポンスの場合、終端検出しながら読み込み
+                let mut decoder = ChunkedDecoder::new_unlimited();
+                let mut full_body = body.to_vec();
+                decoder.feed(body);
+                
+                while !decoder.is_complete() {
+                    let buf = buf_get();
+                    let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+                    let (res, mut returned_buf) = match read_result {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    
+                    let n = match res {
+                        Ok(0) => { buf_put(returned_buf); break; }
+                        Ok(n) => n,
+                        Err(_) => { buf_put(returned_buf); break; }
+                    };
+                    
+                    returned_buf.set_valid_len(n);
+                    full_body.extend_from_slice(returned_buf.as_valid_slice());
+                    decoder.feed(returned_buf.as_valid_slice());
+                    buf_put(returned_buf);
+                }
+                // Chunkedデコード: 生のボディを抽出
+                decode_chunked_body(&full_body)
             } else if let Some(content_len) = parsed.content_length {
                 // 残りのボディを読む
                 let mut full_body = body.to_vec();
@@ -6572,13 +6600,68 @@ where
                 body.to_vec()
             };
             
+            // 圧縮すべきかどうかを判定
+            let should_compress = compression.should_compress(
+                client_encoding,
+                content_type,
+                Some(final_body.len()),
+                existing_encoding,
+            );
+            
+            // HTTP/2用のヘッダーを構築（ホップバイホップヘッダー除外）
+            let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+            h2_headers.push((b"server", b"veil/http2"));
+            
+            // 圧縮が有効な場合は Content-Encoding を追加
+            let encoding_value: Vec<u8>;
+            if let Some(enc) = should_compress {
+                encoding_value = match enc {
+                    AcceptedEncoding::Brotli => b"br".to_vec(),
+                    AcceptedEncoding::Gzip => b"gzip".to_vec(),
+                    AcceptedEncoding::Deflate => b"deflate".to_vec(),
+                    AcceptedEncoding::Identity => Vec::new(),
+                };
+                if !encoding_value.is_empty() {
+                    h2_headers.push((b"content-encoding", &encoding_value));
+                    h2_headers.push((b"vary", b"Accept-Encoding"));
+                }
+            }
+            
+            for header in resp.headers.iter() {
+                if header.name.is_empty() {
+                    continue;
+                }
+                // ホップバイホップヘッダーを除外
+                if header.name.eq_ignore_ascii_case("connection") ||
+                   header.name.eq_ignore_ascii_case("keep-alive") ||
+                   header.name.eq_ignore_ascii_case("transfer-encoding") ||
+                   header.name.eq_ignore_ascii_case("upgrade") {
+                    continue;
+                }
+                // 圧縮時は Content-Length と Content-Encoding をスキップ
+                if should_compress.is_some() && (
+                    header.name.eq_ignore_ascii_case("content-length") ||
+                    header.name.eq_ignore_ascii_case("content-encoding")
+                ) {
+                    continue;
+                }
+                h2_headers.push((header.name.as_bytes(), header.value));
+            }
+            
+            // 圧縮処理
+            let response_body = if let Some(enc) = should_compress {
+                compress_body_h2(&final_body, enc, compression)
+            } else {
+                final_body
+            };
+            
             // HTTP/2 レスポンス送信
-            if let Err(e) = conn.send_response(stream_id, status, &h2_headers, Some(&final_body)).await {
+            if let Err(e) = conn.send_response(stream_id, status, &h2_headers, Some(&response_body)).await {
                 warn!("[HTTP/2] Response send error: {}", e);
                 return None;
             }
             
-            return Some((status, final_body.len() as u64));
+            return Some((status, response_body.len() as u64));
         }
         
         // ヘッダーが大きすぎる
@@ -6603,6 +6686,8 @@ async fn handle_http2_proxy_https<S>(
     addr: &str,
     sni: &str,
     request: Vec<u8>,
+    compression: &CompressionConfig,
+    client_encoding: AcceptedEncoding,
 ) -> Option<(u16, u64)>
 where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
@@ -6698,24 +6783,43 @@ where
             let mut resp = httparse::Response::new(&mut headers_storage);
             let _ = resp.parse(&response_buf);
             
-            // HTTP/2用のヘッダーを構築
-            let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
-            h2_headers.push((b"server", b"veil/http2"));
+            // Content-Type と Content-Encoding を取得
+            let content_type = resp.headers.iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-type"))
+                .map(|h| h.value);
+            let existing_encoding = resp.headers.iter()
+                .find(|h| h.name.eq_ignore_ascii_case("content-encoding"))
+                .map(|h| h.value);
             
-            for header in resp.headers.iter() {
-                if header.name.is_empty() {
-                    continue;
+            // ボディを読む（Chunked対応）
+            let final_body = if parsed.is_chunked {
+                // Chunked レスポンスの場合、終端検出しながら読み込み
+                let mut decoder = ChunkedDecoder::new_unlimited();
+                let mut full_body = body.to_vec();
+                decoder.feed(body);
+                
+                while !decoder.is_complete() {
+                    let buf = buf_get();
+                    let read_result = timeout(READ_TIMEOUT, backend.read(buf)).await;
+                    let (res, mut returned_buf) = match read_result {
+                        Ok(r) => r,
+                        Err(_) => break,
+                    };
+                    
+                    let n = match res {
+                        Ok(0) => { buf_put(returned_buf); break; }
+                        Ok(n) => n,
+                        Err(_) => { buf_put(returned_buf); break; }
+                    };
+                    
+                    returned_buf.set_valid_len(n);
+                    full_body.extend_from_slice(returned_buf.as_valid_slice());
+                    decoder.feed(returned_buf.as_valid_slice());
+                    buf_put(returned_buf);
                 }
-                if header.name.eq_ignore_ascii_case("connection") ||
-                   header.name.eq_ignore_ascii_case("keep-alive") ||
-                   header.name.eq_ignore_ascii_case("transfer-encoding") {
-                    continue;
-                }
-                h2_headers.push((header.name.as_bytes(), header.value));
-            }
-            
-            // 残りのボディを読む
-            let final_body = if let Some(content_len) = parsed.content_length {
+                // Chunkedデコード: 生のボディを抽出
+                decode_chunked_body(&full_body)
+            } else if let Some(content_len) = parsed.content_length {
                 let mut full_body = body.to_vec();
                 while full_body.len() < content_len {
                     let buf = buf_get();
@@ -6740,12 +6844,66 @@ where
                 body.to_vec()
             };
             
-            if let Err(e) = conn.send_response(stream_id, status, &h2_headers, Some(&final_body)).await {
+            // 圧縮すべきかどうかを判定
+            let should_compress = compression.should_compress(
+                client_encoding,
+                content_type,
+                Some(final_body.len()),
+                existing_encoding,
+            );
+            
+            // HTTP/2用のヘッダーを構築
+            let mut h2_headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(16);
+            h2_headers.push((b"server", b"veil/http2"));
+            
+            // 圧縮が有効な場合は Content-Encoding を追加
+            let encoding_value: Vec<u8>;
+            if let Some(enc) = should_compress {
+                encoding_value = match enc {
+                    AcceptedEncoding::Brotli => b"br".to_vec(),
+                    AcceptedEncoding::Gzip => b"gzip".to_vec(),
+                    AcceptedEncoding::Deflate => b"deflate".to_vec(),
+                    AcceptedEncoding::Identity => Vec::new(),
+                };
+                if !encoding_value.is_empty() {
+                    h2_headers.push((b"content-encoding", &encoding_value));
+                    h2_headers.push((b"vary", b"Accept-Encoding"));
+                }
+            }
+            
+            for header in resp.headers.iter() {
+                if header.name.is_empty() {
+                    continue;
+                }
+                // ホップバイホップヘッダーを除外
+                if header.name.eq_ignore_ascii_case("connection") ||
+                   header.name.eq_ignore_ascii_case("keep-alive") ||
+                   header.name.eq_ignore_ascii_case("transfer-encoding") {
+                    continue;
+                }
+                // 圧縮時は Content-Length と Content-Encoding をスキップ
+                if should_compress.is_some() && (
+                    header.name.eq_ignore_ascii_case("content-length") ||
+                    header.name.eq_ignore_ascii_case("content-encoding")
+                ) {
+                    continue;
+                }
+                h2_headers.push((header.name.as_bytes(), header.value));
+            }
+            
+            // 圧縮処理
+            let response_body = if let Some(enc) = should_compress {
+                compress_body_h2(&final_body, enc, compression)
+            } else {
+                final_body
+            };
+            
+            if let Err(e) = conn.send_response(stream_id, status, &h2_headers, Some(&response_body)).await {
                 warn!("[HTTP/2] Response send error: {}", e);
                 return None;
             }
             
-            return Some((status, final_body.len() as u64));
+            return Some((status, response_body.len() as u64));
         }
         
         if response_buf.len() > MAX_HEADER_SIZE {
@@ -6756,6 +6914,109 @@ where
     let headers: &[(&[u8], &[u8])] = &[(b"server", b"veil/http2")];
     let _ = conn.send_response(stream_id, 502, headers, Some(b"Bad Gateway")).await;
     Some((502, 11))
+}
+
+/// Chunkedエンコードされたボディをデコードして生のデータを抽出
+/// 
+/// RFC 7230 Section 4.1に準拠した簡易的なChunkedデコーダ。
+/// Transfer-Encoding: chunked 形式のボディから、生のデータを抽出します。
+#[cfg(feature = "http2")]
+fn decode_chunked_body(chunked_data: &[u8]) -> Vec<u8> {
+    let mut result = Vec::with_capacity(chunked_data.len());
+    let mut pos = 0;
+    
+    while pos < chunked_data.len() {
+        // チャンクサイズを読み取り（16進数）
+        let size_start = pos;
+        while pos < chunked_data.len() && chunked_data[pos] != b'\r' {
+            pos += 1;
+        }
+        
+        if pos >= chunked_data.len() {
+            break;
+        }
+        
+        // チャンクサイズを解析
+        let size_str = match std::str::from_utf8(&chunked_data[size_start..pos]) {
+            Ok(s) => s.trim(),
+            Err(_) => break,
+        };
+        
+        // チャンク拡張（;以降）を除去
+        let size_str = size_str.split(';').next().unwrap_or(size_str);
+        
+        let chunk_size = match u64::from_str_radix(size_str, 16) {
+            Ok(s) => s as usize,
+            Err(_) => break,
+        };
+        
+        // 終端チャンク（サイズ0）
+        if chunk_size == 0 {
+            break;
+        }
+        
+        // \r\n をスキップ
+        pos += 2;
+        if pos >= chunked_data.len() {
+            break;
+        }
+        
+        // チャンクデータをコピー
+        let end = std::cmp::min(pos + chunk_size, chunked_data.len());
+        result.extend_from_slice(&chunked_data[pos..end]);
+        pos = end;
+        
+        // チャンク終端の \r\n をスキップ
+        if pos + 2 <= chunked_data.len() {
+            pos += 2;
+        }
+    }
+    
+    result
+}
+
+/// HTTP/2 用レスポンスボディ圧縮ヘルパー関数
+/// 
+/// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
+/// 圧縮に失敗した場合は元のデータをそのまま返します。
+#[cfg(feature = "http2")]
+fn compress_body_h2(body: &[u8], encoding: AcceptedEncoding, compression: &CompressionConfig) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    
+    match encoding {
+        AcceptedEncoding::Gzip => {
+            let level = Compression::new(compression.gzip_level);
+            let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), level);
+            if encoder.write_all(body).is_err() {
+                return body.to_vec();
+            }
+            encoder.finish().unwrap_or_else(|_| body.to_vec())
+        }
+        AcceptedEncoding::Brotli => {
+            let mut compressed = Vec::with_capacity(body.len());
+            let params = brotli::enc::BrotliEncoderParams {
+                quality: compression.brotli_level as i32,
+                ..Default::default()
+            };
+            let mut input = std::io::Cursor::new(body);
+            if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
+                return body.to_vec();
+            }
+            compressed
+        }
+        AcceptedEncoding::Deflate => {
+            use flate2::write::DeflateEncoder;
+            let level = Compression::new(compression.gzip_level);
+            let mut encoder = DeflateEncoder::new(Vec::with_capacity(body.len()), level);
+            if encoder.write_all(body).is_err() {
+                return body.to_vec();
+            }
+            encoder.finish().unwrap_or_else(|_| body.to_vec())
+        }
+        AcceptedEncoding::Identity => body.to_vec(),
+    }
 }
 
 /// HTTP/2 ファイル配信

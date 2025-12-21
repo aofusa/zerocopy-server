@@ -40,6 +40,7 @@ use crate::{
     Backend, SortedPathMap, SecurityConfig, UpstreamGroup, ProxyTarget,
     find_backend, check_security, SecurityCheckResult,
     encode_prometheus_metrics, record_request_metrics,
+    AcceptedEncoding, CompressionConfig,
     CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
 
@@ -358,6 +359,7 @@ impl Http3Handler {
         let mut path = None;
         let mut authority = None;
         let mut content_length: usize = 0;
+        let mut accept_encoding: Option<Vec<u8>> = None;
 
         for header in headers {
             match header.name() {
@@ -369,9 +371,18 @@ impl Http3Handler {
                         content_length = s.parse().unwrap_or(0);
                     }
                 }
+                name if name.eq_ignore_ascii_case(b"accept-encoding") => {
+                    accept_encoding = Some(header.value().to_vec());
+                }
                 _ => {}
             }
         }
+        
+        // クライアントの Accept-Encoding を解析
+        let client_encoding = accept_encoding
+            .as_ref()
+            .map(|v| AcceptedEncoding::parse(v))
+            .unwrap_or(AcceptedEncoding::Identity);
 
         let method = method.unwrap_or_else(|| b"GET".to_vec());
         let path = path.unwrap_or_else(|| b"/".to_vec());
@@ -459,9 +470,9 @@ impl Http3Handler {
 
         // バックエンド処理
         let (status, resp_size) = match backend {
-            Backend::Proxy(upstream_group, _, _) => {
+            Backend::Proxy(upstream_group, _, compression) => {
                 debug!("[HTTP/3] Starting proxy request to upstream group");
-                let result = self.handle_proxy(stream_id, &upstream_group, &method, &path, &prefix, headers, request_body)
+                let result = self.handle_proxy(stream_id, &upstream_group, &compression, client_encoding, &method, &path, &prefix, headers, request_body)
                     .unwrap_or((502, 11));
                 debug!("[HTTP/3] Proxy request completed: status={}, size={}", result.0, result.1);
                 result
@@ -626,6 +637,8 @@ impl Http3Handler {
         &mut self,
         stream_id: u64,
         upstream_group: &Arc<UpstreamGroup>,
+        compression: &CompressionConfig,
+        client_encoding: AcceptedEncoding,
         method: &[u8],
         req_path: &[u8],
         prefix: &[u8],
@@ -713,7 +726,7 @@ impl Http3Handler {
         // 同期的なブロッキングI/Oでバックエンドに接続
         // monoioはthread-per-coreモデルなので、同期I/Oも許容される
         // ただし、本番環境では非同期版が推奨
-        let result = self.proxy_to_backend_sync(stream_id, target, request);
+        let result = self.proxy_to_backend_sync(stream_id, target, request, compression, client_encoding);
         
         server.release();
         result
@@ -728,6 +741,8 @@ impl Http3Handler {
         stream_id: u64,
         target: &ProxyTarget,
         request: Vec<u8>,
+        compression: &CompressionConfig,
+        client_encoding: AcceptedEncoding,
     ) -> io::Result<(u16, usize)> {
         use std::io::{Read, Write};
         use std::net::TcpStream;
@@ -779,7 +794,7 @@ impl Http3Handler {
         // TLSバックエンドの場合
         if target.use_tls {
             // rustlsを使用したTLS接続
-            let result = self.proxy_to_tls_backend_sync(stream_id, target, request, backend);
+            let result = self.proxy_to_tls_backend_sync(stream_id, target, request, backend, compression, client_encoding);
             return result;
         }
         
@@ -812,7 +827,7 @@ impl Http3Handler {
         }
         
         // HTTPレスポンスをパース
-        self.parse_and_send_response(stream_id, &response)
+        self.parse_and_send_response(stream_id, &response, compression, client_encoding)
     }
     
     /// TLSバックエンドへの同期プロキシ処理
@@ -822,6 +837,8 @@ impl Http3Handler {
         target: &ProxyTarget,
         request: Vec<u8>,
         mut tcp_stream: std::net::TcpStream,
+        compression: &CompressionConfig,
+        client_encoding: AcceptedEncoding,
     ) -> io::Result<(u16, usize)> {
         use std::io::{Read, Write};
         use rustls::ClientConfig;
@@ -888,11 +905,17 @@ impl Http3Handler {
         }
         
         // HTTPレスポンスをパース
-        self.parse_and_send_response(stream_id, &response)
+        self.parse_and_send_response(stream_id, &response, compression, client_encoding)
     }
     
     /// HTTPレスポンスをパースしてHTTP/3レスポンスとして送信
-    fn parse_and_send_response(&mut self, stream_id: u64, response: &[u8]) -> io::Result<(u16, usize)> {
+    fn parse_and_send_response(
+        &mut self,
+        stream_id: u64,
+        response: &[u8],
+        compression: &CompressionConfig,
+        client_encoding: AcceptedEncoding,
+    ) -> io::Result<(u16, usize)> {
         // ヘッダー終端を探す
         let header_end = match find_header_end(response) {
             Some(pos) => pos,
@@ -910,9 +933,57 @@ impl Http3Handler {
         // ステータスコードを取得
         let status_code = parse_status_code(header_bytes).unwrap_or(502);
         
+        // Content-Type と Content-Encoding を取得
+        let mut content_type: Option<&[u8]> = None;
+        let mut existing_encoding: Option<&[u8]> = None;
+        
+        if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
+            let headers_section = &header_bytes[first_crlf + 1..];
+            for line in headers_section.split(|&b| b == b'\n') {
+                let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
+                if line.is_empty() {
+                    continue;
+                }
+                if let Some(colon_pos) = memchr::memchr(b':', line) {
+                    let name = &line[..colon_pos];
+                    let value = &line[colon_pos + 1..];
+                    let value = value.strip_prefix(&[b' ']).unwrap_or(value);
+                    
+                    if name.eq_ignore_ascii_case(b"content-type") {
+                        content_type = Some(value);
+                    } else if name.eq_ignore_ascii_case(b"content-encoding") {
+                        existing_encoding = Some(value);
+                    }
+                }
+            }
+        }
+        
+        // 圧縮すべきか判定
+        let should_compress = compression.should_compress(
+            client_encoding,
+            content_type,
+            Some(body_bytes.len()),
+            existing_encoding,
+        );
+        
         // ヘッダーをパース
         let mut resp_headers: Vec<(&[u8], &[u8])> = Vec::new();
         resp_headers.push((b"server", b"veil/http3"));
+        
+        // 圧縮が有効な場合は Content-Encoding を追加
+        let encoding_value: Vec<u8>;
+        if let Some(enc) = should_compress {
+            encoding_value = match enc {
+                AcceptedEncoding::Brotli => b"br".to_vec(),
+                AcceptedEncoding::Gzip => b"gzip".to_vec(),
+                AcceptedEncoding::Deflate => b"deflate".to_vec(),
+                AcceptedEncoding::Identity => Vec::new(),
+            };
+            if !encoding_value.is_empty() {
+                resp_headers.push((b"content-encoding", &encoding_value));
+                resp_headers.push((b"vary", b"Accept-Encoding"));
+            }
+        }
         
         // レスポンスヘッダーを抽出（ステータス行をスキップ）
         if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
@@ -935,13 +1006,28 @@ impl Http3Handler {
                         continue;
                     }
                     
+                    // 圧縮時は Content-Length と Content-Encoding をスキップ
+                    if should_compress.is_some() && (
+                        name.eq_ignore_ascii_case(b"content-length") ||
+                        name.eq_ignore_ascii_case(b"content-encoding")
+                    ) {
+                        continue;
+                    }
+                    
                     resp_headers.push((name, value));
                 }
             }
         }
         
-        self.send_response(stream_id, status_code, &resp_headers, Some(body_bytes))?;
-        Ok((status_code, body_bytes.len()))
+        // 圧縮処理
+        let response_body = if let Some(enc) = should_compress {
+            compress_body_h3(body_bytes, enc, compression)
+        } else {
+            body_bytes.to_vec()
+        };
+        
+        self.send_response(stream_id, status_code, &resp_headers, Some(&response_body))?;
+        Ok((status_code, response_body.len()))
     }
     
     /// ファイル配信
@@ -1542,6 +1628,49 @@ pub fn run_http3_server(
 // ====================
 // ヘルパー関数
 // ====================
+
+/// HTTP/3 用レスポンスボディ圧縮ヘルパー関数
+/// 
+/// バイト配列を受け取り、指定されたエンコーディングで圧縮して返します。
+/// 圧縮に失敗した場合は元のデータをそのまま返します。
+fn compress_body_h3(body: &[u8], encoding: AcceptedEncoding, compression: &CompressionConfig) -> Vec<u8> {
+    use flate2::Compression;
+    use flate2::write::GzEncoder;
+    use std::io::Write;
+    
+    match encoding {
+        AcceptedEncoding::Gzip => {
+            let level = Compression::new(compression.gzip_level);
+            let mut encoder = GzEncoder::new(Vec::with_capacity(body.len()), level);
+            if encoder.write_all(body).is_err() {
+                return body.to_vec();
+            }
+            encoder.finish().unwrap_or_else(|_| body.to_vec())
+        }
+        AcceptedEncoding::Brotli => {
+            let mut compressed = Vec::with_capacity(body.len());
+            let params = brotli::enc::BrotliEncoderParams {
+                quality: compression.brotli_level as i32,
+                ..Default::default()
+            };
+            let mut input = std::io::Cursor::new(body);
+            if brotli::BrotliCompress(&mut input, &mut compressed, &params).is_err() {
+                return body.to_vec();
+            }
+            compressed
+        }
+        AcceptedEncoding::Deflate => {
+            use flate2::write::DeflateEncoder;
+            let level = Compression::new(compression.gzip_level);
+            let mut encoder = DeflateEncoder::new(Vec::with_capacity(body.len()), level);
+            if encoder.write_all(body).is_err() {
+                return body.to_vec();
+            }
+            encoder.finish().unwrap_or_else(|_| body.to_vec())
+        }
+        AcceptedEncoding::Identity => body.to_vec(),
+    }
+}
 
 /// HTTPレスポンスのヘッダー終端（\r\n\r\n）を探す
 fn find_header_end(data: &[u8]) -> Option<usize> {
