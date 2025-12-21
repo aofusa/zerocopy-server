@@ -459,7 +459,7 @@ impl Http3Handler {
 
         // バックエンド処理
         let (status, resp_size) = match backend {
-            Backend::Proxy(upstream_group, _) => {
+            Backend::Proxy(upstream_group, _, _) => {
                 debug!("[HTTP/3] Starting proxy request to upstream group");
                 let result = self.handle_proxy(stream_id, &upstream_group, &method, &path, &prefix, headers, request_body)
                     .unwrap_or((502, 11));

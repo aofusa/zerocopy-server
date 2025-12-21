@@ -753,6 +753,103 @@ url = "http://localhost:8080/app/"
   rate_limit_requests_per_min = 60
 
 # ------------------------------------------
+# レスポンス圧縮設定付きプロキシ
+# ------------------------------------------
+# バックエンドからのレスポンスを動的に圧縮してクライアントに転送
+# 
+# 注意:
+#   - デフォルトは無効（enabled = false）
+#   - 有効にするとkTLSのゼロコピー最適化は迂回されます
+#   - 帯域節約が重要なAPIエンドポイントでの使用を推奨
+#
+# [path_routes."example.com"."/api-compressed/"]
+# type = "Proxy"
+# url = "http://localhost:8080"
+#
+#   [path_routes."example.com"."/api-compressed/".compression]
+#   # 圧縮を有効化（デフォルト: false）
+#   enabled = true
+#   
+#   # 圧縮方式の優先順位（クライアントのAccept-Encodingと照合）
+#   # サポート: "br" (Brotli), "gzip", "deflate"
+#   preferred_encodings = ["br", "gzip"]
+#   
+#   # Gzip圧縮レベル (1-9)
+#   # 1: 最速（圧縮率低）、9: 最遅（圧縮率高）
+#   gzip_level = 4
+#   
+#   # Brotli圧縮レベル (0-11)
+#   # 0: 最速、11: 最遅（圧縮率最高）
+#   brotli_level = 4
+#   
+#   # 最小圧縮サイズ（バイト）
+#   # これより小さいレスポンスは圧縮オーバーヘッドの方が大きいためスキップ
+#   min_size = 1024
+#   
+#   # 圧縮対象のMIMEタイプ（プレフィックスマッチ）
+#   compressible_types = [
+#     "text/",
+#     "application/json",
+#     "application/javascript",
+#     "application/xml",
+#     "image/svg+xml",
+#   ]
+#   
+#   # 圧縮をスキップするMIMEタイプ（プレフィックスマッチ）
+#   skip_types = [
+#     "image/",
+#     "video/",
+#     "audio/",
+#     "application/octet-stream",
+#   ]
+
+# ------------------------------------------
+# 高スループットAPI（圧縮有効、速度優先）
+# ------------------------------------------
+# 大量のJSONレスポンスを返すAPIエンドポイント
+# 帯域節約のため圧縮を有効化、速度優先で低レベル圧縮
+#
+# [path_routes."api.example.com"."/v1/"]
+# type = "Proxy"
+# url = "http://backend-api:8080"
+#
+#   [path_routes."api.example.com"."/v1/".compression]
+#   enabled = true
+#   min_size = 512              # 小さいレスポンスも圧縮
+#   gzip_level = 1              # 速度優先
+#   preferred_encodings = ["gzip"]  # Brotliは遅いのでスキップ
+
+# ------------------------------------------
+# リアルタイムAPI（圧縮無効、kTLS最適化維持）
+# ------------------------------------------
+# 低レイテンシが重要なエンドポイント
+# kTLS最適化を維持するため圧縮無効（デフォルト動作）
+#
+# [path_routes."api.example.com"."/v1/realtime/"]
+# type = "Proxy"
+# url = "http://realtime-backend:8080"
+#
+#   [path_routes."api.example.com"."/v1/realtime/".compression]
+#   enabled = false  # 明示的に無効化（デフォルト値と同じ）
+
+# ------------------------------------------
+# 分析データAPI（圧縮有効、高圧縮率）
+# ------------------------------------------
+# 大きなデータセットを返す分析API
+# レイテンシより帯域節約を優先
+#
+# [path_routes."api.example.com"."/v1/analytics/"]
+# type = "Proxy"
+# url = "http://analytics-backend:8080"
+#
+#   [path_routes."api.example.com"."/v1/analytics/".compression]
+#   enabled = true
+#   min_size = 256
+#   gzip_level = 6              # 圧縮率優先
+#   brotli_level = 6
+#   preferred_encodings = ["br", "gzip"]  # Brotliを優先
+
+# ------------------------------------------
 # 管理用API（IP制限付き）
 # ------------------------------------------
 # 内部ネットワークからのみアクセス許可
