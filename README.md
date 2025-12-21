@@ -214,6 +214,8 @@ http3_enabled = true
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error", "off"
 level = "info"
+# Log output format: "text", "json"
+# format = "text"
 # Log channel size (prevents log drops under high load)
 channel_size = 100000
 # Flush interval (milliseconds)
@@ -1622,19 +1624,46 @@ Provides high-performance async logging using ftlog. ftlog internally uses a bac
 | Option | Description | Default |
 |--------|-------------|---------|
 | `level` | Log level (trace/debug/info/warn/error/off) | info |
+| `format` | Log output format (text/json) | text |
 | `channel_size` | Internal channel buffer size | 100000 |
 | `flush_interval_ms` | Disk flush interval (milliseconds) | 1000 |
 | `max_log_size` | Maximum log file size (bytes, 0=unlimited) | 104857600 |
 | `file_path` | Log file path (defaults to stderr if unspecified) | none |
+
+### Log Output Formats
+
+#### Text Format (Default)
+
+```
+2024-01-01 00:00:00.000+00 0ms INFO main [main.rs:123] Server started
+```
+
+#### JSON Format
+
+Suitable for integration with structured log collection systems (Elasticsearch, Loki, etc.).
+
+```json
+{"timestamp":"2024-01-01T00:00:00.000Z","level":"INFO","target":"veil","file":"main.rs","line":123,"message":"Server started"}
+```
 
 ### Configuration Example
 
 ```toml
 [logging]
 level = "info"
+format = "text"  # or "json"
 channel_size = 100000
 flush_interval_ms = 1000
 file_path = "/var/log/veil.log"
+```
+
+### JSON Format Configuration Example
+
+```toml
+[logging]
+level = "info"
+format = "json"
+file_path = "/var/log/veil.json"
 ```
 
 ## Self-Sandboxing
