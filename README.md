@@ -25,6 +25,8 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 - **Connection Pool**: Latency reduction through backend connection reuse (HTTP/HTTPS support)
 - **Load Balancing**: Request distribution to multiple backends (Round Robin/Least Connections/IP Hash)
 - **Health Check**: Automatic failover with HTTP-based active health checks
+- **Proxy Cache**: Memory and disk-based response caching (ETag/304, stale-while-revalidate, stale-if-error)
+- **Buffering Control**: Response buffering to prevent slow clients from blocking backends (Streaming/Full/Adaptive modes)
 - **WebSocket Support**: Bidirectional proxy with Upgrade header detection (Fixed/Adaptive polling modes)
 - **H2C (HTTP/2 over cleartext)**: HTTP/2 backend connection without TLS (gRPC support)
 - **Header Manipulation**: Add/remove request/response headers (X-Real-IP, HSTS, etc.)
@@ -1046,6 +1048,173 @@ compression_enabled = true
 
 > **Note**: When compression is enabled, kTLS zero-copy sendfile optimization is not used for compressed responses. For maximum throughput with large files, consider disabling compression for static file routes.
 
+## Proxy Cache
+
+Supports caching backend responses to reduce backend load and improve response times.
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Memory Cache** | Fast in-memory LRU cache with configurable size limit |
+| **Disk Cache** | Large response storage using monoio async I/O |
+| **ETag/If-None-Match** | 304 Not Modified responses for conditional requests |
+| **If-Modified-Since** | Date-based conditional request validation |
+| **stale-while-revalidate** | Serve stale content while updating in background |
+| **stale-if-error** | Serve stale content when backend returns errors |
+| **Vary Header Support** | Separate cache entries based on request headers |
+| **Pattern-based Invalidation** | Glob pattern cache invalidation |
+
+### Enabling
+
+Cache is **disabled by default**. Enable per-route using the `cache` section:
+
+```toml
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/api/".cache]
+  enabled = true
+```
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `enabled` | Enable caching | false |
+| `max_memory_size` | Maximum memory cache size (bytes) | 100MB |
+| `disk_path` | Disk cache directory (optional) | none |
+| `max_disk_size` | Maximum disk cache size (bytes) | 1GB |
+| `memory_threshold` | Responses larger than this go to disk (bytes) | 64KB |
+| `default_ttl_secs` | Default TTL when Cache-Control is absent | 300 |
+| `methods` | HTTP methods to cache | ["GET", "HEAD"] |
+| `cacheable_statuses` | Status codes to cache | [200, 301, 302, 304] |
+| `bypass_patterns` | Glob patterns to skip caching | [] |
+| `respect_vary` | Honor Vary header for cache separation | true |
+| `enable_etag` | Enable ETag/If-None-Match validation | true |
+| `stale_while_revalidate` | Serve stale while updating in background | false |
+| `stale_if_error` | Serve stale on backend errors | false |
+| `include_query` | Include query parameters in cache key | true |
+| `key_headers` | Request headers to include in cache key | [] |
+
+### Configuration Example
+
+```toml
+[path_routes."example.com"."/cached-api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/cached-api/".cache]
+  enabled = true
+  max_memory_size = 104857600  # 100MB
+  disk_path = "/var/cache/veil/api"
+  max_disk_size = 1073741824   # 1GB
+  memory_threshold = 65536     # 64KB
+  default_ttl_secs = 300
+  methods = ["GET", "HEAD"]
+  cacheable_statuses = [200, 301, 302, 304]
+  bypass_patterns = ["/cached-api/user/*", "/cached-api/session"]
+  respect_vary = true
+  enable_etag = true
+  stale_while_revalidate = true
+  stale_if_error = true
+  include_query = true
+  key_headers = ["Authorization"]  # Per-user caching
+```
+
+### Cache Key Generation
+
+Cache keys are generated from:
+1. Host name
+2. Request path
+3. Query parameters (if `include_query = true`)
+4. Specified `key_headers` values
+
+### Notes
+
+- When `streaming` buffering mode is used, kTLS zero-copy transfer is preserved
+- Cache respects `Cache-Control: no-cache`, `no-store`, `private` headers
+- `Vary: *` responses are not cached when `respect_vary = true`
+
+## Buffering Control
+
+Controls response buffering to prevent slow clients from blocking backend connections.
+
+### Features
+
+| Feature | Description |
+|---------|-------------|
+| **Streaming Mode** | Pass-through transfer (default, preserves kTLS) |
+| **Full Buffering** | Buffer entire response before sending to client |
+| **Adaptive Mode** | Automatically switch based on response size |
+| **Disk Spillover** | Write large responses to disk when memory limit exceeded |
+
+### Modes
+
+| Mode | Description | Use Case |
+|------|-------------|----------|
+| `streaming` | Direct transfer (default) | Large files, real-time APIs, kTLS optimization |
+| `full` | Buffer entire response | APIs with slow clients, small responses |
+| `adaptive` | Auto-switch based on Content-Length | Mixed workloads |
+
+### Enabling
+
+Buffering is **streaming (pass-through) by default**. Configure per-route using the `buffering` section:
+
+```toml
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/api/".buffering]
+  mode = "adaptive"
+```
+
+### Configuration Options
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `mode` | Buffering mode (`streaming`/`full`/`adaptive`) | `streaming` |
+| `max_memory_buffer` | Maximum memory buffer size (bytes) | 10MB |
+| `adaptive_threshold` | Size threshold for adaptive mode (bytes) | 1MB |
+| `disk_buffer_path` | Disk spillover directory (optional) | none |
+| `max_disk_buffer` | Maximum disk buffer size (bytes) | 100MB |
+| `client_write_timeout_secs` | Client write timeout | 60 |
+| `buffer_headers` | Buffer headers along with body | true |
+
+### Configuration Example
+
+```toml
+[path_routes."example.com"."/buffered-api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/buffered-api/".buffering]
+  mode = "adaptive"
+  adaptive_threshold = 1048576   # 1MB
+  max_memory_buffer = 10485760   # 10MB
+  disk_buffer_path = "/var/tmp/veil/buffer"
+  max_disk_buffer = 104857600    # 100MB
+  client_write_timeout_secs = 60
+  buffer_headers = true
+```
+
+### Adaptive Mode Behavior
+
+```
+Content-Length <= adaptive_threshold → Full buffering
+Content-Length > adaptive_threshold  → Streaming
+Content-Length unknown (chunked)     → Streaming
+```
+
+### kTLS Compatibility
+
+- **Streaming mode**: kTLS `splice(2)` zero-copy transfer is fully preserved
+- **Full/Adaptive modes**: Response passes through userspace buffer (no kTLS optimization)
+
+> **Note**: For maximum performance with kTLS, use `streaming` mode for routes where low latency is critical.
+
 ## Prometheus Metrics
 
 Export metrics such as request counts, latency, and body sizes in Prometheus format.
@@ -1087,6 +1256,12 @@ Use the `path` option to change the endpoint path.
 | `veil_proxy_http_response_size_bytes` | Histogram | - | Response body size |
 | `veil_proxy_http_active_connections` | Gauge | host | Active connection count |
 | `veil_proxy_http_upstream_health` | Gauge | upstream, server | Upstream health status (1=healthy, 0=unhealthy) |
+| `veil_proxy_cache_hits_total` | Counter | host | Total cache hit count |
+| `veil_proxy_cache_misses_total` | Counter | host | Total cache miss count |
+| `veil_proxy_cache_stores_total` | Counter | host, storage | Total cache store operations |
+| `veil_proxy_cache_size_bytes` | Gauge | storage | Current cache size in bytes |
+| `veil_proxy_cache_entries` | Gauge | storage | Current number of cache entries |
+| `veil_proxy_buffering_used_total` | Counter | host | Total requests using buffering |
 
 ### Grafana Dashboard Examples
 

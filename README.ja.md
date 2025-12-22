@@ -25,6 +25,8 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **コネクションプール**: バックエンド接続の再利用によるレイテンシ削減（HTTP/HTTPS両対応）
 - **ロードバランシング**: 複数バックエンドへのリクエスト分散（Round Robin/Least Connections/IP Hash）
 - **ヘルスチェック**: HTTPベースのアクティブヘルスチェックによる自動フェイルオーバー
+- **プロキシキャッシュ**: メモリ・ディスクベースのレスポンスキャッシュ（ETag/304、stale-while-revalidate、stale-if-error）
+- **バッファリング制御**: 低速クライアントによるバックエンド占有防止のためのレスポンスバッファリング（Streaming/Full/Adaptiveモード）
 - **WebSocketサポート**: Upgradeヘッダー検知による双方向プロキシ（Fixed/Adaptiveポーリングモード）
 - **H2C (HTTP/2 over cleartext)**: TLSなしのHTTP/2バックエンド接続（gRPC対応）
 - **ヘッダー操作**: リクエスト/レスポンスヘッダーの追加・削除（X-Real-IP, HSTS等）
@@ -1046,6 +1048,173 @@ compression_enabled = true
 
 > **Note**: 圧縮を有効にすると、圧縮されたレスポンスに対してはkTLSのゼロコピーsendfile最適化は使用されません。大きなファイルの最大スループットを得るには、静的ファイルルートでは圧縮を無効にすることを検討してください。
 
+## プロキシキャッシュ
+
+バックエンドレスポンスをキャッシュし、バックエンド負荷の軽減とレスポンス時間の改善を実現します。
+
+### 特徴
+
+| 機能 | 説明 |
+|------|------|
+| **メモリキャッシュ** | サイズ制限付きの高速インメモリLRUキャッシュ |
+| **ディスクキャッシュ** | monoio非同期I/Oを使用した大容量レスポンス保存 |
+| **ETag/If-None-Match** | 条件付きリクエストに対する304 Not Modifiedレスポンス |
+| **If-Modified-Since** | 日付ベースの条件付きリクエスト検証 |
+| **stale-while-revalidate** | バックグラウンドで更新しながらstaleコンテンツを提供 |
+| **stale-if-error** | バックエンドエラー時にstaleコンテンツを提供 |
+| **Varyヘッダーサポート** | リクエストヘッダーに基づくキャッシュ分離 |
+| **パターンベース無効化** | globパターンによるキャッシュ無効化 |
+
+### 有効化
+
+キャッシュはデフォルトで**無効**です。ルートごとに `cache` セクションで有効化します：
+
+```toml
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/api/".cache]
+  enabled = true
+```
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `enabled` | キャッシュを有効化 | false |
+| `max_memory_size` | メモリキャッシュ最大サイズ（バイト） | 100MB |
+| `disk_path` | ディスクキャッシュディレクトリ（オプション） | なし |
+| `max_disk_size` | ディスクキャッシュ最大サイズ（バイト） | 1GB |
+| `memory_threshold` | これより大きいレスポンスはディスクへ（バイト） | 64KB |
+| `default_ttl_secs` | Cache-Controlがない場合のデフォルトTTL | 300 |
+| `methods` | キャッシュ対象HTTPメソッド | ["GET", "HEAD"] |
+| `cacheable_statuses` | キャッシュ対象ステータスコード | [200, 301, 302, 304] |
+| `bypass_patterns` | キャッシュスキップ用globパターン | [] |
+| `respect_vary` | Varyヘッダーによるキャッシュ分離を尊重 | true |
+| `enable_etag` | ETag/If-None-Match検証を有効化 | true |
+| `stale_while_revalidate` | バックグラウンド更新中にstaleを提供 | false |
+| `stale_if_error` | バックエンドエラー時にstaleを提供 | false |
+| `include_query` | クエリパラメータをキャッシュキーに含める | true |
+| `key_headers` | キャッシュキーに含めるリクエストヘッダー | [] |
+
+### 設定例
+
+```toml
+[path_routes."example.com"."/cached-api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/cached-api/".cache]
+  enabled = true
+  max_memory_size = 104857600  # 100MB
+  disk_path = "/var/cache/veil/api"
+  max_disk_size = 1073741824   # 1GB
+  memory_threshold = 65536     # 64KB
+  default_ttl_secs = 300
+  methods = ["GET", "HEAD"]
+  cacheable_statuses = [200, 301, 302, 304]
+  bypass_patterns = ["/cached-api/user/*", "/cached-api/session"]
+  respect_vary = true
+  enable_etag = true
+  stale_while_revalidate = true
+  stale_if_error = true
+  include_query = true
+  key_headers = ["Authorization"]  # ユーザーごとのキャッシュ
+```
+
+### キャッシュキー生成
+
+キャッシュキーは以下から生成されます：
+1. ホスト名
+2. リクエストパス
+3. クエリパラメータ（`include_query = true` の場合）
+4. 指定された `key_headers` の値
+
+### 注意事項
+
+- `streaming` バッファリングモード使用時、kTLSのゼロコピー転送は維持されます
+- キャッシュは `Cache-Control: no-cache`、`no-store`、`private` ヘッダーを尊重します
+- `respect_vary = true` の場合、`Vary: *` レスポンスはキャッシュされません
+
+## バッファリング制御
+
+低速クライアントによるバックエンド接続の占有を防止するためのレスポンスバッファリングを制御します。
+
+### 特徴
+
+| 機能 | 説明 |
+|------|------|
+| **Streamingモード** | パススルー転送（デフォルト、kTLS維持） |
+| **Fullバッファリング** | クライアント送信前にレスポンス全体をバッファ |
+| **Adaptiveモード** | レスポンスサイズに基づく自動切り替え |
+| **ディスクスピルオーバー** | メモリ制限超過時にディスクへ書き込み |
+
+### モード
+
+| モード | 説明 | 用途 |
+|--------|------|------|
+| `streaming` | 直接転送（デフォルト） | 大きなファイル、リアルタイムAPI、kTLS最適化 |
+| `full` | レスポンス全体をバッファ | 低速クライアント対応、小さなレスポンス |
+| `adaptive` | Content-Lengthに基づく自動切り替え | 混在ワークロード |
+
+### 有効化
+
+バッファリングはデフォルトで **streaming（パススルー）** です。ルートごとに `buffering` セクションで設定します：
+
+```toml
+[path_routes."example.com"."/api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/api/".buffering]
+  mode = "adaptive"
+```
+
+### 設定オプション
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `mode` | バッファリングモード（`streaming`/`full`/`adaptive`） | `streaming` |
+| `max_memory_buffer` | メモリバッファ最大サイズ（バイト） | 10MB |
+| `adaptive_threshold` | adaptiveモードのサイズ閾値（バイト） | 1MB |
+| `disk_buffer_path` | ディスクスピルオーバーディレクトリ（オプション） | なし |
+| `max_disk_buffer` | ディスクバッファ最大サイズ（バイト） | 100MB |
+| `client_write_timeout_secs` | クライアント書き込みタイムアウト | 60 |
+| `buffer_headers` | ヘッダーもボディと一緒にバッファリング | true |
+
+### 設定例
+
+```toml
+[path_routes."example.com"."/buffered-api/"]
+type = "Proxy"
+url = "http://localhost:8080"
+
+  [path_routes."example.com"."/buffered-api/".buffering]
+  mode = "adaptive"
+  adaptive_threshold = 1048576   # 1MB
+  max_memory_buffer = 10485760   # 10MB
+  disk_buffer_path = "/var/tmp/veil/buffer"
+  max_disk_buffer = 104857600    # 100MB
+  client_write_timeout_secs = 60
+  buffer_headers = true
+```
+
+### Adaptiveモードの動作
+
+```
+Content-Length <= adaptive_threshold → フルバッファリング
+Content-Length > adaptive_threshold  → ストリーミング
+Content-Length 不明（chunked）       → ストリーミング
+```
+
+### kTLS互換性
+
+- **Streamingモード**: kTLS `splice(2)` ゼロコピー転送が完全に維持されます
+- **Full/Adaptiveモード**: レスポンスはユーザースペースバッファを経由します（kTLS最適化なし）
+
+> **Note**: kTLSで最大パフォーマンスを得るには、低レイテンシが重要なルートで `streaming` モードを使用してください。
+
 ## Prometheusメトリクス
 
 リクエスト数、レイテンシ、ボディサイズなどのメトリクスをPrometheus形式でエクスポートします。
@@ -1087,6 +1256,12 @@ GET /__metrics
 | `veil_proxy_http_response_size_bytes` | Histogram | - | レスポンスボディサイズ |
 | `veil_proxy_http_active_connections` | Gauge | host | アクティブな接続数 |
 | `veil_proxy_http_upstream_health` | Gauge | upstream, server | アップストリーム健康状態（1=healthy, 0=unhealthy） |
+| `veil_proxy_cache_hits_total` | Counter | host | キャッシュヒット総数 |
+| `veil_proxy_cache_misses_total` | Counter | host | キャッシュミス総数 |
+| `veil_proxy_cache_stores_total` | Counter | host, storage | キャッシュ保存操作総数 |
+| `veil_proxy_cache_size_bytes` | Gauge | storage | 現在のキャッシュサイズ（バイト） |
+| `veil_proxy_cache_entries` | Gauge | storage | 現在のキャッシュエントリ数 |
+| `veil_proxy_buffering_used_total` | Counter | host | バッファリング使用リクエスト総数 |
 
 ### Grafanaダッシュボード例
 
