@@ -159,16 +159,24 @@ impl CacheManager {
         };
         
         // Varyチェック（Vary: * はキャッシュ不可）
-        let parsed_vary = CachePolicy::parse_vary(&headers);
-        if parsed_vary.is_none() && self.config.respect_vary {
-            // Vary: * の場合はNoneが返される
-            // ただし、Varyヘッダーが存在しない場合もNoneなので区別が必要
-            // parse_varyはVary: *の場合にNoneを返し、Varyがない場合はSome([])を返すように修正が必要
-            // 現状の実装ではVaryがない場合もNoneを返すので、ここでは何もしない
+        use super::policy::VaryResult;
+        let vary_result = CachePolicy::parse_vary_ex(&headers);
+        
+        if self.config.respect_vary {
+            // Vary: * の場合はキャッシュしない
+            if !vary_result.is_cacheable() {
+                return false;
+            }
         }
         
         // レスポンスから取得したVaryヘッダー、または渡されたVaryヘッダーを使用
-        let effective_vary = vary_headers.or(parsed_vary);
+        let effective_vary = vary_headers.or_else(|| {
+            match vary_result {
+                VaryResult::Headers(h) => Some(h),
+                VaryResult::NotPresent => None,
+                VaryResult::Uncacheable => None,
+            }
+        });
         
         // ストレージ選択
         let storage_type = self.config.select_storage(body.len());

@@ -2,6 +2,34 @@
 //!
 //! Cache-Controlヘッダーの解析とキャッシュ可否判定を行います。
 
+/// Varyヘッダー解析結果
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VaryResult {
+    /// Varyヘッダーが存在しない
+    NotPresent,
+    /// Vary: * でキャッシュ不可
+    Uncacheable,
+    /// Varyヘッダーで指定されたヘッダー名のリスト
+    Headers(Vec<String>),
+}
+
+impl VaryResult {
+    /// キャッシュ可能かどうか
+    #[inline]
+    pub fn is_cacheable(&self) -> bool {
+        !matches!(self, VaryResult::Uncacheable)
+    }
+    
+    /// ヘッダーリストを取得（NotPresentの場合は空のVec）
+    #[inline]
+    pub fn headers(&self) -> Option<&Vec<String>> {
+        match self {
+            VaryResult::Headers(h) => Some(h),
+            _ => None,
+        }
+    }
+}
+
 /// Cache-Control ディレクティブ
 #[derive(Debug, Clone, Default)]
 pub struct CacheControl {
@@ -169,18 +197,29 @@ impl CachePolicy {
     
     /// Varyヘッダーを解析
     /// 
-    /// Vary: * の場合はキャッシュ不可を示すNoneを返す
-    pub fn parse_vary(response_headers: &[(Box<[u8]>, Box<[u8]>)]) -> Option<Vec<String>> {
+    /// 戻り値:
+    /// - `VaryResult::NotPresent` - Varyヘッダーなし
+    /// - `VaryResult::Uncacheable` - Vary: * でキャッシュ不可
+    /// - `VaryResult::Headers(vec)` - Varyヘッダーのリスト
+    pub fn parse_vary_ex(response_headers: &[(Box<[u8]>, Box<[u8]>)]) -> VaryResult {
         let vary_header = response_headers
             .iter()
             .find(|(name, _)| name.eq_ignore_ascii_case(b"vary"))
-            .map(|(_, value)| value)?;
+            .map(|(_, value)| value);
         
-        let vary_str = std::str::from_utf8(vary_header).ok()?;
+        let vary_header = match vary_header {
+            Some(h) => h,
+            None => return VaryResult::NotPresent,
+        };
+        
+        let vary_str = match std::str::from_utf8(vary_header) {
+            Ok(s) => s,
+            Err(_) => return VaryResult::NotPresent,
+        };
         
         // Vary: * はキャッシュ不可
         if vary_str.trim() == "*" {
-            return None;
+            return VaryResult::Uncacheable;
         }
         
         let headers: Vec<String> = vary_str
@@ -189,7 +228,19 @@ impl CachePolicy {
             .filter(|s| !s.is_empty())
             .collect();
         
-        Some(headers)
+        VaryResult::Headers(headers)
+    }
+    
+    /// Varyヘッダーを解析（後方互換性のため）
+    /// 
+    /// Vary: * の場合はキャッシュ不可を示すNoneを返す
+    #[inline]
+    pub fn parse_vary(response_headers: &[(Box<[u8]>, Box<[u8]>)]) -> Option<Vec<String>> {
+        match Self::parse_vary_ex(response_headers) {
+            VaryResult::Headers(h) => Some(h),
+            VaryResult::NotPresent => Some(Vec::new()),
+            VaryResult::Uncacheable => None,
+        }
     }
     
     /// リクエストがキャッシュをバイパスすべきかチェック
@@ -315,6 +366,53 @@ mod tests {
         
         let vary = CachePolicy::parse_vary(&headers);
         assert!(vary.is_none()); // Vary: * はキャッシュ不可
+    }
+
+    #[test]
+    fn test_parse_vary_ex_not_present() {
+        let headers: Vec<(Box<[u8]>, Box<[u8]>)> = vec![];
+        
+        let result = CachePolicy::parse_vary_ex(&headers);
+        assert_eq!(result, VaryResult::NotPresent);
+        assert!(result.is_cacheable());
+    }
+
+    #[test]
+    fn test_parse_vary_ex_headers() {
+        let headers = vec![
+            (b"vary".to_vec().into_boxed_slice(), 
+             b"Accept-Encoding".to_vec().into_boxed_slice()),
+        ];
+        
+        let result = CachePolicy::parse_vary_ex(&headers);
+        assert!(result.is_cacheable());
+        match result {
+            VaryResult::Headers(h) => {
+                assert!(h.contains(&"accept-encoding".to_string()));
+            }
+            _ => panic!("Expected VaryResult::Headers"),
+        }
+    }
+
+    #[test]
+    fn test_parse_vary_ex_uncacheable() {
+        let headers = vec![
+            (b"vary".to_vec().into_boxed_slice(), 
+             b"*".to_vec().into_boxed_slice()),
+        ];
+        
+        let result = CachePolicy::parse_vary_ex(&headers);
+        assert_eq!(result, VaryResult::Uncacheable);
+        assert!(!result.is_cacheable());
+    }
+
+    #[test]
+    fn test_parse_vary_no_header_returns_empty() {
+        // Varyヘッダーがない場合、parse_varyはSome(空のVec)を返す
+        let headers: Vec<(Box<[u8]>, Box<[u8]>)> = vec![];
+        
+        let vary = CachePolicy::parse_vary(&headers);
+        assert_eq!(vary, Some(Vec::new()));
     }
 }
 

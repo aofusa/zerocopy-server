@@ -30,7 +30,6 @@ mod config;
 mod handler;
 
 pub use config::{BufferingConfig, BufferingMode};
-pub use handler::{BufferedResponse, BufferingHandler};
 
 // ディスクバッファ操作を公開（Linux限定）
 #[cfg(target_os = "linux")]
