@@ -62,7 +62,13 @@ impl CacheIndex {
         let hash = key.hash_value();
         
         // DashMapから取得
-        let mut entry = self.entries.get_mut(&hash)?;
+        let mut entry = match self.entries.get_mut(&hash) {
+            Some(e) => e,
+            None => {
+                self.misses.fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+        };
         
         // キーの完全一致を確認（ハッシュ衝突対策）
         if entry.key != *key {
