@@ -470,7 +470,7 @@ impl Http3Handler {
 
         // バックエンド処理
         let (status, resp_size) = match backend {
-            Backend::Proxy(upstream_group, _, path_compression) => {
+            Backend::Proxy(upstream_group, _, path_compression, _buffering, _cache) => {
                 debug!("[HTTP/3] Starting proxy request to upstream group");
                 
                 // HTTP/3専用圧縮設定を解決
@@ -520,7 +520,7 @@ impl Http3Handler {
                     (200, data.len())
                 }
             }
-            Backend::SendFile(base_path, is_dir, index_file, security) => {
+            Backend::SendFile(base_path, is_dir, index_file, security, _cache) => {
                 self.handle_sendfile(stream_id, &base_path, is_dir, index_file.as_deref(), &path, &prefix, &security)
                     .unwrap_or((404, 9))
             }

@@ -891,6 +891,101 @@ url = "http://localhost:9000/"
   allowed_methods = ["GET", "POST"]
 
 # ------------------------------------------
+# プロキシキャッシュ設定
+# ------------------------------------------
+# バックエンドからのレスポンスをキャッシュし、
+# 同じリクエストへの応答時間を短縮します。
+#
+# [path_routes."example.com"."/cached-api/"]
+# type = "Proxy"
+# url = "http://localhost:8080"
+#
+#   # キャッシュ設定
+#   [path_routes."example.com"."/cached-api/".cache]
+#   # キャッシュを有効化
+#   enabled = true
+#   
+#   # インメモリキャッシュ最大サイズ（バイト）
+#   # デフォルト: 100MB (104857600)
+#   max_memory_size = 104857600
+#   
+#   # ディスクキャッシュパス（大きいレスポンス用）
+#   # 未設定の場合はメモリのみ
+#   disk_path = "/var/cache/veil/api"
+#   
+#   # ディスクキャッシュ最大サイズ（バイト）
+#   # デフォルト: 1GB (1073741824)
+#   max_disk_size = 1073741824
+#   
+#   # メモリキャッシュ閾値（バイト）
+#   # これより大きいレスポンスはディスクへ保存
+#   # デフォルト: 64KB (65536)
+#   memory_threshold = 65536
+#   
+#   # デフォルトTTL（秒）
+#   # Cache-Controlヘッダーがない場合に使用
+#   # デフォルト: 300秒（5分）
+#   default_ttl_secs = 300
+#   
+#   # キャッシュ対象HTTPメソッド
+#   # デフォルト: ["GET", "HEAD"]
+#   methods = ["GET", "HEAD"]
+#   
+#   # キャッシュ対象ステータスコード
+#   # デフォルト: [200, 301, 302, 304]
+#   cacheable_statuses = [200, 301, 302, 304]
+#   
+#   # キャッシュ除外パスパターン（globパターン）
+#   bypass_patterns = ["/cached-api/user/*", "/cached-api/session"]
+#   
+#   # Varyヘッダーを尊重するか
+#   # trueの場合、Varyに基づいて別々のキャッシュエントリを作成
+#   respect_vary = true
+#   
+#   # ETag検証を有効化
+#   enable_etag = true
+#   
+#   # クエリパラメータをキャッシュキーに含めるか
+#   include_query = true
+
+# ------------------------------------------
+# バッファリング制御設定
+# ------------------------------------------
+# 低速クライアントによるバックエンド占有を防止するため、
+# レスポンスをバッファリングしてからクライアントに送信します。
+#
+# [path_routes."example.com"."/buffered-api/"]
+# type = "Proxy"
+# url = "http://localhost:8080"
+#
+#   # バッファリング設定
+#   [path_routes."example.com"."/buffered-api/".buffering]
+#   # バッファリングモード: "streaming", "full", "adaptive"
+#   # - streaming: ストリーミング転送（従来の動作、デフォルト）
+#   # - full: フルバッファリング（全レスポンスをバッファ後に転送）
+#   # - adaptive: 適応型（小さいレスポンスはフル、大きいレスポンスはストリーミング）
+#   mode = "adaptive"
+#   
+#   # 適応型モードの閾値（バイト）
+#   # Content-Lengthがこの値以下の場合はフルバッファリング
+#   # デフォルト: 1MB (1048576)
+#   adaptive_threshold = 1048576
+#   
+#   # フルバッファリング時のメモリ最大サイズ（バイト）
+#   # この値を超えるレスポンスはディスクバッファへスピルオーバー
+#   # デフォルト: 10MB (10485760)
+#   max_memory_buffer = 10485760
+#   
+#   # ディスクバッファパス
+#   # メモリバッファを超えた場合の一時ファイル保存先
+#   # 未設定の場合はディスクバッファを使用しない
+#   # disk_buffer_path = "/var/tmp/veil/buffer"
+#   
+#   # クライアント書き込みタイムアウト（秒）
+#   # バッファからクライアントへの書き込みがこの時間を超えると接続を切断
+#   client_write_timeout_secs = 60
+
+# ------------------------------------------
 # WebSocket プロキシ
 # ------------------------------------------
 # Connection: Upgrade と Upgrade: websocket ヘッダーを自動検出

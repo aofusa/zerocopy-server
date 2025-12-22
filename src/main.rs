@@ -129,6 +129,17 @@ pub mod http3_server;
 /// - Landlockファイルシステム制限
 pub mod security;
 
+/// バッファリング制御モジュール
+/// - 低速クライアントによるバックエンド占有防止
+/// - フルバッファリング・適応型バッファリング
+pub mod buffering;
+
+/// プロキシキャッシュモジュール
+/// - インメモリキャッシュ（DashMap + LRU）
+/// - ディスクキャッシュ（monoio::fs 非同期I/O）
+/// - Cache-Control / Vary ヘッダー対応
+pub mod cache;
+
 use httparse::{Request, Status};
 use monoio::fs::OpenOptions;
 use monoio::buf::{IoBuf, IoBufMut};
@@ -3451,16 +3462,41 @@ enum BackendConfig {
     /// - sni_name: TLS接続時のSNI名（IP直打ち時にドメイン名を指定可能）
     /// - use_h2c: H2C (HTTP/2 over cleartext) を使用するかどうか
     /// - compression: 圧縮設定（オプション）
-    Proxy { url: String, sni_name: Option<String>, use_h2c: bool, security: SecurityConfig, compression: CompressionConfig },
+    /// - buffering: バッファリング設定（オプション）
+    /// - cache: キャッシュ設定（オプション）
+    Proxy { 
+        url: String, 
+        sni_name: Option<String>, 
+        use_h2c: bool, 
+        security: SecurityConfig, 
+        compression: CompressionConfig,
+        buffering: buffering::BufferingConfig,
+        cache: cache::CacheConfig,
+    },
     /// Upstream グループ参照（ロードバランシング用）
     /// - compression: 圧縮設定（オプション）
-    ProxyUpstream { upstream: String, security: SecurityConfig, compression: CompressionConfig },
+    /// - buffering: バッファリング設定（オプション）
+    /// - cache: キャッシュ設定（オプション）
+    ProxyUpstream { 
+        upstream: String, 
+        security: SecurityConfig, 
+        compression: CompressionConfig,
+        buffering: buffering::BufferingConfig,
+        cache: cache::CacheConfig,
+    },
     /// File バックエンド設定
     /// - path: ファイルまたはディレクトリのパス
     /// - mode: "sendfile" または "memory"
     /// - index: ディレクトリアクセス時に返すファイル名（デフォルト: "index.html"）
     /// - security: ルートごとのセキュリティ設定
-    File { path: String, mode: String, index: Option<String>, security: SecurityConfig },
+    /// - cache: キャッシュ設定（オプション、静的ファイルのキャッシュ用）
+    File { 
+        path: String, 
+        mode: String, 
+        index: Option<String>, 
+        security: SecurityConfig,
+        cache: cache::CacheConfig,
+    },
     /// Redirect バックエンド設定
     /// - redirect_url: リダイレクト先URL（$request_uri, $host, $path 変数使用可能）
     /// - redirect_status: ステータスコード（301, 302, 307, 308）
@@ -3505,6 +3541,10 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut use_h2c: Option<bool> = None;
                 // 圧縮設定（Proxy用）
                 let mut compression: Option<CompressionConfig> = None;
+                // バッファリング設定（Proxy用）
+                let mut buffering_config: Option<buffering::BufferingConfig> = None;
+                // キャッシュ設定（Proxy/File用）
+                let mut cache_config: Option<cache::CacheConfig> = None;
                 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -3516,6 +3556,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "index" => index = Some(map.next_value()?),
                         "security" => security = Some(map.next_value()?),
                         "compression" => compression = Some(map.next_value()?),
+                        "buffering" => buffering_config = Some(map.next_value()?),
+                        "cache" => cache_config = Some(map.next_value()?),
                         "redirect_url" => redirect_url = Some(map.next_value()?),
                         "redirect_status" => redirect_status = Some(map.next_value()?),
                         "preserve_path" => preserve_path = Some(map.next_value()?),
@@ -3528,16 +3570,32 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let backend_type = backend_type.unwrap_or_else(|| "File".to_string());
                 let security = security.unwrap_or_default();
                 let compression = compression.unwrap_or_default();
+                let buffering = buffering_config.unwrap_or_default();
+                let cache = cache_config.unwrap_or_default();
                 
                 match backend_type.as_str() {
                     "Proxy" => {
                         // upstream が指定されている場合はロードバランシング用
                         if let Some(upstream_name) = upstream {
-                            Ok(BackendConfig::ProxyUpstream { upstream: upstream_name, security, compression })
+                            Ok(BackendConfig::ProxyUpstream { 
+                                upstream: upstream_name, 
+                                security, 
+                                compression,
+                                buffering,
+                                cache,
+                            })
                         } else {
                             let url = url.ok_or_else(|| serde::de::Error::missing_field("url or upstream"))?;
                             let use_h2c = use_h2c.unwrap_or(false);
-                            Ok(BackendConfig::Proxy { url, sni_name, use_h2c, security, compression })
+                            Ok(BackendConfig::Proxy { 
+                                url, 
+                                sni_name, 
+                                use_h2c, 
+                                security, 
+                                compression,
+                                buffering,
+                                cache,
+                            })
                         }
                     }
                     "Redirect" => {
@@ -3556,7 +3614,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                     "File" | _ => {
                         let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
                         let mode = mode.unwrap_or_else(|| "sendfile".to_string());
-                        Ok(BackendConfig::File { path, mode, index, security })
+                        Ok(BackendConfig::File { path, mode, index, security, cache })
                     }
                 }
             }
@@ -3576,7 +3634,15 @@ enum Backend {
     /// - Arc<UpstreamGroup>: アップストリームグループ（単一または複数バックエンド）
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
     /// - Arc<CompressionConfig>: 圧縮設定
-    Proxy(Arc<UpstreamGroup>, Arc<SecurityConfig>, Arc<CompressionConfig>),
+    /// - Arc<buffering::BufferingConfig>: バッファリング設定
+    /// - Arc<cache::CacheConfig>: キャッシュ設定
+    Proxy(
+        Arc<UpstreamGroup>, 
+        Arc<SecurityConfig>, 
+        Arc<CompressionConfig>,
+        Arc<buffering::BufferingConfig>,
+        Arc<cache::CacheConfig>,
+    ),
     /// MemoryFile バックエンド
     /// - Arc<Vec<u8>>: ファイルコンテンツ
     /// - Arc<str>: MIMEタイプ
@@ -3587,7 +3653,8 @@ enum Backend {
     /// - bool: ディレクトリかどうか
     /// - Option<Arc<str>>: インデックスファイル名（None = "index.html"）
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
-    SendFile(Arc<PathBuf>, bool, Option<Arc<str>>, Arc<SecurityConfig>),
+    /// - Arc<cache::CacheConfig>: キャッシュ設定
+    SendFile(Arc<PathBuf>, bool, Option<Arc<str>>, Arc<SecurityConfig>, Arc<cache::CacheConfig>),
     /// Redirect バックエンド
     /// - Arc<str>: リダイレクト先URL
     /// - u16: ステータスコード（301, 302, 307, 308）
@@ -3603,13 +3670,33 @@ impl Backend {
         static DEFAULT_SECURITY: Lazy<SecurityConfig> = Lazy::new(SecurityConfig::default);
         
         match self {
-            Backend::Proxy(_, security, _) => security,
+            Backend::Proxy(_, security, _, _, _) => security,
             Backend::MemoryFile(_, _, security) => security,
-            Backend::SendFile(_, _, _, security) => security,
+            Backend::SendFile(_, _, _, security, _) => security,
             Backend::Redirect(_, _, _) => &DEFAULT_SECURITY,
         }
     }
     
+    /// このバックエンドのバッファリング設定を取得
+    #[inline]
+    fn buffering(&self) -> Option<&buffering::BufferingConfig> {
+        match self {
+            Backend::Proxy(_, _, _, buffering, _) => Some(buffering),
+            _ => None,
+        }
+    }
+    
+    /// このバックエンドのキャッシュ設定を取得
+    #[inline]
+    fn cache(&self) -> Option<&cache::CacheConfig> {
+        static DEFAULT_CACHE: Lazy<cache::CacheConfig> = Lazy::new(cache::CacheConfig::default);
+        
+        match self {
+            Backend::Proxy(_, _, _, _, cache) => Some(cache),
+            Backend::SendFile(_, _, _, _, cache) => Some(cache),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -4971,7 +5058,7 @@ fn load_backend(
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
 ) -> io::Result<Backend> {
     match config {
-        BackendConfig::Proxy { url, sni_name, use_h2c, security, compression } => {
+        BackendConfig::Proxy { url, sni_name, use_h2c, security, compression, buffering, cache } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
@@ -4988,10 +5075,28 @@ fn load_backend(
                       url, compression.gzip_level, compression.brotli_level);
             }
             
+            // バッファリング設定のログ出力
+            if buffering.is_enabled() {
+                info!("Response buffering enabled for backend: {} (mode={:?}, max_memory={})", 
+                      url, buffering.mode, buffering.max_memory_buffer);
+            }
+            
+            // キャッシュ設定のログ出力
+            if cache.enabled {
+                info!("Proxy cache enabled for backend: {} (max_memory={}, ttl={}s)", 
+                      url, cache.max_memory_size, cache.default_ttl_secs);
+            }
+            
             let group = UpstreamGroup::single(target);
-            Ok(Backend::Proxy(Arc::new(group), Arc::new(security.clone()), Arc::new(compression.clone())))
+            Ok(Backend::Proxy(
+                Arc::new(group), 
+                Arc::new(security.clone()), 
+                Arc::new(compression.clone()),
+                Arc::new(buffering.clone()),
+                Arc::new(cache.clone()),
+            ))
         }
-        BackendConfig::ProxyUpstream { upstream, security, compression } => {
+        BackendConfig::ProxyUpstream { upstream, security, compression, buffering, cache } => {
             // Upstream グループ参照
             let group = upstream_groups.get(upstream)
                 .ok_or_else(|| io::Error::new(
@@ -5005,14 +5110,39 @@ fn load_backend(
                       upstream, compression.gzip_level, compression.brotli_level);
             }
             
-            Ok(Backend::Proxy(group.clone(), Arc::new(security.clone()), Arc::new(compression.clone())))
+            // バッファリング設定のログ出力
+            if buffering.is_enabled() {
+                info!("Response buffering enabled for upstream: {} (mode={:?}, max_memory={})", 
+                      upstream, buffering.mode, buffering.max_memory_buffer);
+            }
+            
+            // キャッシュ設定のログ出力
+            if cache.enabled {
+                info!("Proxy cache enabled for upstream: {} (max_memory={}, ttl={}s)", 
+                      upstream, cache.max_memory_size, cache.default_ttl_secs);
+            }
+            
+            Ok(Backend::Proxy(
+                group.clone(), 
+                Arc::new(security.clone()), 
+                Arc::new(compression.clone()),
+                Arc::new(buffering.clone()),
+                Arc::new(cache.clone()),
+            ))
         }
-        BackendConfig::File { path, mode, index, security } => {
+        BackendConfig::File { path, mode, index, security, cache } => {
             let metadata = fs::metadata(path)?;
             let is_dir = metadata.is_dir();
             // インデックスファイル名を Arc<str> に変換（None = デフォルトで "index.html"）
             let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
             let security = Arc::new(security.clone());
+            let cache = Arc::new(cache.clone());
+            
+            // キャッシュ設定のログ出力
+            if cache.enabled {
+                info!("File cache enabled for path: {} (max_memory={}, ttl={}s)", 
+                      path, cache.max_memory_size, cache.default_ttl_secs);
+            }
             
             match mode.as_str() {
                 "memory" => {
@@ -5024,7 +5154,7 @@ fn load_backend(
                     
                     Ok(Backend::MemoryFile(Arc::new(data), Arc::from(mime_type.as_ref()), security))
                 }
-                "sendfile" | "" => Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security)),
+                "sendfile" | "" => Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security, cache)),
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
         }
@@ -6449,7 +6579,7 @@ where
     
     // Backend処理
     match backend {
-        Backend::Proxy(upstream_group, _, compression) => {
+        Backend::Proxy(upstream_group, _, compression, _buffering, _cache) => {
             handle_http2_proxy(conn, stream_id, &upstream_group, &compression, client_encoding, method, path, &prefix, client_ip).await
         }
         Backend::MemoryFile(data, mime_type, security) => {
@@ -6490,7 +6620,7 @@ where
             }
             Some((200, data.len() as u64))
         }
-        Backend::SendFile(base_path, is_dir, index_file, security) => {
+        Backend::SendFile(base_path, is_dir, index_file, security, _cache) => {
             handle_http2_sendfile(conn, stream_id, &base_path, is_dir, index_file.as_deref(), path, &prefix, &security).await
         }
         Backend::Redirect(redirect_url, status_code, preserve_path) => {
@@ -7669,7 +7799,7 @@ async fn handle_requests(
                 // WebSocket Upgrade の場合は専用ハンドラーを使用
                 if is_websocket {
                     // WebSocket はプロキシバックエンドでのみサポート
-                    if let Backend::Proxy(ref upstream_group, ref security, _) = backend {
+                    if let Backend::Proxy(ref upstream_group, ref security, _, _, _) = backend {
                         info!("WebSocket upgrade request detected for path: {}", 
                               std::str::from_utf8(&path_bytes).unwrap_or("-"));
                         
@@ -7894,7 +8024,7 @@ async fn handle_backend(
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     match backend {
-        Backend::Proxy(upstream_group, security, compression) => {
+        Backend::Proxy(upstream_group, security, compression, _buffering, _cache) => {
             handle_proxy(tls_stream, &upstream_group, &security, &compression, method, req_path, &prefix, content_length, is_chunked, headers, initial_body, client_wants_close, client_ip).await
         }
         Backend::MemoryFile(data, mime_type, security) => {
@@ -7958,7 +8088,7 @@ async fn handle_backend(
                 _ => None,
             }
         }
-        Backend::SendFile(base_path, is_dir, index_file, security) => {
+        Backend::SendFile(base_path, is_dir, index_file, security, _cache) => {
             handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close, &security).await
         }
         Backend::Redirect(redirect_url, status_code, preserve_path) => {
