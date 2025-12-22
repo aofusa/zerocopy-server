@@ -3610,14 +3610,6 @@ impl Backend {
         }
     }
     
-    /// このバックエンドの圧縮設定を取得（Proxyのみ有効）
-    #[inline]
-    fn compression(&self) -> Option<&CompressionConfig> {
-        match self {
-            Backend::Proxy(_, _, compression) => Some(compression),
-            _ => None,
-        }
-    }
 }
 
 #[derive(Clone)]
@@ -9418,61 +9410,6 @@ fn status_reason_phrase(status: u16) -> &'static str {
     }
 }
 
-/// HTTPリクエストを送信してレスポンスを受信（内部関数）
-/// 戻り値: Option<(status_code, response_size, backend_wants_keep_alive)>
-async fn proxy_http_request(
-    client_stream: &mut ServerTls,
-    backend_stream: &mut TcpStream,
-    request: Vec<u8>,
-    content_length: usize,
-    is_chunked: bool,
-    initial_body: &[u8],
-    max_chunked_body_size: u64,
-) -> Option<(u16, u64, bool)> {
-    // 1. リクエストヘッダー送信（タイムアウト付き）
-    let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
-    if !matches!(write_result, Ok((Ok(_), _))) {
-        return None;
-    }
-
-    // 2. リクエストボディ送信
-    if !initial_body.is_empty() {
-        let body_buf = initial_body.to_vec();
-        let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(body_buf)).await;
-        if !matches!(write_result, Ok((Ok(_), _))) {
-            return None;
-        }
-    }
-
-    // 3. 残りのリクエストボディを転送
-    if is_chunked {
-        // Chunked転送の場合（DoS対策: ルートごとのmax_chunked_body_sizeで制限）
-        match transfer_chunked_body(client_stream, backend_stream, initial_body, max_chunked_body_size).await {
-            ChunkedTransferResult::Complete => {}
-            ChunkedTransferResult::Failed => return None,
-            ChunkedTransferResult::SizeLimitExceeded => {
-                // サイズ制限超過 - 413エラーを返すべきだが、
-                // ここではバックエンド接続を閉じて失敗として扱う
-                return None;
-            }
-        }
-    } else {
-        // Content-Length転送の場合
-        let remaining = content_length.saturating_sub(initial_body.len());
-        if remaining > 0 {
-            let transferred = transfer_exact_bytes(client_stream, backend_stream, remaining).await;
-            if transferred < remaining as u64 {
-                return None;
-            }
-        }
-    }
-
-    // 4. レスポンスを受信して転送（Connectionヘッダーも取得）
-    let (total, status_code, backend_wants_keep_alive) = transfer_response_with_keepalive(backend_stream, client_stream).await;
-
-    Some((status_code, total, backend_wants_keep_alive))
-}
-
 // ====================
 // HTTPリクエスト送信とレスポンス受信（圧縮対応版）
 // ====================
@@ -9558,6 +9495,7 @@ async fn transfer_response_with_compression(
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
     let mut status_code = 502u16;
+    // 初期値false: エラー時はKeep-Aliveを無効化
     let mut backend_wants_keep_alive = false;
 
     // ヘッダー読み取り用バッファ
@@ -9568,19 +9506,19 @@ async fn transfer_response_with_compression(
         let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => {
-                return (total, status_code, false);
+                return (total, status_code, backend_wants_keep_alive);
             }
         };
         
         let n = match res {
             Ok(0) => {
                 buf_put(returned_buf);
-                return (total, status_code, false);
+                return (total, status_code, backend_wants_keep_alive);
             }
             Ok(n) => n,
             Err(_) => {
                 buf_put(returned_buf);
-                return (total, status_code, false);
+                return (total, status_code, backend_wants_keep_alive);
             }
         };
         
@@ -10522,59 +10460,6 @@ async fn proxy_https_pooled(
     }
 }
 
-/// HTTPSリクエストを送信してレスポンスを受信（内部関数）
-/// 戻り値: Option<(status_code, response_size, backend_wants_keep_alive)>
-async fn proxy_https_request(
-    client_stream: &mut ServerTls,
-    backend_stream: &mut ClientTls,
-    request: Vec<u8>,
-    content_length: usize,
-    is_chunked: bool,
-    initial_body: &[u8],
-    max_chunked_body_size: u64,
-) -> Option<(u16, u64, bool)> {
-    // 1. リクエストヘッダー送信
-    let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
-    if !matches!(write_result, Ok((Ok(_), _))) {
-        return None;
-    }
-
-    // 2. リクエストボディ送信
-    if !initial_body.is_empty() {
-        let body_buf = initial_body.to_vec();
-        let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(body_buf)).await;
-        if !matches!(write_result, Ok((Ok(_), _))) {
-            return None;
-        }
-    }
-
-    // 3. 残りのリクエストボディを転送
-    if is_chunked {
-        // Chunked転送の場合（DoS対策: ルートごとのmax_chunked_body_sizeで制限）
-        match transfer_chunked_body(client_stream, backend_stream, initial_body, max_chunked_body_size).await {
-            ChunkedTransferResult::Complete => {}
-            ChunkedTransferResult::Failed => return None,
-            ChunkedTransferResult::SizeLimitExceeded => {
-                // サイズ制限超過 - 接続を閉じて失敗として扱う
-                return None;
-            }
-        }
-    } else {
-        let remaining = content_length.saturating_sub(initial_body.len());
-        if remaining > 0 {
-            let transferred = transfer_exact_bytes(client_stream, backend_stream, remaining).await;
-            if transferred < remaining as u64 {
-                return None;
-            }
-        }
-    }
-
-    // 4. レスポンスを受信して転送（Connectionヘッダーも取得）
-    let (total, status_code, backend_wants_keep_alive) = transfer_response_with_keepalive(backend_stream, client_stream).await;
-
-    Some((status_code, total, backend_wants_keep_alive))
-}
-
 /// HTTPSリクエストを送信してレスポンスを受信（圧縮対応版）
 /// 戻り値: Option<(status_code, response_size, backend_wants_keep_alive)>
 async fn proxy_https_request_with_compression(
@@ -10639,6 +10524,7 @@ async fn transfer_https_response_with_compression(
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
     let mut status_code = 502u16;
+    // 初期値false: エラー時はKeep-Aliveを無効化
     let mut backend_wants_keep_alive = false;
 
     // ヘッダー読み取り用バッファ
@@ -10649,19 +10535,19 @@ async fn transfer_https_response_with_compression(
         let (res, mut returned_buf) = match read_result {
             Ok(result) => result,
             Err(_) => {
-                return (total, status_code, false);
+                return (total, status_code, backend_wants_keep_alive);
             }
         };
         
         let n = match res {
             Ok(0) => {
                 buf_put(returned_buf);
-                return (total, status_code, false);
+                return (total, status_code, backend_wants_keep_alive);
             }
             Ok(n) => n,
             Err(_) => {
                 buf_put(returned_buf);
-                return (total, status_code, false);
+                return (total, status_code, backend_wants_keep_alive);
             }
         };
         
@@ -11168,189 +11054,6 @@ async fn transfer_chunked_body<R: AsyncReader, W: AsyncWriter>(
     }
     
     ChunkedTransferResult::Failed
-}
-
-/// レスポンスを受信して転送（Keep-Aliveサポート版）
-/// バックエンドがKeep-Aliveを許可しているかどうかも返す
-async fn transfer_response_with_keepalive<R: AsyncReader, W: AsyncWriter>(
-    backend: &mut R,
-    client: &mut W,
-) -> (u64, u16, bool) {
-    let mut total = 0u64;
-    let mut status_code = 502u16;
-    let mut header_parsed = false;
-    let mut accumulated = Vec::with_capacity(4096);
-    let mut is_chunked = false;
-    let mut body_remaining: Option<usize> = None;
-    // ステートマシンベースのChunkedデコーダを使用
-    // レスポンス受信時は制限なし（バックエンドを信頼）
-    let mut chunked_decoder = ChunkedDecoder::new_unlimited();
-    let mut backend_wants_keep_alive = false;  // デフォルトはfalse（安全側）
-    
-    loop {
-        let buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend.read_buf(buf)).await;
-        
-        let (res, mut returned_buf) = match read_result {
-            Ok(result) => result,
-            Err(_) => {
-                // タイムアウト
-                if !accumulated.is_empty() {
-                    let data = std::mem::take(&mut accumulated);
-                    let len = data.len();
-                    let _ = timeout(WRITE_TIMEOUT, client.write_buf(data)).await;
-                    total += len as u64;
-                }
-                break;
-            }
-        };
-        
-        let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                // EOFに達した
-                if !accumulated.is_empty() {
-                    let data = std::mem::take(&mut accumulated);
-                    let len = data.len();
-                    let _ = timeout(WRITE_TIMEOUT, client.write_buf(data)).await;
-                    total += len as u64;
-                }
-                break;
-            }
-            Ok(n) => n,
-            Err(_) => {
-                buf_put(returned_buf);
-                break;
-            }
-        };
-        
-        // SafeReadBuffer の有効長を設定
-        returned_buf.set_valid_len(n);
-        
-        if !header_parsed {
-            accumulated.extend_from_slice(returned_buf.as_valid_slice());
-            buf_put(returned_buf);
-            
-            // httparseを使用してレスポンスヘッダーを解析
-            if let Some(parsed) = parse_http_response(&accumulated) {
-                header_parsed = true;
-                status_code = parsed.status_code;
-                is_chunked = parsed.is_chunked;
-                
-                // HTTP/1.1 ではデフォルトでkeep-alive、Connection: closeが明示されていなければOK
-                backend_wants_keep_alive = !parsed.is_connection_close;
-                
-                let header_len = parsed.header_len;
-                let header_with_body = std::mem::take(&mut accumulated);
-                let data_len = header_with_body.len();
-                
-                // ボディ開始部分の長さを計算
-                let body_start_len = data_len.saturating_sub(header_len);
-                
-                // Content-Lengthがある場合、残りのボディサイズを計算
-                if let Some(cl) = parsed.content_length {
-                    body_remaining = Some(cl.saturating_sub(body_start_len));
-                }
-                
-                // Chunked の場合、初期ボディ部分をデコーダにフィード
-                if is_chunked && body_start_len > 0 {
-                    let _ = chunked_decoder.feed(&header_with_body[header_len..]);
-                }
-                
-                let write_result = timeout(WRITE_TIMEOUT, client.write_buf(header_with_body)).await;
-                match write_result {
-                    Ok((Ok(_), returned)) => {
-                        buf_put_vec(returned);
-                    }
-                    Ok((Err(_), returned)) => {
-                        buf_put_vec(returned);
-                        backend_wants_keep_alive = false;
-                        break;
-                    }
-                    Err(_) => {
-                        backend_wants_keep_alive = false;
-                        break;
-                    }
-                }
-                total += data_len as u64;
-            }
-        } else {
-            // ヘッダー解析済み
-            if is_chunked {
-                // Chunked転送 - デコーダにデータをフィード（型安全なアクセス）
-                let feed_result = chunked_decoder.feed(returned_buf.as_valid_slice());
-                
-                // 有効データのみを含むVecに変換
-                let write_buf = returned_buf.into_truncated();
-                
-                let write_result = timeout(WRITE_TIMEOUT, client.write_buf(write_buf)).await;
-                match write_result {
-                    Ok((Ok(_), returned)) => {
-                        buf_put_vec(returned);
-                    }
-                    Ok((Err(_), returned)) => {
-                        buf_put_vec(returned);
-                        backend_wants_keep_alive = false;
-                        break;
-                    }
-                    Err(_) => {
-                        backend_wants_keep_alive = false;
-                        break;
-                    }
-                }
-                
-                total += n as u64;
-                
-                // ステートマシンによる終端チェック
-                if feed_result == ChunkedFeedResult::Complete {
-                    break;
-                }
-            } else {
-                // Content-Length転送
-                let bytes_to_send = if let Some(remaining) = body_remaining {
-                    let to_send = n.min(remaining);
-                    body_remaining = Some(remaining - to_send);
-                    to_send
-                } else {
-                    n
-                };
-                
-                if bytes_to_send > 0 {
-                    // 送信サイズを調整
-                    returned_buf.set_valid_len(bytes_to_send);
-                    let write_buf = returned_buf.into_truncated();
-                    
-                    let write_result = timeout(WRITE_TIMEOUT, client.write_buf(write_buf)).await;
-                    match write_result {
-                        Ok((Ok(_), returned)) => {
-                            buf_put_vec(returned);
-                        }
-                        Ok((Err(_), returned)) => {
-                            buf_put_vec(returned);
-                            backend_wants_keep_alive = false;
-                            break;
-                        }
-                        Err(_) => {
-                            backend_wants_keep_alive = false;
-                            break;
-                        }
-                    }
-                    
-                    total += bytes_to_send as u64;
-                } else {
-                    buf_put(returned_buf);
-                }
-                
-                if let Some(remaining) = body_remaining {
-                    if remaining == 0 {
-                        break;
-                    }
-                }
-            }
-        }
-    }
-    
-    (total, status_code, backend_wants_keep_alive)
 }
 
 // ====================
