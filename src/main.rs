@@ -506,6 +506,210 @@ static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
     gauge
 });
 
+// ====================
+// キャッシュメトリクス
+// ====================
+
+/// キャッシュヒット数カウンター（host ラベル付き）
+static CACHE_HITS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("cache_hits_total", "Total number of cache hits")
+        .namespace("veil_proxy");
+    let counter = CounterVec::new(opts, &["host"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// キャッシュミス数カウンター（host ラベル付き）
+static CACHE_MISSES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("cache_misses_total", "Total number of cache misses")
+        .namespace("veil_proxy");
+    let counter = CounterVec::new(opts, &["host"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// キャッシュ保存数カウンター（host, storage ラベル付き）
+/// storage: "memory" or "disk"
+static CACHE_STORES_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("cache_stores_total", "Total number of cache stores")
+        .namespace("veil_proxy");
+    let counter = CounterVec::new(opts, &["host", "storage"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// キャッシュ削除数カウンター（reason ラベル付き）
+/// reason: "expired", "lru", "invalidate"
+static CACHE_EVICTIONS_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("cache_evictions_total", "Total number of cache evictions")
+        .namespace("veil_proxy");
+    let counter = CounterVec::new(opts, &["reason"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// キャッシュサイズゲージ（storage ラベル付き）
+/// storage: "memory" or "disk"
+static CACHE_SIZE_BYTES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new("cache_size_bytes", "Current cache size in bytes")
+        .namespace("veil_proxy");
+    let gauge = IntGaugeVec::new(opts, &["storage"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// キャッシュエントリ数ゲージ
+static CACHE_ENTRIES: Lazy<IntGaugeVec> = Lazy::new(|| {
+    let opts = Opts::new("cache_entries", "Current number of cache entries")
+        .namespace("veil_proxy");
+    let gauge = IntGaugeVec::new(opts, &["storage"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(gauge.clone())).unwrap();
+    gauge
+});
+
+/// バッファリング使用数カウンター（mode ラベル付き）
+/// mode: "full", "adaptive_buffered", "adaptive_streaming"
+#[allow(dead_code)]
+static BUFFERING_USED_TOTAL: Lazy<CounterVec> = Lazy::new(|| {
+    let opts = Opts::new("buffering_used_total", "Total number of requests using buffering")
+        .namespace("veil_proxy");
+    let counter = CounterVec::new(opts, &["mode"]).unwrap();
+    METRICS_REGISTRY.register(Box::new(counter.clone())).unwrap();
+    counter
+});
+
+/// メトリクス: キャッシュヒットを記録
+#[inline]
+fn record_cache_hit(host: &str) {
+    CACHE_HITS_TOTAL.with_label_values(&[host]).inc();
+}
+
+/// メトリクス: キャッシュミスを記録
+#[inline]
+fn record_cache_miss(host: &str) {
+    CACHE_MISSES_TOTAL.with_label_values(&[host]).inc();
+}
+
+/// メトリクス: キャッシュ保存を記録
+#[inline]
+fn record_cache_store(host: &str, storage: &str) {
+    CACHE_STORES_TOTAL.with_label_values(&[host, storage]).inc();
+}
+
+/// メトリクス: キャッシュ削除を記録
+#[inline]
+fn record_cache_eviction(reason: &str, count: usize) {
+    CACHE_EVICTIONS_TOTAL.with_label_values(&[reason]).inc_by(count as f64);
+}
+
+/// メトリクス: キャッシュサイズを更新
+#[inline]
+fn update_cache_size_metrics(stats: &cache::CacheStats) {
+    CACHE_SIZE_BYTES.with_label_values(&["memory"]).set(stats.memory_usage as i64);
+    CACHE_SIZE_BYTES.with_label_values(&["disk"]).set(stats.disk_usage as i64);
+    CACHE_ENTRIES.with_label_values(&["memory"]).set(stats.entries as i64);
+    CACHE_ENTRIES.with_label_values(&["disk"]).set(0); // ディスクエントリ数は別途追跡が必要
+}
+
+/// メトリクス: バッファリング使用を記録
+#[inline]
+#[allow(dead_code)]
+fn record_buffering_used(mode: &str) {
+    BUFFERING_USED_TOTAL.with_label_values(&[mode]).inc();
+}
+
+// ====================
+// キャッシュ保存コンテキスト
+// ====================
+
+/// キャッシュ保存コンテキスト
+/// 
+/// プロキシ処理中にレスポンスをキャプチャしてキャッシュに保存するために使用します。
+/// splice転送では使用できないため、このコンテキストが存在する場合は通常転送を使用します。
+pub struct CacheSaveContext {
+    /// キャッシュキー
+    pub key: cache::CacheKey,
+    /// ホスト名（メトリクス用）
+    pub host: String,
+    /// キャプチャしたレスポンスヘッダー
+    pub captured_headers: Vec<(Box<[u8]>, Box<[u8]>)>,
+    /// キャプチャしたレスポンスボディ
+    pub captured_body: Vec<u8>,
+    /// ステータスコード
+    pub status_code: u16,
+    /// キャプチャサイズ上限（これを超えるとキャプチャを中止）
+    pub max_capture_size: usize,
+    /// キャプチャ中止フラグ
+    pub capture_aborted: bool,
+}
+
+impl CacheSaveContext {
+    /// 新しいキャッシュ保存コンテキストを作成
+    pub fn new(key: cache::CacheKey, host: String, max_capture_size: usize) -> Self {
+        Self {
+            key,
+            host,
+            captured_headers: Vec::new(),
+            captured_body: Vec::with_capacity(4096),
+            status_code: 0,
+            max_capture_size,
+            capture_aborted: false,
+        }
+    }
+    
+    /// ヘッダーを設定
+    #[inline]
+    pub fn set_headers(&mut self, headers: Vec<(Box<[u8]>, Box<[u8]>)>, status_code: u16) {
+        self.captured_headers = headers;
+        self.status_code = status_code;
+    }
+    
+    /// ボディチャンクを追加（サイズ制限付き）
+    #[inline]
+    pub fn append_body(&mut self, data: &[u8]) {
+        if self.capture_aborted {
+            return;
+        }
+        
+        let new_size = self.captured_body.len() + data.len();
+        if new_size > self.max_capture_size {
+            // サイズ上限を超えた場合、キャプチャを中止
+            self.capture_aborted = true;
+            self.captured_body.clear();
+            self.captured_headers.clear();
+            return;
+        }
+        
+        self.captured_body.extend_from_slice(data);
+    }
+    
+    /// キャッシュに保存（キャプチャ成功時のみ）
+    pub fn save_to_cache(&self) -> bool {
+        if self.capture_aborted || self.captured_body.is_empty() {
+            return false;
+        }
+        
+        if let Some(cache_manager) = cache::get_global_cache() {
+            let stored = cache_manager.store(
+                self.key.clone(),
+                self.status_code,
+                self.captured_headers.clone(),
+                self.captured_body.clone(),
+            );
+            
+            if stored {
+                record_cache_store(&self.host, "memory");
+                debug!("Cached response for {} (status={}, size={})", 
+                       self.host, self.status_code, self.captured_body.len());
+            }
+            
+            stored
+        } else {
+            false
+        }
+    }
+}
+
 /// Prometheusメトリクスをテキストフォーマットでエンコード
 fn encode_prometheus_metrics() -> Vec<u8> {
     let encoder = TextEncoder::new();
@@ -5402,6 +5606,9 @@ fn main() {
     
     // 健康チェックスレッドを起動（Upstream の健康状態を監視）
     spawn_health_check_thread();
+    
+    // キャッシュクリーンアップスレッドを起動（期限切れエントリの削除、LRU eviction）
+    spawn_cache_cleanup_thread();
 
     let mut handles = Vec::with_capacity(num_threads);
 
@@ -5917,6 +6124,62 @@ fn spawn_reload_thread() {
 /// 
 /// CURRENT_CONFIG から Upstream グループを取得し、
 /// 設定された間隔で各サーバーにHTTPリクエストを送信してヘルスをチェック。
+/// キャッシュクリーンアップスレッドを起動
+/// 
+/// 定期的に以下の処理を実行:
+/// - 期限切れエントリの削除
+/// - LRU eviction（メモリ使用量が閾値を超えた場合）
+/// - メトリクスの更新
+fn spawn_cache_cleanup_thread() {
+    thread::spawn(move || {
+        info!("Cache cleanup thread started (interval=60s)");
+        
+        loop {
+            // 60秒ごとにクリーンアップを実行
+            thread::sleep(Duration::from_secs(60));
+            
+            // シャットダウン中は終了
+            if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                info!("Cache cleanup thread shutting down");
+                break;
+            }
+            
+            // グローバルキャッシュを取得
+            if let Some(cache_manager) = cache::get_global_cache() {
+                // 1. 期限切れエントリの削除
+                let expired_count = cache_manager.evict_expired();
+                if expired_count > 0 {
+                    debug!("Cache cleanup: evicted {} expired entries", expired_count);
+                    record_cache_eviction("expired", expired_count);
+                }
+                
+                // 2. LRU eviction（メモリ使用量が閾値を超えた場合）
+                let lru_count = cache_manager.evict_lru();
+                if lru_count > 0 {
+                    debug!("Cache cleanup: evicted {} LRU entries", lru_count);
+                    record_cache_eviction("lru", lru_count);
+                }
+                
+                // 3. ディスクキャッシュのクリーンアップ
+                match cache_manager.evict_disk() {
+                    Ok(disk_count) if disk_count > 0 => {
+                        debug!("Cache cleanup: evicted {} disk entries", disk_count);
+                        record_cache_eviction("disk", disk_count);
+                    }
+                    Err(e) => {
+                        warn!("Cache disk cleanup error: {}", e);
+                    }
+                    _ => {}
+                }
+                
+                // 4. メトリクスを更新
+                let stats = cache_manager.stats();
+                update_cache_size_metrics(&stats);
+            }
+        }
+    });
+}
+
 fn spawn_health_check_thread() {
     thread::spawn(move || {
         info!("Health check thread started");
@@ -9135,6 +9398,7 @@ async fn handle_proxy(
                     if let Some(cached_entry) = cache_manager.get(&cache_key) {
                         // キャッシュヒット！
                         debug!("Cache HIT for {} {}", host_str, path_str);
+                        record_cache_hit(host_str);
                         
                         // キャッシュからレスポンスを返す
                         if let Some(body_data) = cached_entry.memory_body() {
@@ -9178,9 +9442,30 @@ async fn handle_proxy(
                         }
                     } else {
                         debug!("Cache MISS for {} {}", host_str, path_str);
+                        record_cache_miss(host_str);
                     }
                 }
             }
+        }
+    }
+    
+    // キャッシュ保存コンテキストを作成（キャッシュ有効かつキャッシュ可能な場合）
+    let mut cache_save_ctx: Option<CacheSaveContext> = None;
+    if cache_config.enabled && cache_config.is_cacheable_method(method) && !cache_config.should_bypass(path_str) {
+        let query = path_str.find('?').map(|i| &path_str[i+1..]);
+        let path_only = path_str.find('?').map(|i| &path_str[..i]).unwrap_or(path_str);
+        
+        if let Some(cache_key) = cache::CacheKey::from_request(
+            method,
+            host_str,
+            path_only,
+            query,
+            cache_config.include_query,
+            None,
+        ) {
+            // キャッシュ保存用コンテキストを作成
+            let max_capture = cache_config.max_memory_size.min(10 * 1024 * 1024); // 最大10MB
+            cache_save_ctx = Some(CacheSaveContext::new(cache_key, host_str.to_string(), max_capture));
         }
     }
     
@@ -9334,6 +9619,7 @@ async fn handle_proxy(
     request.extend_from_slice(HEADER_CONNECTION_KEEPALIVE_END);
 
     let result = if target.use_tls {
+        // HTTPS接続（キャッシュ保存はHTTPのみサポート、HTTPSは別途実装が必要）
         proxy_https_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
     } else if target.use_h2c {
         // H2C (HTTP/2 over cleartext) 接続
@@ -9354,10 +9640,11 @@ async fn handle_proxy(
         {
             // HTTP/2 feature が無効な場合はHTTP/1.1にフォールバック
             warn!("H2C requested but http2 feature not enabled, falling back to HTTP/1.1");
-            proxy_http_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
+            proxy_http_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut()).await
         }
     } else {
-        proxy_http_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close).await
+        // HTTP接続（キャッシュ保存対応）
+        proxy_http_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, cache_save_ctx.as_mut()).await
     };
     
     // 接続カウンターを減少（Least Connections 用）
@@ -9382,6 +9669,7 @@ async fn proxy_http_pooled(
     is_chunked: bool,
     initial_body: &[u8],
     client_wants_close: bool,
+    cache_ctx: Option<&mut CacheSaveContext>,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // セキュリティ設定からタイムアウトを取得
     let connect_timeout = Duration::from_secs(security.backend_connect_timeout_secs);
@@ -9422,13 +9710,17 @@ async fn proxy_http_pooled(
     // 注意: 実際のContent-Typeはレスポンス受信後に判定するため、ここでは設定の有効/無効のみ確認
     let compression_enabled = compression.enabled && client_encoding != AcceptedEncoding::Identity;
     
+    // キャッシュ保存が必要かどうか
+    // キャッシュ保存が必要な場合はsplice転送を使用できない（ユーザー空間でボディをキャプチャする必要がある）
+    let cache_save_needed = cache_ctx.is_some();
+    
     // リクエスト送信とレスポンス受信
     // kTLS 有効時は splice(2) を使用してゼロコピー転送
-    // ただし、圧縮が有効な場合はkTLSを迂回（ユーザー空間で圧縮処理が必要）
+    // ただし、圧縮有効またはキャッシュ保存が必要な場合はkTLSを迂回
     #[cfg(feature = "ktls")]
     let result = {
-        // kTLS + splice 版を試みる（Content-Length の場合のみ有効、圧縮無効時のみ）
-        if client_stream.is_ktls_enabled() && !is_chunked && !compression_enabled {
+        // kTLS + splice 版を試みる（Content-Length の場合のみ有効、圧縮無効時、キャッシュ保存不要時のみ）
+        if client_stream.is_ktls_enabled() && !is_chunked && !compression_enabled && !cache_save_needed {
             let splice_result = proxy_http_request_splice(
                 &client_stream,
                 &backend_stream,
@@ -9452,10 +9744,11 @@ async fn proxy_http_pooled(
                     max_chunked,
                     compression,
                     client_encoding,
+                    cache_ctx,
                 ).await
             }
         } else {
-            // kTLS が無効、Chunked、または圧縮有効の場合は通常版を使用
+            // kTLS が無効、Chunked、圧縮有効、またはキャッシュ保存が必要な場合は通常版を使用
             proxy_http_request_with_compression(
                 &mut client_stream,
                 &mut backend_stream,
@@ -9466,6 +9759,7 @@ async fn proxy_http_pooled(
                 max_chunked,
                 compression,
                 client_encoding,
+                cache_ctx,
             ).await
         }
     };
@@ -9481,6 +9775,7 @@ async fn proxy_http_pooled(
         max_chunked,
         compression,
         client_encoding,
+        cache_ctx,
     ).await;
 
     match result {
@@ -9692,6 +9987,7 @@ async fn proxy_http_request_with_compression(
     max_chunked_body_size: u64,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    cache_ctx: Option<&mut CacheSaveContext>,
 ) -> Option<(u16, u64, bool)> {
     // 1. リクエストヘッダー送信（タイムアウト付き）
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -9729,9 +10025,9 @@ async fn proxy_http_request_with_compression(
         }
     }
 
-    // 4. レスポンスを受信して転送（圧縮対応）
+    // 4. レスポンスを受信して転送（圧縮対応、キャッシュ保存対応）
     let (total, status_code, backend_wants_keep_alive) = 
-        transfer_response_with_compression(backend_stream, client_stream, compression, client_encoding).await;
+        transfer_response_with_compression(backend_stream, client_stream, compression, client_encoding, cache_ctx).await;
 
     Some((status_code, total, backend_wants_keep_alive))
 }
@@ -9741,11 +10037,13 @@ async fn proxy_http_request_with_compression(
 // ====================
 
 /// レスポンスヘッダーを解析し、必要に応じて圧縮してクライアントに転送
+/// キャッシュコンテキストが指定されている場合、レスポンスボディをキャプチャしてキャッシュに保存
 async fn transfer_response_with_compression(
     backend_stream: &mut TcpStream,
     client_stream: &mut ServerTls,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    mut cache_ctx: Option<&mut CacheSaveContext>,
 ) -> (u64, u16, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -9803,6 +10101,7 @@ async fn transfer_response_with_compression(
             
             if let Some(encoding) = should_compress {
                 // 圧縮有効: ヘッダーを書き換えて圧縮転送
+                // 注意: 圧縮時はキャッシュ保存をスキップ（圧縮後のデータをキャッシュするには追加実装が必要）
                 let result = transfer_compressed_response(
                     client_stream,
                     backend_stream,
@@ -9817,7 +10116,24 @@ async fn transfer_response_with_compression(
                 
                 return (result.0, status_code, result.1);
             } else {
-                // 圧縮無効: そのまま転送（既存ロジック）
+                // 圧縮無効: そのまま転送（キャッシュ保存対応）
+                
+                // キャッシュコンテキストがある場合、ヘッダーを設定
+                if let Some(ref mut ctx) = cache_ctx {
+                    // ヘッダーを解析してキャッシュコンテキストに保存
+                    let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+                    let mut response = httparse::Response::new(&mut headers_storage);
+                    if response.parse(&accumulated[..header_len]).is_ok() {
+                        let headers: Vec<(Box<[u8]>, Box<[u8]>)> = response.headers.iter()
+                            .map(|h| (h.name.as_bytes().into(), h.value.into()))
+                            .collect();
+                        ctx.set_headers(headers, status_code);
+                    }
+                    
+                    // 初期ボディをキャプチャ
+                    ctx.append_body(body_start);
+                }
+                
                 // ヘッダーをそのまま送信
                 let header_data = accumulated[..header_len].to_vec();
                 let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(header_data)).await;
@@ -9836,7 +10152,7 @@ async fn transfer_response_with_compression(
                     total += body_start.len() as u64;
                 }
                 
-                // 残りのボディを転送
+                // 残りのボディを転送（キャッシュキャプチャ対応）
                 let body_remaining = if let Some(cl) = parsed.content_length {
                     cl.saturating_sub(body_start.len())
                 } else if parsed.is_chunked {
@@ -9847,12 +10163,13 @@ async fn transfer_response_with_compression(
                 };
                 
                 if body_remaining > 0 {
-                    let transferred = transfer_response_body(
+                    let transferred = transfer_response_body_with_cache(
                         backend_stream,
                         client_stream,
                         parsed.content_length,
                         parsed.is_chunked,
                         body_start,
+                        cache_ctx,
                     ).await;
                     total += transferred;
                 }
@@ -10208,6 +10525,7 @@ fn build_compressed_headers(
 }
 
 /// レスポンスボディを転送（圧縮なし）
+#[allow(dead_code)]
 async fn transfer_response_body(
     backend_stream: &mut TcpStream,
     client_stream: &mut ServerTls,
@@ -10276,7 +10594,158 @@ async fn transfer_response_body(
     total
 }
 
+/// レスポンスボディを転送（キャッシュキャプチャ対応版）
+/// 
+/// キャッシュコンテキストが指定されている場合、ボディをキャプチャしてキャッシュに保存します。
+async fn transfer_response_body_with_cache(
+    backend_stream: &mut TcpStream,
+    client_stream: &mut ServerTls,
+    content_length: Option<usize>,
+    is_chunked: bool,
+    initial_body: &[u8],
+    mut cache_ctx: Option<&mut CacheSaveContext>,
+) -> u64 {
+    let mut total = 0u64;
+    
+    if let Some(cl) = content_length {
+        let remaining = cl.saturating_sub(initial_body.len());
+        if remaining > 0 {
+            let transferred = transfer_exact_bytes_from_backend_with_cache(
+                backend_stream, 
+                client_stream, 
+                remaining,
+                cache_ctx,
+            ).await;
+            total += transferred;
+        }
+    } else if is_chunked {
+        // Chunked 転送（キャッシュキャプチャ対応）
+        let mut decoder = ChunkedDecoder::new_unlimited();
+        decoder.feed(initial_body);
+        
+        if decoder.is_complete() {
+            // 転送完了後にキャッシュに保存
+            if let Some(ctx) = cache_ctx {
+                ctx.save_to_cache();
+            }
+            return total;
+        }
+        
+        loop {
+            let read_buf = buf_get();
+            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+            
+            let (res, mut returned_buf) = match read_result {
+                Ok(result) => result,
+                Err(_) => break,
+            };
+            
+            let n = match res {
+                Ok(0) => {
+                    buf_put(returned_buf);
+                    break;
+                }
+                Ok(n) => n,
+                Err(_) => {
+                    buf_put(returned_buf);
+                    break;
+                }
+            };
+            
+            returned_buf.set_valid_len(n);
+            let chunk = returned_buf.as_valid_slice();
+            let feed_result = decoder.feed(chunk);
+            
+            // キャッシュコンテキストにボディをキャプチャ
+            if let Some(ref mut ctx) = cache_ctx {
+                ctx.append_body(chunk);
+            }
+            
+            // クライアントに転送
+            let chunk_data = chunk.to_vec();
+            let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(chunk_data)).await;
+            buf_put(returned_buf);
+            
+            if !matches!(write_result, Ok((Ok(_), _))) {
+                break;
+            }
+            total += n as u64;
+            
+            if feed_result == ChunkedFeedResult::Complete {
+                break;
+            }
+        }
+        
+        // 転送完了後にキャッシュに保存
+        if let Some(ctx) = cache_ctx {
+            ctx.save_to_cache();
+        }
+    }
+    
+    total
+}
+
+/// バックエンドから正確なバイト数を読み取りクライアントに転送（キャッシュキャプチャ対応版）
+async fn transfer_exact_bytes_from_backend_with_cache(
+    backend_stream: &mut TcpStream,
+    client_stream: &mut ServerTls,
+    mut remaining: usize,
+    mut cache_ctx: Option<&mut CacheSaveContext>,
+) -> u64 {
+    let mut total = 0u64;
+    
+    while remaining > 0 {
+        let read_buf = buf_get();
+        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
+        
+        let (res, mut returned_buf) = match read_result {
+            Ok(result) => result,
+            Err(_) => break,
+        };
+        
+        let n = match res {
+            Ok(0) => {
+                buf_put(returned_buf);
+                break;
+            }
+            Ok(n) => n.min(remaining),
+            Err(_) => {
+                buf_put(returned_buf);
+                break;
+            }
+        };
+        
+        returned_buf.set_valid_len(n);
+        let chunk = returned_buf.as_valid_slice();
+        
+        // キャッシュコンテキストにボディをキャプチャ
+        if let Some(ref mut ctx) = cache_ctx {
+            ctx.append_body(&chunk[..n]);
+        }
+        
+        // クライアントに転送
+        let chunk_data = chunk[..n].to_vec();
+        let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(chunk_data)).await;
+        buf_put(returned_buf);
+        
+        if !matches!(write_result, Ok((Ok(_), _))) {
+            break;
+        }
+        
+        total += n as u64;
+        remaining = remaining.saturating_sub(n);
+    }
+    
+    // 転送完了後にキャッシュに保存
+    if let Some(ctx) = cache_ctx {
+        ctx.save_to_cache();
+    }
+    
+    total
+}
+
 /// バックエンドから正確なバイト数を読み取りクライアントに転送
+#[allow(dead_code)]
 async fn transfer_exact_bytes_from_backend(
     backend_stream: &mut TcpStream,
     client_stream: &mut ServerTls,
