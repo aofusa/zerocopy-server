@@ -10524,76 +10524,6 @@ fn build_compressed_headers(
     new_headers
 }
 
-/// レスポンスボディを転送（圧縮なし）
-#[allow(dead_code)]
-async fn transfer_response_body(
-    backend_stream: &mut TcpStream,
-    client_stream: &mut ServerTls,
-    content_length: Option<usize>,
-    is_chunked: bool,
-    initial_body: &[u8],
-) -> u64 {
-    let mut total = 0u64;
-    
-    if let Some(cl) = content_length {
-        let remaining = cl.saturating_sub(initial_body.len());
-        if remaining > 0 {
-            let transferred = transfer_exact_bytes_from_backend(backend_stream, client_stream, remaining).await;
-            total += transferred;
-        }
-    } else if is_chunked {
-        // Chunked 転送
-        let mut decoder = ChunkedDecoder::new_unlimited();
-        decoder.feed(initial_body);
-        
-        if decoder.is_complete() {
-            return total;
-        }
-        
-        loop {
-            let read_buf = buf_get();
-            let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-            
-            let (res, mut returned_buf) = match read_result {
-                Ok(result) => result,
-                Err(_) => break,
-            };
-            
-            let n = match res {
-                Ok(0) => {
-                    buf_put(returned_buf);
-                    break;
-                }
-                Ok(n) => n,
-                Err(_) => {
-                    buf_put(returned_buf);
-                    break;
-                }
-            };
-            
-            returned_buf.set_valid_len(n);
-            let chunk = returned_buf.as_valid_slice();
-            let feed_result = decoder.feed(chunk);
-            
-            // クライアントに転送
-            let chunk_data = chunk.to_vec();
-            let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(chunk_data)).await;
-            buf_put(returned_buf);
-            
-            if !matches!(write_result, Ok((Ok(_), _))) {
-                break;
-            }
-            total += n as u64;
-            
-            if feed_result == ChunkedFeedResult::Complete {
-                break;
-            }
-        }
-    }
-    
-    total
-}
-
 /// レスポンスボディを転送（キャッシュキャプチャ対応版）
 /// 
 /// キャッシュコンテキストが指定されている場合、ボディをキャプチャしてキャッシュに保存します。
@@ -10739,52 +10669,6 @@ async fn transfer_exact_bytes_from_backend_with_cache(
     // 転送完了後にキャッシュに保存
     if let Some(ctx) = cache_ctx {
         ctx.save_to_cache();
-    }
-    
-    total
-}
-
-/// バックエンドから正確なバイト数を読み取りクライアントに転送
-#[allow(dead_code)]
-async fn transfer_exact_bytes_from_backend(
-    backend_stream: &mut TcpStream,
-    client_stream: &mut ServerTls,
-    mut remaining: usize,
-) -> u64 {
-    let mut total = 0u64;
-    
-    while remaining > 0 {
-        let read_buf = buf_get();
-        let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
-        
-        let (res, mut returned_buf) = match read_result {
-            Ok(result) => result,
-            Err(_) => break,
-        };
-        
-        let n = match res {
-            Ok(0) => {
-                buf_put(returned_buf);
-                break;
-            }
-            Ok(n) => n.min(remaining),
-            Err(_) => {
-                buf_put(returned_buf);
-                break;
-            }
-        };
-        
-        returned_buf.set_valid_len(n);
-        let chunk = returned_buf.as_valid_slice().to_vec();
-        let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(chunk)).await;
-        buf_put(returned_buf);
-        
-        if !matches!(write_result, Ok((Ok(_), _))) {
-            break;
-        }
-        
-        total += n as u64;
-        remaining = remaining.saturating_sub(n);
     }
     
     total
