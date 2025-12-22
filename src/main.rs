@@ -1609,6 +1609,77 @@ impl CompressionConfig {
     }
 }
 
+/// HTTP/3用の圧縮設定を解決
+/// 
+/// 優先順位:
+/// 1. パスごとの設定 (compression.enabled = false なら圧縮しない)
+/// 2. HTTP/3専用設定 (http3.compression_enabled + http3.compression.*)
+/// 3. パスごとのデフォルト値
+/// 
+/// # 引数
+/// * `path_compression` - パスごとの圧縮設定
+/// * `http3_config` - HTTP/3セクションの設定
+/// 
+/// # 戻り値
+/// 解決された圧縮設定
+pub fn resolve_http3_compression_config(
+    path_compression: &CompressionConfig,
+    http3_config: &Http3ConfigSection,
+) -> CompressionConfig {
+    // パスごとの設定で明示的に有効化されている場合はそれを優先
+    // （パス設定が既に有効なら、HTTP/3設定で上書きするだけ）
+    if path_compression.enabled {
+        // パス設定が有効な場合、HTTP/3専用パラメータで上書き
+        let h3_comp = &http3_config.compression;
+        return CompressionConfig {
+            enabled: true,
+            preferred_encodings: h3_comp.preferred_encodings
+                .clone()
+                .unwrap_or_else(|| path_compression.preferred_encodings.clone()),
+            gzip_level: h3_comp.gzip_level
+                .unwrap_or(path_compression.gzip_level),
+            brotli_level: h3_comp.brotli_level
+                .unwrap_or(path_compression.brotli_level),
+            min_size: h3_comp.min_size
+                .unwrap_or(path_compression.min_size),
+            compressible_types: h3_comp.compressible_types
+                .clone()
+                .unwrap_or_else(|| path_compression.compressible_types.clone()),
+            skip_types: h3_comp.skip_types
+                .clone()
+                .unwrap_or_else(|| path_compression.skip_types.clone()),
+        };
+    }
+    
+    // パスごとの設定で圧縮が無効の場合
+    // HTTP/3の compression_enabled をチェック
+    if http3_config.compression_enabled {
+        // HTTP/3で圧縮が有効化されている場合、HTTP/3専用設定を適用
+        let h3_comp = &http3_config.compression;
+        return CompressionConfig {
+            enabled: true, // HTTP/3では有効
+            preferred_encodings: h3_comp.preferred_encodings
+                .clone()
+                .unwrap_or_else(|| path_compression.preferred_encodings.clone()),
+            gzip_level: h3_comp.gzip_level
+                .unwrap_or(path_compression.gzip_level),
+            brotli_level: h3_comp.brotli_level
+                .unwrap_or(path_compression.brotli_level),
+            min_size: h3_comp.min_size
+                .unwrap_or(path_compression.min_size),
+            compressible_types: h3_comp.compressible_types
+                .clone()
+                .unwrap_or_else(|| path_compression.compressible_types.clone()),
+            skip_types: h3_comp.skip_types
+                .clone()
+                .unwrap_or_else(|| path_compression.skip_types.clone()),
+        };
+    }
+    
+    // HTTP/3圧縮も無効の場合はパス設定をそのまま使用（圧縮無効）
+    path_compression.clone()
+}
+
 /// グローバルセキュリティ設定
 #[derive(Deserialize, Clone, Debug, Default)]
 pub struct GlobalSecurityConfig {
@@ -2902,6 +2973,63 @@ impl Http2ConfigSection {
 // HTTP/3 設定セクション (RFC 9114, QUIC RFC 9000)
 // ====================
 
+/// HTTP/3 専用圧縮設定
+/// 
+/// HTTP/3接続時に使用する圧縮パラメータを設定します。
+/// 未設定のフィールドはパスごとの設定または全体設定を継承します。
+#[derive(Deserialize, Clone, Debug, Default)]
+#[serde(default)]
+pub struct Http3CompressionConfig {
+    /// 圧縮方式の優先順位
+    /// サポート: "br" (Brotli), "gzip", "deflate"
+    /// 未設定時はパスごとの設定を使用
+    pub preferred_encodings: Option<Vec<String>>,
+    
+    /// Gzip圧縮レベル (1-9)
+    /// 未設定時はパスごとの設定を使用
+    pub gzip_level: Option<u32>,
+    
+    /// Brotli圧縮レベル (0-11)
+    /// 未設定時はパスごとの設定を使用
+    pub brotli_level: Option<u32>,
+    
+    /// 最小圧縮サイズ（バイト）
+    /// 未設定時はパスごとの設定を使用
+    pub min_size: Option<usize>,
+    
+    /// 圧縮対象のMIMEタイプ（プレフィックスマッチ）
+    /// 未設定時はパスごとの設定を使用
+    pub compressible_types: Option<Vec<String>>,
+    
+    /// 圧縮をスキップするMIMEタイプ（プレフィックスマッチ）
+    /// 未設定時はパスごとの設定を使用
+    pub skip_types: Option<Vec<String>>,
+}
+
+impl Http3CompressionConfig {
+    /// 設定の妥当性を検証
+    pub fn validate(&self) -> Result<(), String> {
+        if let Some(level) = self.gzip_level {
+            if level < 1 || level > 9 {
+                return Err(format!("http3.compression.gzip_level: {} (must be 1-9)", level));
+            }
+        }
+        if let Some(level) = self.brotli_level {
+            if level > 11 {
+                return Err(format!("http3.compression.brotli_level: {} (must be 0-11)", level));
+            }
+        }
+        if let Some(ref encodings) = self.preferred_encodings {
+            for enc in encodings {
+                if !["br", "gzip", "deflate"].contains(&enc.as_str()) {
+                    return Err(format!("http3.compression.preferred_encodings: unknown encoding '{}'", enc));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 /// HTTP/3 詳細設定
 /// 
 /// HTTP/3 (QUIC) プロトコルのパラメータを設定します。
@@ -2947,6 +3075,22 @@ pub struct Http3ConfigSection {
     /// 初期最大単方向ストリーム数
     #[serde(default = "default_h3_max_streams")]
     pub initial_max_streams_uni: u64,
+    
+    /// HTTP/3接続時の圧縮を常に有効化
+    /// デフォルト: false
+    /// 
+    /// true の場合、パスごとの設定で明示的に無効化されていない限り、
+    /// すべてのHTTP/3レスポンスで圧縮を試みます。
+    /// パスごとの compression.enabled = false の場合はそちらが優先されます。
+    #[serde(default)]
+    pub compression_enabled: bool,
+    
+    /// HTTP/3専用の圧縮パラメータ
+    /// 
+    /// パスごとの圧縮設定より優先されます。
+    /// 未設定のフィールドはパスごとの設定を継承します。
+    #[serde(default)]
+    pub compression: Http3CompressionConfig,
 }
 
 fn default_h3_max_idle_timeout() -> u64 { 30000 }
@@ -2967,6 +3111,8 @@ impl Default for Http3ConfigSection {
             initial_max_stream_data_uni: default_h3_initial_max_stream_data(),
             initial_max_streams_bidi: default_h3_max_streams(),
             initial_max_streams_uni: default_h3_max_streams(),
+            compression_enabled: false,
+            compression: Http3CompressionConfig::default(),
         }
     }
 }
@@ -4237,8 +4383,7 @@ struct RuntimeConfig {
     http2_enabled: bool,
     /// HTTP/2 設定（詳細設定）
     http2_config: Http2ConfigSection,
-    /// HTTP/3 設定（ホットリロード時の参照用）
-    #[allow(dead_code)]
+    /// HTTP/3 設定（圧縮設定の解決に使用）
     http3_config: Http3ConfigSection,
 }
 

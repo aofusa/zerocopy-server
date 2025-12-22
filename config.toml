@@ -484,6 +484,27 @@ connection_window_size = 16777216
 # 初期最大単方向ストリーム数
 # initial_max_streams_uni = 100
 
+# ------------------------------------------
+# HTTP/3 専用圧縮設定
+# ------------------------------------------
+# HTTP/3接続時のみ圧縮を常に有効化できます。
+# パスごとの設定で compression.enabled = false の場合はそちらが優先されます。
+#
+# compression_enabled = true  # HTTP/3接続時は常に圧縮を有効化
+#
+# # HTTP/3専用の圧縮パラメータ（パス設定より優先）
+# [http3.compression]
+# preferred_encodings = ["br", "gzip"]  # Brotli優先
+# gzip_level = 6           # HTTP/3は帯域節約が重要なためやや高めに
+# brotli_level = 5         # Brotli圧縮レベル
+# min_size = 512           # 小さいレスポンスも圧縮（HTTP/3では効果的）
+# compressible_types = [
+#     "text/",
+#     "application/json",
+#     "application/javascript",
+#     "application/xml",
+# ]
+
 
 # ==========================================
 # Upstream グループ定義（ロードバランシング）

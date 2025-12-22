@@ -40,7 +40,7 @@ use crate::{
     Backend, SortedPathMap, SecurityConfig, UpstreamGroup, ProxyTarget,
     find_backend, check_security, SecurityCheckResult,
     encode_prometheus_metrics, record_request_metrics,
-    AcceptedEncoding, CompressionConfig,
+    AcceptedEncoding, CompressionConfig, resolve_http3_compression_config,
     CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
 
@@ -470,9 +470,18 @@ impl Http3Handler {
 
         // バックエンド処理
         let (status, resp_size) = match backend {
-            Backend::Proxy(upstream_group, _, compression) => {
+            Backend::Proxy(upstream_group, _, path_compression) => {
                 debug!("[HTTP/3] Starting proxy request to upstream group");
-                let result = self.handle_proxy(stream_id, &upstream_group, &compression, client_encoding, &method, &path, &prefix, headers, request_body)
+                
+                // HTTP/3専用圧縮設定を解決
+                // 優先順位: パス設定 > HTTP/3設定 > デフォルト
+                let config = CURRENT_CONFIG.load();
+                let effective_compression = resolve_http3_compression_config(
+                    &path_compression,
+                    &config.http3_config,
+                );
+                
+                let result = self.handle_proxy(stream_id, &upstream_group, &effective_compression, client_encoding, &method, &path, &prefix, headers, request_body)
                     .unwrap_or((502, 11));
                 debug!("[HTTP/3] Proxy request completed: status={}, size={}", result.0, result.1);
                 result
