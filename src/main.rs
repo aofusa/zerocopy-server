@@ -640,6 +640,8 @@ pub struct CacheSaveContext {
     pub max_capture_size: usize,
     /// キャプチャ中止フラグ
     pub capture_aborted: bool,
+    /// レスポンスのVaryヘッダーで指定されたヘッダー名のリスト
+    pub vary_headers: Option<Vec<String>>,
 }
 
 impl CacheSaveContext {
@@ -653,12 +655,15 @@ impl CacheSaveContext {
             status_code: 0,
             max_capture_size,
             capture_aborted: false,
+            vary_headers: None,
         }
     }
     
     /// ヘッダーを設定
     #[inline]
     pub fn set_headers(&mut self, headers: Vec<(Box<[u8]>, Box<[u8]>)>, status_code: u16) {
+        // Varyヘッダーを抽出
+        self.vary_headers = cache::CachePolicy::parse_vary(&headers);
         self.captured_headers = headers;
         self.status_code = status_code;
     }
@@ -689,17 +694,18 @@ impl CacheSaveContext {
         }
         
         if let Some(cache_manager) = cache::get_global_cache() {
-            let stored = cache_manager.store(
+            let stored = cache_manager.store_with_vary(
                 self.key.clone(),
                 self.status_code,
                 self.captured_headers.clone(),
                 self.captured_body.clone(),
+                self.vary_headers.clone(),
             );
             
             if stored {
                 record_cache_store(&self.host, "memory");
-                debug!("Cached response for {} (status={}, size={})", 
-                       self.host, self.status_code, self.captured_body.len());
+                debug!("Cached response for {} (status={}, size={}, vary={:?})", 
+                       self.host, self.status_code, self.captured_body.len(), self.vary_headers);
             }
             
             stored
@@ -9603,9 +9609,21 @@ async fn handle_proxy(
     if cache_config.enabled {
         // キャッシュ対象かチェック
         if cache_config.is_cacheable_method(method) && !cache_config.should_bypass(path_str) {
-            // キャッシュキー生成
+            // キャッシュキー生成（key_headers を使用）
             let query = path_str.find('?').map(|i| &path_str[i+1..]);
             let path_only = path_str.find('?').map(|i| &path_str[..i]).unwrap_or(path_str);
+            
+            // key_headers からVaryキー用のヘッダー値を抽出
+            let vary_key_headers = if !cache_config.key_headers.is_empty() {
+                let extracted = extract_vary_headers_for_cache_key(headers, &cache_config.key_headers);
+                if extracted.is_empty() {
+                    None
+                } else {
+                    Some(extracted)
+                }
+            } else {
+                None
+            };
             
             if let Some(cache_key) = cache::CacheKey::from_request(
                 method,
@@ -9613,7 +9631,7 @@ async fn handle_proxy(
                 path_only,
                 query,
                 cache_config.include_query,
-                None, // Varyヘッダーは初回リクエストでは不明
+                vary_key_headers.as_deref(), // key_headers に基づくVaryキー
             ) {
                 // グローバルキャッシュからエントリを取得
                 if let Some(cache_manager) = cache::get_global_cache() {
@@ -9646,6 +9664,25 @@ async fn handle_proxy(
                                     let client_etag_str = std::str::from_utf8(client_etag).unwrap_or("");
                                     if etag_matches(client_etag_str, cached_etag) {
                                         debug!("ETag match, returning 304 Not Modified");
+                                        let response = build_304_response(&cached_entry, client_wants_close, is_stale);
+                                        match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
+                                            Ok((Ok(_), _)) => {
+                                                return Some((client_stream, 304, 0, client_wants_close));
+                                            }
+                                            _ => {
+                                                return None;
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                            
+                            // If-Modified-Since 検証（304レスポンス）
+                            if let Some(client_ims) = cache::CachePolicy::get_if_modified_since(headers) {
+                                if let Some(ref cached_lm) = cached_entry.last_modified {
+                                    let client_ims_str = std::str::from_utf8(client_ims).unwrap_or("");
+                                    if last_modified_matches(client_ims_str, cached_lm) {
+                                        debug!("If-Modified-Since match, returning 304 Not Modified");
                                         let response = build_304_response(&cached_entry, client_wants_close, is_stale);
                                         match timeout(WRITE_TIMEOUT, client_stream.write_all(response)).await {
                                             Ok((Ok(_), _)) => {
@@ -9716,13 +9753,25 @@ async fn handle_proxy(
         let query = path_str.find('?').map(|i| &path_str[i+1..]);
         let path_only = path_str.find('?').map(|i| &path_str[..i]).unwrap_or(path_str);
         
+        // key_headers からVaryキー用のヘッダー値を抽出（保存時も同じキーを使用）
+        let vary_key_headers = if !cache_config.key_headers.is_empty() {
+            let extracted = extract_vary_headers_for_cache_key(headers, &cache_config.key_headers);
+            if extracted.is_empty() {
+                None
+            } else {
+                Some(extracted)
+            }
+        } else {
+            None
+        };
+        
         if let Some(cache_key) = cache::CacheKey::from_request(
             method,
             host_str,
             path_only,
             query,
             cache_config.include_query,
-            None,
+            vary_key_headers.as_deref(), // key_headers に基づくVaryキー
         ) {
             // キャッシュ保存用コンテキストを作成
             let max_capture = cache_config.max_memory_size.min(10 * 1024 * 1024); // 最大10MB
@@ -10305,6 +10354,47 @@ fn etag_matches(client_etag: &str, cached_etag: &str) -> bool {
     false
 }
 
+/// If-Modified-Since 検証
+/// 
+/// クライアントのIf-Modified-SinceとキャッシュのLast-Modifiedを比較
+#[inline]
+fn last_modified_matches(client_ims: &str, cached_lm: &str) -> bool {
+    // RFC 7232: If-Modified-Since は Last-Modified と同じ場合に 304 を返す
+    // 日付比較は複雑なので、文字列完全一致で簡易判定
+    // より正確な日付比較が必要な場合は chrono クレートを使用
+    client_ims.trim() == cached_lm.trim()
+}
+
+/// key_headersに基づいてリクエストヘッダーからVaryキー用の値を抽出
+/// 
+/// # Arguments
+/// * `request_headers` - リクエストヘッダー
+/// * `key_header_names` - キャッシュキーに含めるヘッダー名のリスト
+/// 
+/// # Returns
+/// (ヘッダー名, ヘッダー値) のペアのリスト
+fn extract_vary_headers_for_cache_key<'a>(
+    request_headers: &'a [(Box<[u8]>, Box<[u8]>)],
+    key_header_names: &'a [String],
+) -> Vec<(&'a str, &'a str)> {
+    let mut result = Vec::new();
+    
+    for key_header in key_header_names {
+        for (name, value) in request_headers {
+            if let Ok(name_str) = std::str::from_utf8(name) {
+                if name_str.eq_ignore_ascii_case(key_header) {
+                    if let Ok(value_str) = std::str::from_utf8(value) {
+                        result.push((key_header.as_str(), value_str));
+                        break; // 最初にマッチしたものを使用
+                    }
+                }
+            }
+        }
+    }
+    
+    result
+}
+
 /// 304 Not Modified レスポンスを構築
 fn build_304_response(cached_entry: &cache::CacheEntry, client_wants_close: bool, is_stale: bool) -> Vec<u8> {
     let mut response = Vec::with_capacity(256);
@@ -10547,56 +10637,115 @@ async fn proxy_http_request_buffered(
     match buffered {
         Some((status_code, headers_data, body_result, backend_wants_keep_alive)) => {
             // 5. バッファからクライアントへ送信
-            // ヘッダー送信
-            let write_result = timeout(
-                Duration::from_secs(buffering_config.client_write_timeout_secs),
-                client_stream.write_all(headers_data.clone())
-            ).await;
+            let mut total = 0u64;
             
-            if !matches!(write_result, Ok((Ok(_), _))) {
-                // ディスクファイルがあればクリーンアップ
-                if let BufferedBodyResult::Disk { ref path, .. } = body_result {
-                    let _ = std::fs::remove_file(path);
-                }
-                return Some((status_code, 0, false));
-            }
-            
-            let mut total = headers_data.len() as u64;
-            
-            // ボディ送信（メモリまたはディスクから）
-            match body_result {
-                BufferedBodyResult::Memory(body_data) => {
-                    if !body_data.is_empty() {
+            // buffer_headers の設定に応じてヘッダーとボディを送信
+            if buffering_config.buffer_headers {
+                // buffer_headers = true: ヘッダーとボディを結合して送信（デフォルト動作）
+                // これにより、クライアントへの書き込み回数を削減
+                match body_result {
+                    BufferedBodyResult::Memory(body_data) => {
+                        // ヘッダーとボディを結合
+                        let mut combined = headers_data.clone();
+                        combined.extend_from_slice(&body_data);
+                        
                         let write_result = timeout(
                             Duration::from_secs(buffering_config.client_write_timeout_secs),
-                            client_stream.write_all(body_data.clone())
+                            client_stream.write_all(combined.clone())
+                        ).await;
+                        
+                        if matches!(write_result, Ok((Ok(_), _))) {
+                            total = combined.len() as u64;
+                        }
+                    }
+                    BufferedBodyResult::Disk { path, size } => {
+                        // ヘッダーを先に送信
+                        let write_result = timeout(
+                            Duration::from_secs(buffering_config.client_write_timeout_secs),
+                            client_stream.write_all(headers_data.clone())
                         ).await;
                         
                         if !matches!(write_result, Ok((Ok(_), _))) {
-                            return Some((status_code, total, false));
+                            let _ = std::fs::remove_file(&path);
+                            return Some((status_code, 0, false));
                         }
                         
-                        total += body_data.len() as u64;
+                        total = headers_data.len() as u64;
+                        
+                        // ディスクから読み込んでクライアントに送信
+                        match send_disk_buffer_to_client(client_stream, &path, size, buffering_config.client_write_timeout_secs).await {
+                            Some(sent) => {
+                                total += sent;
+                            }
+                            None => {
+                                let _ = std::fs::remove_file(&path);
+                                return Some((status_code, total, false));
+                            }
+                        }
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    BufferedBodyResult::Failed => {
+                        // ヘッダーのみ送信
+                        let write_result = timeout(
+                            Duration::from_secs(buffering_config.client_write_timeout_secs),
+                            client_stream.write_all(headers_data.clone())
+                        ).await;
+                        if matches!(write_result, Ok((Ok(_), _))) {
+                            total = headers_data.len() as u64;
+                        }
+                        return Some((status_code, total, false));
                     }
                 }
-                BufferedBodyResult::Disk { path, size } => {
-                    // ディスクから読み込んでクライアントに送信
-                    match send_disk_buffer_to_client(client_stream, &path, size, buffering_config.client_write_timeout_secs).await {
-                        Some(sent) => {
-                            total += sent;
-                        }
-                        None => {
-                            // 送信失敗、クリーンアップ
-                            let _ = std::fs::remove_file(&path);
-                            return Some((status_code, total, false));
+            } else {
+                // buffer_headers = false: ヘッダーを先に送信し、ボディは別途送信
+                // ヘッダー送信
+                let write_result = timeout(
+                    Duration::from_secs(buffering_config.client_write_timeout_secs),
+                    client_stream.write_all(headers_data.clone())
+                ).await;
+                
+                if !matches!(write_result, Ok((Ok(_), _))) {
+                    // ディスクファイルがあればクリーンアップ
+                    if let BufferedBodyResult::Disk { ref path, .. } = body_result {
+                        let _ = std::fs::remove_file(path);
+                    }
+                    return Some((status_code, 0, false));
+                }
+                
+                total = headers_data.len() as u64;
+                
+                // ボディ送信（メモリまたはディスクから）
+                match body_result {
+                    BufferedBodyResult::Memory(body_data) => {
+                        if !body_data.is_empty() {
+                            let write_result = timeout(
+                                Duration::from_secs(buffering_config.client_write_timeout_secs),
+                                client_stream.write_all(body_data.clone())
+                            ).await;
+                            
+                            if !matches!(write_result, Ok((Ok(_), _))) {
+                                return Some((status_code, total, false));
+                            }
+                            
+                            total += body_data.len() as u64;
                         }
                     }
-                    // 成功後クリーンアップ
-                    let _ = std::fs::remove_file(&path);
-                }
-                BufferedBodyResult::Failed => {
-                    // バッファリング失敗
-                    return Some((status_code, total, false));
+                    BufferedBodyResult::Disk { path, size } => {
+                        // ディスクから読み込んでクライアントに送信
+                        match send_disk_buffer_to_client(client_stream, &path, size, buffering_config.client_write_timeout_secs).await {
+                            Some(sent) => {
+                                total += sent;
+                            }
+                            None => {
+                                let _ = std::fs::remove_file(&path);
+                                return Some((status_code, total, false));
+                            }
+                        }
+                        let _ = std::fs::remove_file(&path);
+                    }
+                    BufferedBodyResult::Failed => {
+                        return Some((status_code, total, false));
+                    }
                 }
             }
             
@@ -10745,6 +10894,13 @@ async fn buffer_response_body_with_spillover(
             if body.len() + remaining > buffering_config.max_memory_buffer {
                 // ディスクスピルオーバー
                 if let Some(ref disk_path) = buffering_config.disk_buffer_path {
+                    // max_disk_buffer 制限チェック
+                    if cl > buffering_config.max_disk_buffer {
+                        warn!("Response size {} exceeds max_disk_buffer {}, aborting buffer", 
+                              cl, buffering_config.max_disk_buffer);
+                        return BufferedBodyResult::Failed;
+                    }
+                    
                     debug!("Response size exceeds memory limit, spilling to disk");
                     
                     // まず残りのデータをメモリに読み込み
@@ -10802,7 +10958,18 @@ async fn buffer_response_body_with_spillover(
                     
                     // 残りを読み込み続ける
                     let mut overflow = Vec::new();
+                    let max_disk = buffering_config.max_disk_buffer;
+                    let mut total_size = body.len();
+                    let mut size_exceeded = false;
+                    
                     loop {
+                        // max_disk_buffer 制限チェック
+                        if total_size > max_disk {
+                            warn!("Chunked response exceeds max_disk_buffer {}, aborting buffer", max_disk);
+                            size_exceeded = true;
+                            break;
+                        }
+                        
                         let read_buf = buf_get();
                         let read_result = timeout(READ_TIMEOUT, backend_stream.read(read_buf)).await;
                         
@@ -10832,11 +10999,16 @@ async fn buffer_response_body_with_spillover(
                         }
                         
                         overflow.extend_from_slice(chunk);
+                        total_size += n;
                         buf_put(returned_buf);
                         
                         if feed_result == ChunkedFeedResult::Complete {
                             break;
                         }
+                    }
+                    
+                    if size_exceeded {
+                        return BufferedBodyResult::Failed;
                     }
                     
                     // 全体をディスクに書き込み

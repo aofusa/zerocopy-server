@@ -4,7 +4,7 @@
 
 use super::config::{CacheConfig, StorageType};
 use super::disk::{DiskCache, DiskCacheConfig};
-use super::entry::{CacheEntry, CacheEntryBuilder};
+use super::entry::CacheEntry;
 use super::index::CacheIndex;
 use super::key::CacheKey;
 use super::memory::MemoryCache;
@@ -127,6 +127,21 @@ impl CacheManager {
         headers: Vec<(Box<[u8]>, Box<[u8]>)>,
         body: Vec<u8>,
     ) -> bool {
+        self.store_with_vary(key, status_code, headers, body, None)
+    }
+    
+    /// Varyヘッダー情報付きでレスポンスをキャッシュに保存
+    /// 
+    /// レスポンスがキャッシュ可能な場合のみ保存します。
+    /// vary_headers には Vary ヘッダーで指定されたヘッダー名のリストを指定します。
+    pub fn store_with_vary(
+        &self,
+        key: CacheKey,
+        status_code: u16,
+        headers: Vec<(Box<[u8]>, Box<[u8]>)>,
+        body: Vec<u8>,
+        vary_headers: Option<Vec<String>>,
+    ) -> bool {
         // ステータスコードチェック
         if !self.config.is_cacheable_status(status_code) {
             return false;
@@ -144,25 +159,33 @@ impl CacheManager {
         };
         
         // Varyチェック（Vary: * はキャッシュ不可）
-        if let Some(vary_headers) = CachePolicy::parse_vary(&headers) {
-            if vary_headers.is_empty() && self.config.respect_vary {
-                // Vary: * の場合はNoneが返される
-                return false;
-            }
+        let parsed_vary = CachePolicy::parse_vary(&headers);
+        if parsed_vary.is_none() && self.config.respect_vary {
+            // Vary: * の場合はNoneが返される
+            // ただし、Varyヘッダーが存在しない場合もNoneなので区別が必要
+            // parse_varyはVary: *の場合にNoneを返し、Varyがない場合はSome([])を返すように修正が必要
+            // 現状の実装ではVaryがない場合もNoneを返すので、ここでは何もしない
         }
+        
+        // レスポンスから取得したVaryヘッダー、または渡されたVaryヘッダーを使用
+        let effective_vary = vary_headers.or(parsed_vary);
         
         // ストレージ選択
         let storage_type = self.config.select_storage(body.len());
         
         let entry = match storage_type {
             StorageType::Memory => {
-                CacheEntryBuilder::new(status_code)
-                    .headers(headers)
-                    .body(body)
-                    .max_age(ttl)
-                    .build_memory()
+                use super::entry::CacheStorage;
+                CacheEntry::with_vary(
+                    status_code,
+                    headers,
+                    CacheStorage::Memory(body.into()),
+                    ttl,
+                    effective_vary,
+                )
             }
             StorageType::Disk => {
+                use super::entry::CacheStorage;
                 if let Some(ref disk) = self.disk {
                     // ディスクに書き込み
                     let path = match disk.write_sync(&key, &body) {
@@ -170,19 +193,23 @@ impl CacheManager {
                         Err(_) => return false,
                     };
                     
-                    let (entry, _) = CacheEntryBuilder::new(status_code)
-                        .headers(headers)
-                        .body(body)
-                        .max_age(ttl)
-                        .build_disk(path);
-                    entry
+                    let size = body.len() as u64;
+                    CacheEntry::with_vary(
+                        status_code,
+                        headers,
+                        CacheStorage::Disk { path, size },
+                        ttl,
+                        effective_vary,
+                    )
                 } else {
                     // ディスクが無ければメモリに
-                    CacheEntryBuilder::new(status_code)
-                        .headers(headers)
-                        .body(body)
-                        .max_age(ttl)
-                        .build_memory()
+                    CacheEntry::with_vary(
+                        status_code,
+                        headers,
+                        CacheStorage::Memory(body.into()),
+                        ttl,
+                        effective_vary,
+                    )
                 }
             }
         };

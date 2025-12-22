@@ -29,6 +29,9 @@ pub struct CacheEntry {
     pub content_encoding: Option<Box<str>>,
     /// ボディサイズ
     pub body_size: u64,
+    /// Varyヘッダーで指定されたヘッダー名のリスト
+    /// キャッシュ取得時に同じヘッダー値のリクエストにのみ一致
+    pub vary_headers: Option<Arc<[Box<str>]>>,
 }
 
 impl CacheEntry {
@@ -38,6 +41,17 @@ impl CacheEntry {
         headers: Vec<(Box<[u8]>, Box<[u8]>)>,
         storage: CacheStorage,
         max_age_secs: u64,
+    ) -> Self {
+        Self::with_vary(status_code, headers, storage, max_age_secs, None)
+    }
+    
+    /// Varyヘッダー情報を含めてエントリを作成
+    pub fn with_vary(
+        status_code: u16,
+        headers: Vec<(Box<[u8]>, Box<[u8]>)>,
+        storage: CacheStorage,
+        max_age_secs: u64,
+        vary_headers: Option<Vec<String>>,
     ) -> Self {
         let body_size = storage.size();
         
@@ -67,6 +81,14 @@ impl CacheEntry {
             }
         }
         
+        // Varyヘッダーリストを変換
+        let vary_headers_arc = vary_headers.map(|v| {
+            v.into_iter()
+                .map(|s| s.into_boxed_str())
+                .collect::<Vec<_>>()
+                .into()
+        });
+        
         Self {
             status_code,
             headers: headers.into(),
@@ -78,6 +100,7 @@ impl CacheEntry {
             content_type,
             content_encoding,
             body_size,
+            vary_headers: vary_headers_arc,
         }
     }
     
@@ -154,7 +177,20 @@ impl CacheEntry {
             size += s.len();
         }
         
+        // Varyヘッダーサイズ
+        if let Some(vary) = &self.vary_headers {
+            for s in vary.iter() {
+                size += s.len();
+            }
+        }
+        
         size
+    }
+    
+    /// Varyヘッダーリストを取得
+    #[inline]
+    pub fn vary_headers(&self) -> Option<&[Box<str>]> {
+        self.vary_headers.as_deref()
     }
 }
 
