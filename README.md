@@ -1,9 +1,15 @@
 [English](README.md) | [日本語](README.ja.md)
 
-<p align="center">
-  <img src="docs/images/veil_logo.webp" alt="Veil Logo" width="200" />
-  <img src="docs/images/veil_logo_text.svg" alt="Veil" height="120" style="vertical-align: middle;" />
-</p>
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="docs/images/veil_logo.webp" alt="Veil Logo" width="150" />
+    </td>
+    <td align="center">
+      <img src="docs/images/veil_logo_text.svg" alt="Veil" height="100" />
+    </td>
+  </tr>
+</table>
 
 # Veil - High-Performance Reverse Proxy Server
 
@@ -2125,23 +2131,24 @@ In this configuration, systemd creates the outer "container" and bubblewrap prov
 
 ## Logos
 
-### Main Logo (WebP)
-
-<p align="center">
-  <img src="docs/images/veil_logo.webp" alt="Veil Main Logo" width="400" />
-</p>
-
-### Alternative Logo (SVG)
-
-<p align="center">
-  <img src="docs/images/veil_logo_alternative.svg" alt="Veil Alternative Logo" width="400" />
-</p>
-
-### Logo Text (SVG)
-
-<p align="center">
-  <img src="docs/images/veil_logo_text.svg" alt="Veil Logo Text" width="400" />
-</p>
+<table align="center">
+  <tr>
+    <th align="center">Main Logo (WebP)</th>
+    <th align="center">Alternative Logo (SVG)</th>
+    <th align="center">Logo Text (SVG)</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/veil_logo.webp" alt="Veil Main Logo" width="200" />
+    </td>
+    <td align="center">
+      <img src="docs/images/veil_logo_alternative.svg" alt="Veil Alternative Logo" width="200" />
+    </td>
+    <td align="center">
+      <img src="docs/images/veil_logo_text.svg" alt="Veil Logo Text" width="200" />
+    </td>
+  </tr>
+</table>
 
 ## License
 

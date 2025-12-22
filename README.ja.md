@@ -1,9 +1,15 @@
 [English](README.md) | [日本語](README.ja.md)
 
-<p align="center">
-  <img src="docs/images/veil_logo.webp" alt="Veil ロゴ" width="200" />
-  <img src="docs/images/veil_logo_text.svg" alt="Veil" height="120" style="vertical-align: middle;" />
-</p>
+<table align="center">
+  <tr>
+    <td align="center">
+      <img src="docs/images/veil_logo.webp" alt="Veil ロゴ" width="150" />
+    </td>
+    <td align="center">
+      <img src="docs/images/veil_logo_text.svg" alt="Veil" height="100" />
+    </td>
+  </tr>
+</table>
 
 # Veil - High-Performance Reverse Proxy Server
 
@@ -2125,23 +2131,24 @@ ExecStart=/usr/bin/bwrap \
 
 ## ロゴ
 
-### メインロゴ (WebP)
-
-<p align="center">
-  <img src="docs/images/veil_logo.webp" alt="Veil メインロゴ" width="400" />
-</p>
-
-### 代替ロゴ (SVG)
-
-<p align="center">
-  <img src="docs/images/veil_logo_alternative.svg" alt="Veil 代替ロゴ" width="400" />
-</p>
-
-### ロゴ文字 (SVG)
-
-<p align="center">
-  <img src="docs/images/veil_logo_text.svg" alt="Veil ロゴ文字" width="400" />
-</p>
+<table align="center">
+  <tr>
+    <th align="center">メインロゴ (WebP)</th>
+    <th align="center">代替ロゴ (SVG)</th>
+    <th align="center">ロゴ文字 (SVG)</th>
+  </tr>
+  <tr>
+    <td align="center">
+      <img src="docs/images/veil_logo.webp" alt="Veil メインロゴ" width="200" />
+    </td>
+    <td align="center">
+      <img src="docs/images/veil_logo_alternative.svg" alt="Veil 代替ロゴ" width="200" />
+    </td>
+    <td align="center">
+      <img src="docs/images/veil_logo_text.svg" alt="Veil ロゴ文字" width="200" />
+    </td>
+  </tr>
+</table>
 
 ## ライセンス
 
