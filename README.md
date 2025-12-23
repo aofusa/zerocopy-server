@@ -1686,6 +1686,172 @@ cargo build --release --features ktls
 wrk -t4 -c100 -d30s https://localhost/
 ```
 
+## Testing
+
+Veil includes comprehensive test suites covering unit tests, integration tests, and end-to-end (E2E) tests.
+
+### Test Overview
+
+| Test Type | Count | Status |
+|-----------|-------|--------|
+| **Unit Tests** | 251 | ✅ All passing |
+| **Integration Tests** | 13 | ✅ All passing |
+| **E2E Tests** | 24 | ✅ All passing |
+| **Benchmarks** | 2 files | ✅ Ready |
+
+**Total: 288 tests - All passing ✅**
+
+### Running Tests
+
+#### Unit Tests
+
+```bash
+# Run all unit tests
+cargo test --features http2
+
+# Run specific test module
+cargo test --features http2 tests::rate_limit_tests
+
+# Run with output
+cargo test --features http2 -- --nocapture
+```
+
+#### Integration Tests
+
+```bash
+# Run integration tests
+cargo test --test integration_tests --features http2
+```
+
+#### E2E Tests
+
+E2E tests require a running test environment. Use the setup script:
+
+```bash
+# Method 1: Automated (recommended)
+./tests/e2e_setup.sh test
+
+# Method 2: Manual
+./tests/e2e_setup.sh start
+cargo test --test e2e_tests --features http2 -- --test-threads=1
+./tests/e2e_setup.sh stop
+
+# Cleanup only
+./tests/e2e_setup.sh clean
+```
+
+#### Benchmarks
+
+```bash
+# Start E2E environment
+./tests/e2e_setup.sh start
+
+# Run all benchmarks
+cargo bench --features http2
+
+# Run specific benchmark
+cargo bench --bench throughput --features http2
+cargo bench --bench latency --features http2
+
+# Stop environment
+./tests/e2e_setup.sh stop
+
+# Or use automated script
+./tests/run_bench.sh          # All benchmarks
+./tests/run_bench.sh throughput  # Throughput only
+./tests/run_bench.sh latency     # Latency only
+```
+
+### Test Coverage
+
+#### Unit Tests (251 tests)
+
+- **CIDR/IP Filtering**: IP address filtering, CIDR range validation
+- **Rate Limiting**: Sliding window rate limiting, entry management
+- **Configuration Parsing**: TOML parsing, default values
+- **Load Balancing**: Round Robin, Least Connections, IP Hash algorithms
+- **Health Checks**: Server state management, success/failure counting
+- **Connection Pooling**: Pool management, timeout validation
+- **Cache Management**: Memory/disk cache, key generation
+- **HTTP/2**: Frame encoding/decoding, HPACK compression
+- **Security**: Security configuration, kernel version detection
+- **Utilities**: Various helper functions
+
+#### Integration Tests (13 tests)
+
+- TCP connection handling
+- HTTP server responses
+- Multiple server coordination
+- Dynamic port allocation
+- TLS certificate generation
+- Configuration file generation
+- Port availability utilities
+
+#### E2E Tests (24 tests)
+
+- **Proxy Core**: Basic requests, health endpoints
+- **Header Manipulation**: Add/remove headers, backend ID
+- **Load Balancing**: Round Robin distribution
+- **Static File Serving**: Index files, large files
+- **Compression**: gzip, brotli, priority handling
+- **Backend Access**: Direct backend connections
+- **Prometheus**: Metrics endpoint
+- **Error Handling**: 404 responses
+- **HTTP Redirect**: HTTP to HTTPS redirect
+- **Concurrency**: Concurrent and sequential requests
+- **Performance**: Response time validation
+- **Content Types**: HTML, JSON handling
+- **Keep-Alive**: Persistent connections
+- **Custom Headers**: User-Agent, Host headers
+
+### Environment Cleanup
+
+All test environments are automatically cleaned up:
+
+- **Rust Drop Traits**: Server structs automatically terminate on scope exit
+- **Shell Script Traps**: Cleanup on success, failure, or interruption
+- **Graceful Shutdown**: SIGTERM → wait → SIGKILL staged termination
+- **Process Cleanup**: Automatic cleanup of remaining processes
+
+The cleanup mechanism ensures a clean state after test execution, regardless of test outcome.
+
+### Test Files Structure
+
+```
+veil-proxy/
+├── src/
+│   ├── main.rs          # 103 unit tests
+│   ├── security.rs      # 26 unit tests
+│   ├── cache/           # 50+ unit tests
+│   ├── http2/           # 30+ unit tests
+│   └── ...
+├── tests/
+│   ├── integration_tests.rs  # 13 integration tests
+│   ├── e2e_tests.rs          # 24 E2E tests
+│   ├── e2e_setup.sh         # E2E environment setup
+│   ├── run_bench.sh         # Benchmark automation
+│   └── common/
+│       └── mod.rs            # Test utilities
+└── benches/
+    ├── throughput.rs    # Throughput benchmarks
+    └── latency.rs       # Latency benchmarks
+```
+
+### Continuous Integration
+
+For CI/CD pipelines:
+
+```yaml
+# Example GitHub Actions workflow
+- name: Run tests
+  run: |
+    cargo test --features http2 --all-targets
+    
+- name: Run E2E tests
+  run: |
+    ./tests/e2e_setup.sh test
+```
+
 ## Graceful Shutdown
 
 When receiving SIGINT (Ctrl+C) or SIGTERM, the server terminates safely:

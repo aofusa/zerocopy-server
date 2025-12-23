@@ -1686,6 +1686,172 @@ cargo build --release --features ktls
 wrk -t4 -c100 -d30s https://localhost/
 ```
 
+## テスト
+
+Veilには、ユニットテスト、統合テスト、エンドツーエンド（E2E）テストを含む包括的なテストスイートが含まれています。
+
+### テスト概要
+
+| テスト種別 | テスト数 | 状態 |
+|-----------|---------|------|
+| **ユニットテスト** | 251 | ✅ すべて成功 |
+| **統合テスト** | 13 | ✅ すべて成功 |
+| **E2Eテスト** | 24 | ✅ すべて成功 |
+| **ベンチマーク** | 2ファイル | ✅ 準備完了 |
+
+**合計: 288テスト - すべて成功 ✅**
+
+### テストの実行
+
+#### ユニットテスト
+
+```bash
+# すべてのユニットテストを実行
+cargo test --features http2
+
+# 特定のテストモジュールを実行
+cargo test --features http2 tests::rate_limit_tests
+
+# 出力付きで実行
+cargo test --features http2 -- --nocapture
+```
+
+#### 統合テスト
+
+```bash
+# 統合テストを実行
+cargo test --test integration_tests --features http2
+```
+
+#### E2Eテスト
+
+E2Eテストは実行中のテスト環境が必要です。セットアップスクリプトを使用してください：
+
+```bash
+# 方法1: 自動実行（推奨）
+./tests/e2e_setup.sh test
+
+# 方法2: 手動実行
+./tests/e2e_setup.sh start
+cargo test --test e2e_tests --features http2 -- --test-threads=1
+./tests/e2e_setup.sh stop
+
+# クリーンアップのみ
+./tests/e2e_setup.sh clean
+```
+
+#### ベンチマーク
+
+```bash
+# E2E環境を起動
+./tests/e2e_setup.sh start
+
+# すべてのベンチマークを実行
+cargo bench --features http2
+
+# 特定のベンチマークを実行
+cargo bench --bench throughput --features http2
+cargo bench --bench latency --features http2
+
+# 環境を停止
+./tests/e2e_setup.sh stop
+
+# または自動化スクリプトを使用
+./tests/run_bench.sh              # すべてのベンチマーク
+./tests/run_bench.sh throughput   # スループットのみ
+./tests/run_bench.sh latency      # レイテンシのみ
+```
+
+### テストカバレッジ
+
+#### ユニットテスト (251テスト)
+
+- **CIDR/IPフィルタリング**: IPアドレスフィルタリング、CIDR範囲検証
+- **レート制限**: スライディングウィンドウレート制限、エントリ管理
+- **設定パース**: TOMLパース、デフォルト値
+- **ロードバランシング**: Round Robin、Least Connections、IP Hashアルゴリズム
+- **ヘルスチェック**: サーバー状態管理、成功/失敗カウント
+- **コネクションプール**: プール管理、タイムアウト検証
+- **キャッシュ管理**: メモリ/ディスクキャッシュ、キー生成
+- **HTTP/2**: フレームエンコード/デコード、HPACK圧縮
+- **セキュリティ**: セキュリティ設定、カーネルバージョン検出
+- **ユーティリティ**: 各種ヘルパー関数
+
+#### 統合テスト (13テスト)
+
+- TCP接続処理
+- HTTPサーバーレスポンス
+- 複数サーバー連携
+- 動的ポート割り当て
+- TLS証明書生成
+- 設定ファイル生成
+- ポート可用性ユーティリティ
+
+#### E2Eテスト (24テスト)
+
+- **プロキシコア**: 基本リクエスト、ヘルスエンドポイント
+- **ヘッダー操作**: ヘッダーの追加/削除、バックエンドID
+- **ロードバランシング**: Round Robin分散
+- **静的ファイル配信**: インデックスファイル、大容量ファイル
+- **圧縮**: gzip、brotli、優先順位処理
+- **バックエンドアクセス**: 直接バックエンド接続
+- **Prometheus**: メトリクスエンドポイント
+- **エラーハンドリング**: 404レスポンス
+- **HTTPリダイレクト**: HTTPからHTTPSへのリダイレクト
+- **並行性**: 並行および順次リクエスト
+- **パフォーマンス**: レスポンスタイム検証
+- **Content-Type**: HTML、JSON処理
+- **Keep-Alive**: 持続接続
+- **カスタムヘッダー**: User-Agent、Hostヘッダー
+
+### 環境クリーンアップ
+
+すべてのテスト環境は自動的にクリーンアップされます：
+
+- **Rust Dropトレイト**: サーバー構造体がスコープを抜けると自動終了
+- **シェルスクリプトのtrap**: 成功/失敗/中断時にクリーンアップ
+- **Graceful Shutdown**: SIGTERM → 待機 → SIGKILLの段階的終了
+- **プロセスクリーンアップ**: 残存プロセスの自動クリーンアップ
+
+クリーンアップ機構により、テスト結果に関わらず、テスト実行後にクリーンな状態が保証されます。
+
+### テストファイル構造
+
+```
+veil-proxy/
+├── src/
+│   ├── main.rs          # 103ユニットテスト
+│   ├── security.rs      # 26ユニットテスト
+│   ├── cache/           # 50+ユニットテスト
+│   ├── http2/           # 30+ユニットテスト
+│   └── ...
+├── tests/
+│   ├── integration_tests.rs  # 13統合テスト
+│   ├── e2e_tests.rs          # 24 E2Eテスト
+│   ├── e2e_setup.sh          # E2E環境セットアップ
+│   ├── run_bench.sh          # ベンチマーク自動化
+│   └── common/
+│       └── mod.rs            # テストユーティリティ
+└── benches/
+    ├── throughput.rs    # スループットベンチマーク
+    └── latency.rs       # レイテンシベンチマーク
+```
+
+### 継続的インテグレーション
+
+CI/CDパイプライン用の例：
+
+```yaml
+# GitHub Actionsワークフローの例
+- name: テストを実行
+  run: |
+    cargo test --features http2 --all-targets
+    
+- name: E2Eテストを実行
+  run: |
+    ./tests/e2e_setup.sh test
+```
+
 ## Graceful Shutdown
 
 SIGINT（Ctrl+C）またはSIGTERMを受信すると、サーバーは安全に終了します：
