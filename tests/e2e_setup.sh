@@ -245,19 +245,54 @@ start_servers() {
 stop_servers() {
     if [ -f "$PIDS_FILE" ]; then
         log_info "Stopping servers..."
+        
+        # まず SIGTERM で graceful shutdown を試みる
         while read -r pid; do
             if kill -0 "$pid" 2>/dev/null; then
-                kill "$pid" 2>/dev/null || true
-                log_info "Stopped process $pid"
+                kill -TERM "$pid" 2>/dev/null || true
+                log_info "Sent SIGTERM to process $pid"
             fi
         done < "$PIDS_FILE"
+        
+        # プロセス終了を待機（最大5秒）
+        sleep 1
+        local wait_count=0
+        while [ $wait_count -lt 5 ]; do
+            local still_running=false
+            while read -r pid; do
+                if kill -0 "$pid" 2>/dev/null; then
+                    still_running=true
+                    break
+                fi
+            done < "$PIDS_FILE"
+            
+            if [ "$still_running" = false ]; then
+                break
+            fi
+            
+            sleep 1
+            wait_count=$((wait_count + 1))
+        done
+        
+        # まだ残っていれば SIGKILL で強制終了
+        while read -r pid; do
+            if kill -0 "$pid" 2>/dev/null; then
+                log_warn "Force killing process $pid"
+                kill -9 "$pid" 2>/dev/null || true
+            fi
+        done < "$PIDS_FILE"
+        
         rm -f "$PIDS_FILE"
+        log_info "All server processes stopped"
     else
         log_warn "No PID file found"
     fi
     
-    # 残存プロセスを強制終了
+    # 残存プロセスを強制終了（安全策）
     pkill -f "veil.*fixtures" 2>/dev/null || true
+    
+    # ポートが解放されるのを待機
+    sleep 1
 }
 
 # ヘルスチェック
@@ -334,14 +369,28 @@ case "${1:-}" in
         health_check
         ;;
     test)
+        # テスト終了時（成功・失敗問わず）に必ずサーバーを停止
+        trap 'stop_servers' EXIT
+        
         ensure_veil_binary
         prepare_fixtures
         generate_configs
         start_servers
         sleep 2
-        health_check
+        
+        if ! health_check; then
+            log_error "Health check failed, stopping servers"
+            exit 1
+        fi
+        
+        # テスト実行（失敗してもtrapでクリーンアップ）
+        set +e
         run_tests
-        stop_servers
+        TEST_EXIT_CODE=$?
+        set -e
+        
+        # trapでstop_serversが呼ばれるので明示的な呼び出しは不要
+        exit $TEST_EXIT_CODE
         ;;
     clean)
         cleanup
