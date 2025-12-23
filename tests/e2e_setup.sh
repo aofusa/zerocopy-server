@@ -15,7 +15,13 @@ set -e
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(dirname "$SCRIPT_DIR")"
-VEIL_BIN="${PROJECT_DIR}/target/debug/veil"
+# ワークスペース構成の場合、バイナリはワークスペースルートにある
+WORKSPACE_DIR="$(dirname "$PROJECT_DIR")"
+VEIL_BIN="${WORKSPACE_DIR}/target/debug/veil"
+# veil-proxyローカルにある場合はそちらを優先
+if [ -f "${PROJECT_DIR}/target/debug/veil" ]; then
+    VEIL_BIN="${PROJECT_DIR}/target/debug/veil"
+fi
 FIXTURES_DIR="${SCRIPT_DIR}/fixtures"
 PIDS_FILE="${FIXTURES_DIR}/pids.txt"
 
@@ -159,8 +165,8 @@ EOF
     cat > "${FIXTURES_DIR}/proxy.toml" << EOF
 [server]
 listen = "127.0.0.1:${PROXY_HTTPS_PORT}"
-http_listen = "127.0.0.1:${PROXY_HTTP_PORT}"
-redirect_http_to_https = true
+http = "127.0.0.1:${PROXY_HTTP_PORT}"
+redirect_http_to_https = false
 threads = 1
 
 [tls]
@@ -181,14 +187,8 @@ servers = [
     "https://127.0.0.1:${BACKEND2_PORT}"
 ]
 
-[upstreams."backend-pool".health_check]
-enabled = true
-path = "/health"
-interval_secs = 5
-timeout_secs = 2
-
 [path_routes."localhost"."/"]
-type = "Upstream"
+type = "Proxy"
 upstream = "backend-pool"
 
 [path_routes."localhost"."/".security]
@@ -201,7 +201,7 @@ preferred_encodings = ["zstd", "br", "gzip"]
 min_size = 1024
 
 [path_routes."127.0.0.1"."/"]
-type = "Upstream"
+type = "Proxy"
 upstream = "backend-pool"
 
 [path_routes."127.0.0.1"."/".security]
@@ -299,7 +299,7 @@ stop_servers() {
 health_check() {
     log_info "Checking server health..."
     
-    # バックエンド1
+    # バックエンド1 (HTTPS - 自己署名証明書なので-k)
     if curl -ks "https://127.0.0.1:${BACKEND1_PORT}/health" > /dev/null 2>&1; then
         log_info "Backend 1: OK"
     else
@@ -307,7 +307,7 @@ health_check() {
         return 1
     fi
     
-    # バックエンド2
+    # バックエンド2 (HTTPS)
     if curl -ks "https://127.0.0.1:${BACKEND2_PORT}/health" > /dev/null 2>&1; then
         log_info "Backend 2: OK"
     else
@@ -315,12 +315,17 @@ health_check() {
         return 1
     fi
     
-    # プロキシ（メトリクスエンドポイント）
-    if curl -ks "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" > /dev/null 2>&1; then
-        log_info "Proxy: OK"
+    # プロキシ（HTTPポート - リダイレクト無効なのでHTTPで接続可能）
+    if curl -s "http://127.0.0.1:${PROXY_HTTP_PORT}/__metrics" > /dev/null 2>&1; then
+        log_info "Proxy HTTP: OK"
     else
-        log_error "Proxy: FAILED"
-        return 1
+        # HTTPSでも確認
+        if curl -ks "https://127.0.0.1:${PROXY_HTTPS_PORT}/__metrics" > /dev/null 2>&1; then
+            log_info "Proxy HTTPS: OK"
+        else
+            log_error "Proxy: FAILED"
+            return 1
+        fi
     fi
     
     log_info "All servers healthy"

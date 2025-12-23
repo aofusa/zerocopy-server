@@ -12,7 +12,7 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 
-const PROXY_PORT: u16 = 8443;
+const PROXY_PORT: u16 = 8080;
 const BACKEND_PORT: u16 = 9001;
 
 /// プロキシサーバーが起動しているか確認

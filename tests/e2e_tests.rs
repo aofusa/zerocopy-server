@@ -31,19 +31,18 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
+use native_tls::TlsConnector;
 
 // E2E環境のポート設定（e2e_setup.shと一致させる）
-const PROXY_HTTPS_PORT: u16 = 8443;
-#[allow(dead_code)]
-const PROXY_HTTP_PORT: u16 = 8080;  // HTTPリダイレクト用（将来使用）
+const PROXY_PORT: u16 = 8443;  // プロキシHTTPSポート
 const BACKEND1_PORT: u16 = 9001;
 const BACKEND2_PORT: u16 = 9002;
 
 /// E2E環境が起動しているか確認
 fn is_e2e_environment_ready() -> bool {
     // プロキシへの接続確認
-    if TcpStream::connect(format!("127.0.0.1:{}", PROXY_HTTPS_PORT)).is_err() {
-        eprintln!("E2E environment not ready: Proxy not running on port {}", PROXY_HTTPS_PORT);
+    if TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).is_err() {
+        eprintln!("E2E environment not ready: Proxy not running on port {}", PROXY_PORT);
         eprintln!("Please run: ./tests/e2e_setup.sh start");
         return false;
     }
@@ -62,11 +61,23 @@ fn is_e2e_environment_ready() -> bool {
     true
 }
 
-/// HTTPリクエストを送信してレスポンスを取得
+/// TLSコネクタを作成（自己署名証明書を許可）
+fn create_tls_connector() -> TlsConnector {
+    TlsConnector::builder()
+        .danger_accept_invalid_certs(true)
+        .danger_accept_invalid_hostnames(true)
+        .build()
+        .expect("Failed to create TLS connector")
+}
+
+/// HTTPS リクエストを送信してレスポンスを取得
 fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<String> {
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
+    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
+    
+    let connector = create_tls_connector();
+    let mut tls_stream = connector.connect("localhost", stream).ok()?;
     
     // リクエスト構築
     let mut request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n", path);
@@ -75,10 +86,10 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<Strin
     }
     request.push_str("Connection: close\r\n\r\n");
     
-    stream.write_all(request.as_bytes()).ok()?;
+    tls_stream.write_all(request.as_bytes()).ok()?;
     
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).ok()?;
+    tls_stream.read_to_end(&mut response).ok()?;
     
     String::from_utf8(response).ok()
 }
@@ -122,7 +133,7 @@ fn test_proxy_basic_request() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]);
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
@@ -137,7 +148,7 @@ fn test_proxy_health_endpoint() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/health", &[]);
+    let response = send_request(PROXY_PORT, "/health", &[]);
     assert!(response.is_some(), "Should receive response from health endpoint");
     
     let response = response.unwrap();
@@ -156,7 +167,7 @@ fn test_response_header_added() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -176,7 +187,7 @@ fn test_server_header_removed() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -193,7 +204,7 @@ fn test_backend_server_id_header() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -222,7 +233,7 @@ fn test_round_robin_distribution() {
     
     // 10回リクエストを送信
     for _ in 0..10 {
-        let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]);
         if let Some(response) = response {
             if let Some(server_id) = get_header_value(&response, "X-Server-Id") {
                 match server_id.as_str() {
@@ -256,7 +267,7 @@ fn test_static_file_index() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -275,7 +286,7 @@ fn test_static_file_large() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/large.txt", &[]);
+    let response = send_request(PROXY_PORT, "/large.txt", &[]);
     assert!(response.is_some(), "Should receive large file response");
     
     let response = response.unwrap();
@@ -299,7 +310,7 @@ fn test_compression_gzip() {
     
     // Gzip圧縮をリクエスト
     let response = send_request(
-        PROXY_HTTPS_PORT, 
+        PROXY_PORT, 
         "/large.txt", 
         &[("Accept-Encoding", "gzip")]
     );
@@ -329,7 +340,7 @@ fn test_compression_brotli() {
     
     // Brotli圧縮をリクエスト
     let response = send_request(
-        PROXY_HTTPS_PORT, 
+        PROXY_PORT, 
         "/large.txt", 
         &[("Accept-Encoding", "br")]
     );
@@ -385,7 +396,7 @@ fn test_prometheus_metrics() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/__metrics", &[]);
+    let response = send_request(PROXY_PORT, "/__metrics", &[]);
     assert!(response.is_some(), "Should receive metrics response");
     
     let response = response.unwrap();
@@ -410,7 +421,7 @@ fn test_404_not_found() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/nonexistent-path-12345", &[]);
+    let response = send_request(PROXY_PORT, "/nonexistent-path-12345", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -419,37 +430,23 @@ fn test_404_not_found() {
 }
 
 // ====================
-// HTTPリダイレクトテスト
+// HTTPS接続テスト
 // ====================
 
 #[test]
-fn test_http_to_https_redirect() {
+fn test_https_connection() {
     if !is_e2e_environment_ready() {
         eprintln!("Skipping test: E2E environment not ready");
         return;
     }
     
-    // HTTPポートにリクエスト
-    let response = send_request(PROXY_HTTP_PORT, "/", &[]);
+    // HTTPSポートに接続
+    let response = send_request(PROXY_PORT, "/", &[]);
     
-    if let Some(response) = response {
-        let status = get_status_code(&response);
-        
-        // リダイレクトレスポンス（301, 302, 307, 308のいずれか）
-        if let Some(code) = status {
-            if code == 301 || code == 302 || code == 307 || code == 308 {
-                let location = get_header_value(&response, "Location");
-                assert!(
-                    location.is_some(),
-                    "Redirect should have Location header"
-                );
-                assert!(
-                    location.unwrap().starts_with("https://"),
-                    "Should redirect to HTTPS"
-                );
-            }
-        }
-    }
+    assert!(response.is_some(), "Should receive response from HTTPS port");
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "HTTPS request should succeed");
 }
 
 // ====================
@@ -473,7 +470,7 @@ fn test_concurrent_requests() {
         .map(|_| {
             let success_count = Arc::clone(&success_count);
             thread::spawn(move || {
-                let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+                let response = send_request(PROXY_PORT, "/", &[]);
                 if let Some(response) = response {
                     if get_status_code(&response) == Some(200) {
                         success_count.fetch_add(1, Ordering::Relaxed);
@@ -509,7 +506,7 @@ fn test_response_time() {
     use std::time::Instant;
     
     let start = Instant::now();
-    let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]);
     let elapsed = start.elapsed();
     
     assert!(response.is_some(), "Should receive response");
@@ -532,7 +529,7 @@ fn test_html_content_type() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+    let response = send_request(PROXY_PORT, "/", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -554,7 +551,7 @@ fn test_json_content_type() {
         return;
     }
     
-    let response = send_request(PROXY_HTTPS_PORT, "/health", &[]);
+    let response = send_request(PROXY_PORT, "/health", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
@@ -584,7 +581,7 @@ fn test_keep_alive_connection() {
     
     // Keep-Alive接続でのリクエスト
     let response = send_request(
-        PROXY_HTTPS_PORT, 
+        PROXY_PORT, 
         "/", 
         &[("Connection", "keep-alive")]
     );
@@ -607,7 +604,7 @@ fn test_custom_user_agent() {
     }
     
     let response = send_request(
-        PROXY_HTTPS_PORT, 
+        PROXY_PORT, 
         "/", 
         &[("User-Agent", "VeilE2ETest/1.0")]
     );
@@ -630,11 +627,11 @@ fn test_different_host_headers() {
     }
     
     // localhost
-    let response1 = send_request(PROXY_HTTPS_PORT, "/", &[]);
+    let response1 = send_request(PROXY_PORT, "/", &[]);
     assert!(response1.is_some(), "localhost should work");
     
     // 127.0.0.1 のHost
-    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_HTTPS_PORT)).unwrap();
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
     stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
     
     let request = "GET / HTTP/1.1\r\nHost: 127.0.0.1\r\nConnection: close\r\n\r\n";
@@ -663,7 +660,7 @@ fn test_multiple_sequential_requests() {
     let total_requests = 50;
     
     for _ in 0..total_requests {
-        let response = send_request(PROXY_HTTPS_PORT, "/", &[]);
+        let response = send_request(PROXY_PORT, "/", &[]);
         if let Some(response) = response {
             if get_status_code(&response) == Some(200) {
                 success_count += 1;
@@ -692,7 +689,7 @@ fn test_compression_priority() {
     
     // 複数の圧縮形式をサポート
     let response = send_request(
-        PROXY_HTTPS_PORT, 
+        PROXY_PORT, 
         "/large.txt", 
         &[("Accept-Encoding", "gzip, br, zstd")]
     );

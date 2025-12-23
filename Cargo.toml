@@ -156,6 +156,9 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # システム情報取得（リソース使用量測定）
 sysinfo = "0.32"
 
+# E2Eテスト用TLS接続
+native-tls = "0.2"
+
 [[bench]]
 name = "throughput"
 harness = false
