@@ -10273,10 +10273,6 @@ async fn proxy_http_pooled(
     // 注意: 実際のContent-Typeはレスポンス受信後に判定するため、ここでは設定の有効/無効のみ確認
     let compression_enabled = compression.enabled && client_encoding != AcceptedEncoding::Identity;
     
-    // キャッシュ保存が必要かどうか
-    // キャッシュ保存が必要な場合はsplice転送を使用できない（ユーザー空間でボディをキャプチャする必要がある）
-    let cache_save_needed = cache_ctx.is_some();
-    
     // メトリクス用ホスト名
     let host_str_for_metrics = &target.host;
     
@@ -10288,6 +10284,10 @@ async fn proxy_http_pooled(
     // ただし、圧縮有効、キャッシュ保存が必要、またはバッファリング有効な場合はkTLSを迂回
     #[cfg(feature = "ktls")]
     let result = {
+        // キャッシュ保存が必要かどうか
+        // キャッシュ保存が必要な場合はsplice転送を使用できない（ユーザー空間でボディをキャプチャする必要がある）
+        let cache_save_needed = cache_ctx.is_some();
+        
         // kTLS + splice 版を試みる条件:
         // - kTLS有効
         // - Content-Length転送（非chunked）
