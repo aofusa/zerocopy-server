@@ -156,8 +156,8 @@ criterion = { version = "0.5", features = ["html_reports"] }
 # システム情報取得（リソース使用量測定）
 sysinfo = "0.32"
 
-# E2Eテスト用TLS接続
-native-tls = "0.2"
+# E2Eテスト用TLS接続（rustlsを使用、メイン依存関係と一致）
+# rustls と webpki-roots は既にメインの依存関係に含まれているため追加不要
 
 # ベンチマーク用依存関係
 base64 = "0.22"

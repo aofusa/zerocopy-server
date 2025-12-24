@@ -31,7 +31,9 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
-use native_tls::TlsConnector;
+use std::sync::Arc;
+use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rustls::pki_types::ServerName;
 
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443;  // プロキシHTTPSポート
@@ -61,23 +63,50 @@ fn is_e2e_environment_ready() -> bool {
     true
 }
 
-/// TLSコネクタを作成（自己署名証明書を許可）
-fn create_tls_connector() -> TlsConnector {
-    TlsConnector::builder()
-        .danger_accept_invalid_certs(true)
-        .danger_accept_invalid_hostnames(true)
-        .build()
-        .expect("Failed to create TLS connector")
+/// TLSクライアント設定を作成（自己署名証明書を許可）
+fn create_client_config() -> Arc<ClientConfig> {
+    // 空のルート証明書ストアを使用（自己署名証明書を許可）
+    let root_store = RootCertStore::empty();
+    
+    let config = ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    
+    Arc::new(config)
 }
 
 /// HTTPS リクエストを送信してレスポンスを取得
 fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<String> {
-    let stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok()?;
     
-    let connector = create_tls_connector();
-    let mut tls_stream = connector.connect("localhost", stream).ok()?;
+    // rustlsクライアント設定を作成
+    let config = create_client_config();
+    
+    // サーバー名を決定（自己署名証明書なのでホスト名検証をスキップ）
+    let server_name = ServerName::try_from("localhost".to_string())
+        .ok()?;
+    
+    // TLS接続を確立
+    let mut tls_conn = ClientConnection::new(config, server_name).ok()?;
+    
+    // ハンドシェイクを実行（同期）
+    use std::io::ErrorKind;
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                // 非ブロッキングI/Oの場合は待機
+                std::thread::sleep(Duration::from_millis(10));
+                continue;
+            }
+            Err(_) => return None,
+        }
+    }
+    
+    // rustls::Streamを使用して読み書き
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
     
     // リクエスト構築
     let mut request = format!("GET {} HTTP/1.1\r\nHost: localhost\r\n", path);
