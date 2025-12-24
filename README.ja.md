@@ -1237,8 +1237,6 @@ enabled = true
 | `enabled` | メトリクスエンドポイントを有効化 | **false** |
 | `path` | メトリクスエンドポイントのパス | `/__metrics` |
 | `allowed_ips` | アクセスを許可するIP/CIDR（配列） | []（すべて許可） |
-| `enable_active_connections` | アクティブ接続数メトリクスを有効化 | **true** |
-| `enable_upstream_health` | アップストリーム健康状態メトリクスを有効化 | **true** |
 
 ### エンドポイント
 
@@ -1301,9 +1299,6 @@ allowed_ips = [
   "172.16.0.0/12",
   "192.168.0.0/16"
 ]
-# 特定のメトリクスの有効化/無効化（デフォルト: 両方有効）
-enable_active_connections = true
-enable_upstream_health = true
 ```
 
 ### アクセス制御

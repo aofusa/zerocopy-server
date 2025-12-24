@@ -1237,8 +1237,6 @@ enabled = true
 | `enabled` | Enable metrics endpoint | **false** |
 | `path` | Metrics endpoint path | `/__metrics` |
 | `allowed_ips` | Allowed IP/CIDR for access (array) | [] (all allowed) |
-| `enable_active_connections` | Enable active connections metric | **true** |
-| `enable_upstream_health` | Enable upstream health status metric | **true** |
 
 ### Endpoint
 
@@ -1301,9 +1299,6 @@ allowed_ips = [
   "172.16.0.0/12",
   "192.168.0.0/16"
 ]
-# Enable/disable specific metrics (default: both enabled)
-enable_active_connections = true
-enable_upstream_health = true
 ```
 
 ### Access Control

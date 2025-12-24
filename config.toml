@@ -675,20 +675,12 @@ connection_window_size = 16777216
 #   "172.16.0.0/12",
 #   "192.168.0.0/16"
 # ]
-#
-# # アクティブ接続数メトリクスを有効化（デフォルト: true）
-# enable_active_connections = true
-#
-# # アップストリーム健康状態メトリクスを有効化（デフォルト: true）
-# enable_upstream_health = true
 
 # [prometheus]
 # # メトリクスエンドポイントの有効化（デフォルト: false）
 # enabled = true
 # path = "/__metrics"
 # allowed_ips = []  # 空の場合は全てのIPを許可
-# enable_active_connections = true
-# enable_upstream_health = true
 
 
 [host_routes."example.com"]

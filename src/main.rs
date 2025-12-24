@@ -2176,16 +2176,6 @@ pub struct PrometheusConfig {
     /// 例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"]
     #[serde(default)]
     pub allowed_ips: Vec<String>,
-    
-    /// アクティブ接続数メトリクスを有効化するかどうか
-    /// デフォルト: true
-    #[serde(default = "default_true")]
-    pub enable_active_connections: bool,
-    
-    /// アップストリーム健康状態メトリクスを有効化するかどうか
-    /// デフォルト: true
-    #[serde(default = "default_true")]
-    pub enable_upstream_health: bool,
 }
 
 fn default_prometheus_enabled() -> bool { false }
@@ -2197,8 +2187,6 @@ impl Default for PrometheusConfig {
             enabled: default_prometheus_enabled(),
             path: default_prometheus_path(),
             allowed_ips: Vec::new(),
-            enable_active_connections: default_true(),
-            enable_upstream_health: default_true(),
         }
     }
 }
@@ -6494,16 +6482,10 @@ fn spawn_health_check_thread() {
                         );
                         
                         // メトリクス: ヘルスチェック結果を更新
-                        let enable_upstream_health = {
-                            let config = CURRENT_CONFIG.load();
-                            config.prometheus_config.enable_upstream_health
-                        };
-                        if enable_upstream_health {
-                            if check_result {
-                                HTTP_UPSTREAM_HEALTH.with_label_values(&[name, &addr]).set(1);
-                            } else {
-                                HTTP_UPSTREAM_HEALTH.with_label_values(&[name, &addr]).set(0);
-                            }
+                        if check_result {
+                            HTTP_UPSTREAM_HEALTH.with_label_values(&[name, &addr]).set(1);
+                        } else {
+                            HTTP_UPSTREAM_HEALTH.with_label_values(&[name, &addr]).set(0);
                         }
                         
                         if check_result {
@@ -7017,14 +6999,8 @@ async fn handle_http2_connection<S>(
     
     info!("[HTTP/2] Connection established from {}", client_ip);
     
-    // メトリクス有効化フラグを取得
-    let enable_active_connections = {
-        let config = CURRENT_CONFIG.load();
-        config.prometheus_config.enable_active_connections
-    };
-    
     // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
-    let mut connection_metric = ActiveConnectionMetric::new(enable_active_connections);
+    let mut connection_metric = ActiveConnectionMetric::new(true);
     
     // カスタムリクエストハンドラーを使用してメインループ実行
     let result = handle_http2_requests(&mut conn, host_routes, path_routes, client_ip, &mut connection_metric).await;
@@ -8246,14 +8222,8 @@ async fn handle_requests(
 ) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     
-    // メトリクス有効化フラグを取得
-    let enable_active_connections = {
-        let config = CURRENT_CONFIG.load();
-        config.prometheus_config.enable_active_connections
-    };
-    
     // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
-    let mut connection_metric = ActiveConnectionMetric::new(enable_active_connections);
+    let mut connection_metric = ActiveConnectionMetric::new(true);
 
     loop {
         // 読み込み（アイドルタイムアウト付き）
