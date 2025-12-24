@@ -32,7 +32,8 @@ use std::io::{Read, Write};
 use std::net::TcpStream;
 use std::time::Duration;
 use std::sync::Arc;
-use rustls::{ClientConfig, ClientConnection, RootCertStore};
+use rustls::{ClientConfig, ClientConnection};
+use rustls::crypto::CryptoProvider;
 use rustls::pki_types::ServerName;
 
 // E2E環境のポート設定（e2e_setup.shと一致させる）
@@ -63,13 +64,64 @@ fn is_e2e_environment_ready() -> bool {
     true
 }
 
+/// rustlsのCryptoProviderを初期化（一度だけ実行）
+fn init_crypto_provider() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        CryptoProvider::install_default(rustls::crypto::ring::default_provider())
+            .expect("Failed to install rustls crypto provider");
+    });
+}
+
+/// 証明書検証をスキップするカスタム検証器
+#[derive(Debug)]
+struct SkipServerVerification;
+
+impl rustls::client::danger::ServerCertVerifier for SkipServerVerification {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &rustls::pki_types::CertificateDer<'_>,
+        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &rustls::pki_types::CertificateDer<'_>,
+        _dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        rustls::crypto::ring::default_provider()
+            .signature_verification_algorithms
+            .supported_schemes()
+            .to_vec()
+    }
+}
+
 /// TLSクライアント設定を作成（自己署名証明書を許可）
 fn create_client_config() -> Arc<ClientConfig> {
-    // 空のルート証明書ストアを使用（自己署名証明書を許可）
-    let root_store = RootCertStore::empty();
+    init_crypto_provider();
     
     let config = ClientConfig::builder()
-        .with_root_certificates(root_store)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(SkipServerVerification))
         .with_no_client_auth();
     
     Arc::new(config)
