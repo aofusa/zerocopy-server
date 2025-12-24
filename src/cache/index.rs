@@ -368,7 +368,7 @@ impl Default for CacheIndex {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cache::entry::{CacheStorage, CacheEntryBuilder};
+    use crate::cache::entry::CacheEntryBuilder;
     use crate::cache::key::CacheableMethod;
 
     fn create_test_key(path: &str) -> CacheKey {

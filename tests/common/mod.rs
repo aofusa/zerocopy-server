@@ -4,7 +4,6 @@
 
 use std::net::{TcpListener, SocketAddr};
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
 use std::time::Duration;
 use std::io::{Read, Write};
 
@@ -99,6 +98,7 @@ impl EchoServer {
     }
     
     /// サーバーのポートを取得
+    #[allow(dead_code)] // APIの一貫性のため保持
     pub fn port(&self) -> u16 {
         self.addr.port()
     }
@@ -186,11 +186,6 @@ impl SimpleHttpServer {
     pub fn port(&self) -> u16 {
         self.addr.port()
     }
-    
-    /// HTTPのURL形式でアドレスを取得
-    pub fn url(&self) -> String {
-        format!("http://127.0.0.1:{}/", self.addr.port())
-    }
 }
 
 impl Drop for SimpleHttpServer {
@@ -202,65 +197,6 @@ impl Drop for SimpleHttpServer {
     }
 }
 
-/// プロキシサーバーインスタンス
-pub struct ProxyInstance {
-    pub process: Child,
-    pub https_port: u16,
-    pub http_port: u16,
-    config_path: PathBuf,
-}
-
-impl ProxyInstance {
-    /// 新しいプロキシインスタンスを起動
-    pub fn start(
-        binary_path: &std::path::Path,
-        config_path: &std::path::Path,
-        https_port: u16,
-        http_port: u16,
-    ) -> std::io::Result<Self> {
-        let process = Command::new(binary_path)
-            .args(["-c", config_path.to_str().unwrap()])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        
-        // 起動を待機
-        std::thread::sleep(Duration::from_millis(500));
-        
-        Ok(Self {
-            process,
-            https_port,
-            http_port,
-            config_path: config_path.to_path_buf(),
-        })
-    }
-    
-    /// HTTPSのURL形式でアドレスを取得
-    pub fn https_url(&self, path: &str) -> String {
-        format!("https://127.0.0.1:{}{}", self.https_port, path)
-    }
-    
-    /// HTTPのURL形式でアドレスを取得
-    pub fn http_url(&self, path: &str) -> String {
-        format!("http://127.0.0.1:{}{}", self.http_port, path)
-    }
-    
-    /// プロキシが起動しているか確認
-    pub fn is_running(&mut self) -> bool {
-        match self.process.try_wait() {
-            Ok(None) => true, // まだ実行中
-            _ => false,
-        }
-    }
-}
-
-impl Drop for ProxyInstance {
-    fn drop(&mut self) {
-        // プロセスを終了
-        let _ = self.process.kill();
-        let _ = self.process.wait();
-    }
-}
 
 /// テスト用設定ファイルを生成
 pub fn generate_test_config(
@@ -328,17 +264,6 @@ pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
-/// ポートが閉じるまで待機
-pub fn wait_for_port_closed(port: u16, timeout: Duration) -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if std::net::TcpStream::connect(format!("127.0.0.1:{}", port)).is_err() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    false
-}
 
 #[cfg(test)]
 mod tests {

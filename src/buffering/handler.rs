@@ -9,6 +9,7 @@ use std::path::PathBuf;
 /// 
 /// ハッシュの上位ビットを使用して2層のディレクトリ構造を作成し、
 /// ファイルシステムのディレクトリエントリ数を分散させます。
+#[allow(dead_code)] // テストコードで使用、将来の使用に備える
 pub fn key_to_path(base_path: &std::path::Path, key: &[u8]) -> PathBuf {
     let hash = xxh3_64(key);
     

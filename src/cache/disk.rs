@@ -324,7 +324,6 @@ pub fn get_disk_path(storage: &CacheStorage) -> Option<&PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::fs;
     use crate::cache::key::CacheableMethod;
     use tempfile::tempdir;
 
