@@ -119,6 +119,22 @@ pub struct CacheConfig {
     /// 例: ["Authorization"]（ユーザーごとのキャッシュ）
     #[serde(default)]
     pub key_headers: Vec<String>,
+    
+    /// ディスクキャッシュで非同期I/Oを使用するかどうか（io_uring有効時のみ）
+    /// 
+    /// - true: monoio::fsを使用した非同期I/O（io_uring）
+    /// - false: 同期I/O（std::fs）
+    /// 
+    /// デフォルト: true（パフォーマンス向上のため）
+    /// 
+    /// 注意: Linux環境以外では自動的に同期I/Oにフォールバック
+    #[serde(default = "default_use_async_io")]
+    pub use_async_io: bool,
+}
+
+/// use_async_ioのデフォルト値（true）
+fn default_use_async_io() -> bool {
+    true
 }
 
 fn default_true() -> bool { true }
@@ -141,6 +157,7 @@ impl Default for CacheConfig {
             stale_if_error: false,
             include_query: true,
             key_headers: Vec::new(),
+            use_async_io: default_use_async_io(),
         }
     }
 }

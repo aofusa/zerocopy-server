@@ -43,6 +43,7 @@ impl CacheManager {
                 base_path: disk_path.clone(),
                 max_size: config.max_disk_size as u64,
                 extension: "cache".to_string(),
+                use_async_io: config.use_async_io,
             };
             Some(DiskCache::new(disk_config)?)
         } else {
@@ -195,7 +196,9 @@ impl CacheManager {
             StorageType::Disk => {
                 use super::entry::CacheStorage;
                 if let Some(ref disk) = self.disk {
-                    // ディスクに書き込み
+                    // ディスクに書き込み（非同期I/Oが有効な場合は非同期、それ以外は同期）
+                    // 注意: store()は同期メソッドのため、ここでは同期I/Oを使用
+                    // 非同期I/Oは将来的にstore_async()メソッドで実装可能
                     let path = match disk.write_sync(&key, &body) {
                         Ok(p) => p,
                         Err(_) => return false,

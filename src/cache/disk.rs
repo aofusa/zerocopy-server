@@ -19,6 +19,15 @@ pub struct DiskCacheConfig {
     pub max_size: u64,
     /// ファイル拡張子
     pub extension: String,
+    /// 非同期I/Oを使用するかどうか（io_uring有効時のみ）
+    /// 
+    /// - true: monoio::fsを使用した非同期I/O（io_uring）
+    /// - false: 同期I/O（std::fs）
+    /// 
+    /// デフォルト: true（パフォーマンス向上のため）
+    /// 
+    /// 注意: Linux環境以外では自動的に同期I/Oにフォールバック
+    pub use_async_io: bool,
 }
 
 impl Default for DiskCacheConfig {
@@ -27,6 +36,7 @@ impl Default for DiskCacheConfig {
             base_path: PathBuf::from("/var/cache/veil"),
             max_size: 1024 * 1024 * 1024, // 1GB
             extension: "cache".to_string(),
+            use_async_io: true, // デフォルトで有効
         }
     }
 }
@@ -73,6 +83,13 @@ impl DiskCache {
     }
     
     /// ハッシュ値からファイルパスを生成
+    /// 
+    /// 将来の使用に備えた機能。ハッシュベースのキャッシュ管理や
+    /// キャッシュ移行時に使用可能。
+    /// 
+    /// # 使用例
+    /// - キャッシュの再構築（メタデータのみからパスを復元）
+    /// - ハッシュベースのキャッシュ検索
     #[allow(dead_code)]
     fn hash_to_path(&self, hash: u64) -> PathBuf {
         let dir1 = format!("{:02x}", (hash >> 56) as u8);
@@ -257,11 +274,88 @@ impl DiskCache {
         self.current_size.store(0, Ordering::Relaxed);
         Ok(())
     }
+    
+    /// 非同期ファイル読み込み（io_uring使用）
+    /// 
+    /// `use_async_io`が有効な場合のみ使用可能。
+    /// Linux環境以外では自動的に同期I/Oにフォールバック。
+    #[cfg(target_os = "linux")]
+    pub async fn read_async(&self, key: &CacheKey) -> io::Result<Vec<u8>> {
+        let path = self.key_to_path(key);
+        self.reads.fetch_add(1, Ordering::Relaxed);
+        async_io::read_file(&path).await
+    }
+    
+    /// 非同期ファイル書き込み（io_uring使用）
+    /// 
+    /// `use_async_io`が有効な場合のみ使用可能。
+    /// Linux環境以外では自動的に同期I/Oにフォールバック。
+    #[cfg(target_os = "linux")]
+    pub async fn write_async(&self, key: &CacheKey, data: Vec<u8>) -> io::Result<PathBuf> {
+        let path = self.key_to_path(key);
+        let data_len = data.len() as u64;
+        
+        // 親ディレクトリを作成（同期だが頻度は低い）
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        
+        async_io::write_file(&path, data).await?;
+        
+        self.writes.fetch_add(1, Ordering::Relaxed);
+        self.current_size.fetch_add(data_len, Ordering::Relaxed);
+        
+        Ok(path)
+    }
+    
+    /// ファイルを読み込む（同期/非同期を自動選択）
+    /// 
+    /// `use_async_io`が有効でLinux環境の場合は非同期I/Oを使用し、
+    /// それ以外の場合は同期I/Oを使用します。
+    pub async fn read(&self, key: &CacheKey) -> io::Result<Vec<u8>> {
+        if self.config.use_async_io {
+            #[cfg(target_os = "linux")]
+            {
+                self.read_async(key).await
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // 非Linux環境では同期I/Oにフォールバック
+                self.read_sync(key)
+            }
+        } else {
+            // 同期I/Oを使用
+            self.read_sync(key)
+        }
+    }
+    
+    /// ファイルを書き込む（同期/非同期を自動選択）
+    /// 
+    /// `use_async_io`が有効でLinux環境の場合は非同期I/Oを使用し、
+    /// それ以外の場合は同期I/Oを使用します。
+    pub async fn write(&self, key: &CacheKey, data: Vec<u8>) -> io::Result<PathBuf> {
+        if self.config.use_async_io {
+            #[cfg(target_os = "linux")]
+            {
+                self.write_async(key, data).await
+            }
+            #[cfg(not(target_os = "linux"))]
+            {
+                // 非Linux環境では同期I/Oにフォールバック
+                self.write_sync(key, &data)
+            }
+        } else {
+            // 同期I/Oを使用
+            self.write_sync(key, &data)
+        }
+    }
 }
 
 /// monoio非同期I/O操作
+/// 
+/// io_uringを使用した非同期ファイルI/Oを提供します。
+/// Linux環境でのみ利用可能です。
 #[cfg(target_os = "linux")]
-#[allow(dead_code)]
 pub mod async_io {
     use monoio::fs::File;
     use std::io;
@@ -338,6 +432,7 @@ mod tests {
             base_path: dir.path().to_path_buf(),
             max_size: 1024 * 1024,
             extension: "cache".to_string(),
+            use_async_io: false, // テストでは同期I/Oを使用
         };
         
         let cache = DiskCache::new(config).unwrap();
@@ -351,6 +446,7 @@ mod tests {
             base_path: dir.path().to_path_buf(),
             max_size: 1024 * 1024,
             extension: "cache".to_string(),
+            use_async_io: false, // テストでは同期I/Oを使用
         };
         
         let cache = DiskCache::new(config).unwrap();
@@ -367,6 +463,7 @@ mod tests {
             base_path: dir.path().to_path_buf(),
             max_size: 1024 * 1024,
             extension: "cache".to_string(),
+            use_async_io: false, // テストでは同期I/Oを使用
         };
         
         let cache = DiskCache::new(config).unwrap();
@@ -391,6 +488,7 @@ mod tests {
             base_path: dir.path().to_path_buf(),
             max_size: 1024 * 1024,
             extension: "cache".to_string(),
+            use_async_io: false, // テストでは同期I/Oを使用
         };
         
         let cache = DiskCache::new(config).unwrap();
@@ -410,6 +508,7 @@ mod tests {
             base_path: dir.path().to_path_buf(),
             max_size: 1024 * 1024,
             extension: "cache".to_string(),
+            use_async_io: false, // テストでは同期I/Oを使用
         };
         
         let cache = DiskCache::new(config).unwrap();

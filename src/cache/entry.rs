@@ -217,6 +217,20 @@ impl CacheStorage {
 }
 
 /// キャッシュエントリビルダー
+/// 
+/// ビルダーパターンによる柔軟な`CacheEntry`の作成を提供します。
+/// 
+/// # 使用例
+/// ```rust
+/// let entry = CacheEntryBuilder::new(200)
+///     .header(b"content-type", b"text/plain")
+///     .body(b"Hello, World!".to_vec())
+///     .max_age(3600)
+///     .build_memory();
+/// ```
+/// 
+/// # 注意
+/// テストコードや将来の機能拡張で使用されることを想定しています。
 #[allow(dead_code)]
 pub struct CacheEntryBuilder {
     status_code: u16,

@@ -32,6 +32,11 @@ struct MemoryCacheEntry {
     /// キャッシュエントリ
     entry: Arc<CacheEntry>,
     /// 挿入時刻
+    /// 
+    /// キャッシュエントリの挿入時刻を記録。以下の用途で使用可能：
+    /// - キャッシュ統計（平均TTL、ヒット率分析）
+    /// - デバッグ情報（エントリの生存時間）
+    /// - TTLベースのエビクション（将来実装）
     #[allow(dead_code)]
     inserted_at: Instant,
 }
@@ -207,6 +212,15 @@ impl MemoryCache {
 }
 
 /// ボディデータからCacheEntryを作成するヘルパー
+/// 
+/// テストコードや簡易的なエントリ作成に使用。
+/// より柔軟な設定が必要な場合は`CacheEntryBuilder`を使用してください。
+/// 
+/// # 使用例
+/// ```rust
+/// let entry = create_memory_entry(200, headers, body, 3600);
+/// cache.insert(key, entry);
+/// ```
 #[allow(dead_code)]
 pub fn create_memory_entry(
     status_code: u16,
