@@ -484,8 +484,6 @@ static HTTP_RESPONSE_SIZE_BYTES: Lazy<Histogram> = Lazy::new(|| {
 });
 
 /// アクティブ接続数ゲージ（ホスト別）
-/// TODO: 接続開始/終了時にインクリメント/デクリメントを追加
-#[allow(dead_code)]
 static HTTP_ACTIVE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("http_active_connections", "Number of active HTTP connections")
         .namespace("veil_proxy");
@@ -494,10 +492,40 @@ static HTTP_ACTIVE_CONNECTIONS: Lazy<IntGaugeVec> = Lazy::new(|| {
     gauge
 });
 
+/// アクティブ接続メトリクスの自動管理（Dropトレイトで自動デクリメント）
+struct ActiveConnectionMetric {
+    host_name: Option<String>,
+    enabled: bool,
+}
+
+impl ActiveConnectionMetric {
+    fn new(enabled: bool) -> Self {
+        Self {
+            host_name: None,
+            enabled,
+        }
+    }
+    
+    fn set_host(&mut self, host: String) {
+        if self.enabled && self.host_name.is_none() {
+            self.host_name = Some(host.clone());
+            HTTP_ACTIVE_CONNECTIONS.with_label_values(&[&host]).inc();
+        }
+    }
+}
+
+impl Drop for ActiveConnectionMetric {
+    fn drop(&mut self) {
+        if self.enabled {
+            if let Some(ref host) = self.host_name {
+                HTTP_ACTIVE_CONNECTIONS.with_label_values(&[host]).dec();
+            }
+        }
+    }
+}
+
 /// アップストリーム健康状態ゲージ（upstream, server ラベル付き）
 /// 1 = healthy, 0 = unhealthy
-/// TODO: ヘルスチェック結果に応じて更新
-#[allow(dead_code)]
 static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
     let opts = Opts::new("http_upstream_health", "Upstream server health status (1=healthy, 0=unhealthy)")
         .namespace("veil_proxy");
@@ -2148,6 +2176,16 @@ pub struct PrometheusConfig {
     /// 例: ["127.0.0.1", "10.0.0.0/8", "192.168.0.0/16"]
     #[serde(default)]
     pub allowed_ips: Vec<String>,
+    
+    /// アクティブ接続数メトリクスを有効化するかどうか
+    /// デフォルト: true
+    #[serde(default = "default_true")]
+    pub enable_active_connections: bool,
+    
+    /// アップストリーム健康状態メトリクスを有効化するかどうか
+    /// デフォルト: true
+    #[serde(default = "default_true")]
+    pub enable_upstream_health: bool,
 }
 
 fn default_prometheus_enabled() -> bool { false }
@@ -2159,6 +2197,8 @@ impl Default for PrometheusConfig {
             enabled: default_prometheus_enabled(),
             path: default_prometheus_path(),
             allowed_ips: Vec::new(),
+            enable_active_connections: default_true(),
+            enable_upstream_health: default_true(),
         }
     }
 }
@@ -3081,6 +3121,14 @@ struct HealthCheckConfig {
     /// 何回連続で成功したら healthy に戻すか
     #[serde(default = "default_healthy_threshold")]
     healthy_threshold: u32,
+    /// TLS接続を使用するかどうか
+    /// デフォルト: false（既存のHTTP健康チェックを使用）
+    #[serde(default)]
+    use_tls: bool,
+    /// 証明書検証を有効化するかどうか（use_tls=true時のみ有効）
+    /// デフォルト: true
+    #[serde(default = "default_true")]
+    verify_cert: bool,
 }
 
 fn default_health_check_interval() -> u64 { 10 }
@@ -3099,6 +3147,8 @@ impl Default for HealthCheckConfig {
             healthy_statuses: default_healthy_statuses(),
             unhealthy_threshold: default_unhealthy_threshold(),
             healthy_threshold: default_healthy_threshold(),
+            use_tls: false,
+            verify_cert: default_true(),
         }
     }
 }
@@ -4336,9 +4386,8 @@ impl PathRouter {
     }
 }
 
-// 旧SortedPathMapとの互換性のため、型エイリアスを提供
-// TODO: 将来的にはPathRouterに完全移行
-type SortedPathMap = PathRouter;
+// SortedPathMapはPathRouterに完全移行済み
+// 型エイリアスは削除し、すべてPathRouterを使用
 
 // ====================
 // 非同期I/Oトレイト（コード重複解消）
@@ -6438,10 +6487,24 @@ fn spawn_health_check_thread() {
                             &addr,
                             &target.host,
                             &hc_config.path,
-                            target.use_tls,
+                            hc_config.use_tls,
+                            hc_config.verify_cert,
                             Duration::from_secs(hc_config.timeout_secs),
                             &hc_config.healthy_statuses,
                         );
+                        
+                        // メトリクス: ヘルスチェック結果を更新
+                        let enable_upstream_health = {
+                            let config = CURRENT_CONFIG.load();
+                            config.prometheus_config.enable_upstream_health
+                        };
+                        if enable_upstream_health {
+                            if check_result {
+                                HTTP_UPSTREAM_HEALTH.with_label_values(&[name, &addr]).set(1);
+                            } else {
+                                HTTP_UPSTREAM_HEALTH.with_label_values(&[name, &addr]).set(0);
+                            }
+                        }
                         
                         if check_result {
                             server.record_success(hc_config.healthy_threshold);
@@ -6478,19 +6541,24 @@ fn spawn_health_check_thread() {
 /// 同期的な健康チェックを実行
 /// 
 /// TCP 接続して HTTP GET リクエストを送信し、レスポンスをチェック。
+/// TLS接続もサポート（use_tls=true時）。
 fn perform_health_check(
     addr: &str,
     host: &str,
     path: &str,
-    _use_tls: bool,  // TODO: TLS バックエンドの健康チェック
+    use_tls: bool,
+    verify_cert: bool,
     timeout: Duration,
     healthy_statuses: &[u16],
 ) -> bool {
     use std::net::TcpStream as StdTcpStream;
-    use std::io::{Read, Write};
+    use std::io::{Read, Write, ErrorKind};
+    use rustls::{ClientConfig, ClientConnection, RootCertStore};
+    use rustls::pki_types::ServerName;
+    use std::sync::Arc;
     
     // TCP 接続
-    let mut stream = match StdTcpStream::connect_timeout(
+    let mut tcp_stream = match StdTcpStream::connect_timeout(
         &addr.parse().unwrap_or_else(|_| std::net::SocketAddr::from(([127, 0, 0, 1], 80))),
         timeout,
     ) {
@@ -6498,39 +6566,118 @@ fn perform_health_check(
         Err(_) => return false,
     };
     
-    let _ = stream.set_read_timeout(Some(timeout));
-    let _ = stream.set_write_timeout(Some(timeout));
+    let _ = tcp_stream.set_read_timeout(Some(timeout));
+    let _ = tcp_stream.set_write_timeout(Some(timeout));
     
-    // HTTP リクエスト送信
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: HealthCheck/1.0\r\n\r\n",
-        path, host
-    );
-    
-    if stream.write_all(request.as_bytes()).is_err() {
-        return false;
-    }
-    
-    // レスポンス読み取り
-    let mut response = [0u8; 1024];
-    let n = match stream.read(&mut response) {
-        Ok(n) if n > 0 => n,
-        _ => return false,
-    };
-    
-    // ステータスコードを抽出
-    let response_str = String::from_utf8_lossy(&response[..n]);
-    if let Some(status_line) = response_str.lines().next() {
-        // "HTTP/1.1 200 OK" のようなパターン
-        let parts: Vec<&str> = status_line.split_whitespace().collect();
-        if parts.len() >= 2 {
-            if let Ok(status_code) = parts[1].parse::<u16>() {
-                return healthy_statuses.contains(&status_code);
+    // TLS接続の場合
+    if use_tls {
+        // rustls クライアント設定
+        let root_store = if verify_cert {
+            // 証明書検証を有効化（デフォルトのルート証明書ストアを使用）
+            let mut root_store = RootCertStore::empty();
+            root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            root_store
+        } else {
+            // 証明書検証を無効化（自己署名証明書を許可）
+            RootCertStore::empty()
+        };
+        
+        let config = ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
+        
+        let config = Arc::new(config);
+        
+        // SNI名を決定
+        let server_name = match ServerName::try_from(host.to_string()) {
+            Ok(name) => name,
+            Err(_) => return false,
+        };
+        
+        // TLS接続を確立
+        let mut tls_conn = match ClientConnection::new(config, server_name) {
+            Ok(conn) => conn,
+            Err(_) => return false,
+        };
+        
+        // ハンドシェイクを実行（同期）
+        while tls_conn.is_handshaking() {
+            match tls_conn.complete_io(&mut tcp_stream) {
+                Ok(_) => {}
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {
+                    // 非ブロッキングI/Oの場合は短い待機
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                }
+                Err(_) => return false,
             }
         }
+        
+        // rustls::Streamを使用して読み書き
+        let mut stream = rustls::Stream::new(&mut tls_conn, &mut tcp_stream);
+        
+        // HTTP リクエスト送信
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: HealthCheck/1.0\r\n\r\n",
+            path, host
+        );
+        
+        if stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        
+        // レスポンス読み取り
+        let mut response = [0u8; 1024];
+        let n = match stream.read(&mut response) {
+            Ok(n) if n > 0 => n,
+            _ => return false,
+        };
+        
+        // ステータスコードを抽出
+        let response_str = String::from_utf8_lossy(&response[..n]);
+        if let Some(status_line) = response_str.lines().next() {
+            // "HTTP/1.1 200 OK" のようなパターン
+            let parts: Vec<&str> = status_line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(status_code) = parts[1].parse::<u16>() {
+                    return healthy_statuses.contains(&status_code);
+                }
+            }
+        }
+        
+        false
+    } else {
+        // HTTP接続（既存の実装）
+        let request = format!(
+            "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nUser-Agent: HealthCheck/1.0\r\n\r\n",
+            path, host
+        );
+        
+        if tcp_stream.write_all(request.as_bytes()).is_err() {
+            return false;
+        }
+        
+        // レスポンス読み取り
+        let mut response = [0u8; 1024];
+        let n = match tcp_stream.read(&mut response) {
+            Ok(n) if n > 0 => n,
+            _ => return false,
+        };
+        
+        // ステータスコードを抽出
+        let response_str = String::from_utf8_lossy(&response[..n]);
+        if let Some(status_line) = response_str.lines().next() {
+            // "HTTP/1.1 200 OK" のようなパターン
+            let parts: Vec<&str> = status_line.split_whitespace().collect();
+            if parts.len() >= 2 {
+                if let Ok(status_code) = parts[1].parse::<u16>() {
+                    return healthy_statuses.contains(&status_code);
+                }
+            }
+        }
+        
+        false
     }
-    
-    false
 }
 
 // ====================
@@ -6848,7 +6995,7 @@ fn is_connection_closed_error(e: &std::io::Error) -> bool {
 async fn handle_http2_connection<S>(
     tls_stream: S,
     host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
     client_ip: &str,
 ) where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
@@ -6870,8 +7017,17 @@ async fn handle_http2_connection<S>(
     
     info!("[HTTP/2] Connection established from {}", client_ip);
     
+    // メトリクス有効化フラグを取得
+    let enable_active_connections = {
+        let config = CURRENT_CONFIG.load();
+        config.prometheus_config.enable_active_connections
+    };
+    
+    // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
+    let mut connection_metric = ActiveConnectionMetric::new(enable_active_connections);
+    
     // カスタムリクエストハンドラーを使用してメインループ実行
-    let result = handle_http2_requests(&mut conn, host_routes, path_routes, client_ip).await;
+    let result = handle_http2_requests(&mut conn, host_routes, path_routes, client_ip, &mut connection_metric).await;
     
     if let Err(e) = result {
         warn!("[HTTP/2] Connection error: {}", e);
@@ -6885,8 +7041,9 @@ async fn handle_http2_connection<S>(
 async fn handle_http2_requests<S>(
     conn: &mut http2::Http2Connection<S>,
     host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
     client_ip: &str,
+    connection_metric: &mut ActiveConnectionMetric,
 ) -> Result<(), http2::Http2Error>
 where
     S: monoio::io::AsyncReadRent + monoio::io::AsyncWriteRentExt + Unpin,
@@ -6949,6 +7106,13 @@ where
                     }
                 };
                 
+                // メトリクス: 最初のリクエストでホスト名を取得し、インクリメント
+                if let Ok(host_str) = std::str::from_utf8(&authority) {
+                    connection_metric.set_host(host_str.to_string());
+                } else {
+                    connection_metric.set_host("unknown".to_string());
+                }
+                
                 // 処理時間計測開始
                 let start_instant = Instant::now();
                 
@@ -7003,7 +7167,7 @@ async fn handle_http2_single_request<S>(
     authority: &[u8],
     body_len: usize,
     host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
     client_ip: &str,
 ) -> Option<(u16, u64)>
 where
@@ -8077,10 +8241,19 @@ async fn handle_connection(
 async fn handle_requests(
     mut tls_stream: ServerTls,
     host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
     client_ip: &str,
 ) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
+    
+    // メトリクス有効化フラグを取得
+    let enable_active_connections = {
+        let config = CURRENT_CONFIG.load();
+        config.prometheus_config.enable_active_connections
+    };
+    
+    // アクティブ接続メトリクスの自動管理（Dropで自動デクリメント）
+    let mut connection_metric = ActiveConnectionMetric::new(enable_active_connections);
 
     loop {
         // 読み込み（アイドルタイムアウト付き）
@@ -8135,6 +8308,13 @@ async fn handle_requests(
                     .find(|h| h.name.eq_ignore_ascii_case("host"))
                     .map(|h| Box::from(h.value))
                     .unwrap_or_else(|| Box::from([] as [u8; 0]));
+                
+                // メトリクス: 最初のリクエストでホスト名を取得し、インクリメント
+                if let Ok(host_str) = std::str::from_utf8(&host_bytes) {
+                    connection_metric.set_host(host_str.to_string());
+                } else {
+                    connection_metric.set_host("unknown".to_string());
+                }
                 
                 let path_bytes: Box<[u8]> = req.path
                     .map(|p| p.as_bytes().into())
@@ -8502,7 +8682,7 @@ fn find_backend(
     host: &[u8],
     path: &[u8],
     host_routes: &Arc<HashMap<Box<[u8]>, Backend>>,
-    path_routes: &Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    path_routes: &Arc<HashMap<Box<[u8]>, PathRouter>>,
 ) -> Option<(Box<[u8]>, Backend)> {
     if let Some(backend) = host_routes.get(host) {
         return Some((Box::new([]), backend.clone()));

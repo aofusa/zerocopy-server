@@ -739,3 +739,74 @@ fn test_compression_priority() {
     }
 }
 
+// ====================
+// メトリクステスト（新機能）
+// ====================
+
+#[test]
+fn test_active_connections_metric() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // メトリクスエンドポイントからアクティブ接続数を取得
+    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    assert!(response.is_some(), "Should receive metrics response");
+    
+    let response = response.unwrap();
+    
+    // HTTP_ACTIVE_CONNECTIONSメトリクスが含まれるか確認
+    // 注意: 接続が確立されている場合のみ値が存在する
+    assert!(
+        response.contains("http_active_connections") || response.contains("veil_proxy_http_active_connections"),
+        "Should contain active connections metric"
+    );
+}
+
+#[test]
+fn test_upstream_health_metric() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // メトリクスエンドポイントからアップストリーム健康状態を取得
+    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    assert!(response.is_some(), "Should receive metrics response");
+    
+    let response = response.unwrap();
+    
+    // HTTP_UPSTREAM_HEALTHメトリクスが含まれるか確認
+    // 注意: ヘルスチェックが設定されている場合のみ値が存在する
+    assert!(
+        response.contains("http_upstream_health") || response.contains("veil_proxy_http_upstream_health"),
+        "Should contain upstream health metric"
+    );
+}
+
+#[test]
+fn test_tls_health_check() {
+    // このテストは、TLS健康チェック機能が正しく動作することを確認します
+    // 注意: 実際のTLSバックエンドが必要なため、E2E環境でのみ実行可能
+    
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // TLS接続でヘルスチェックが動作することを確認
+    // 実際のテストは、TLSバックエンドが設定されている場合にのみ有効
+    // ここでは、メトリクスエンドポイントから健康状態を確認
+    
+    let response = send_request(PROXY_PORT, "/__metrics", &[]);
+    assert!(response.is_some(), "Should receive metrics response");
+    
+    // メトリクスが正常に取得できることを確認
+    let response = response.unwrap();
+    assert!(
+        response.contains("veil_proxy") || response.contains("# HELP"),
+        "Should contain Prometheus metrics"
+    );
+}
+

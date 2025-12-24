@@ -37,7 +37,7 @@ use ring::rand::*;
 use ftlog::{info, warn, error, debug};
 
 use crate::{
-    Backend, SortedPathMap, SecurityConfig, UpstreamGroup, ProxyTarget,
+    Backend, PathRouter, SecurityConfig, UpstreamGroup, ProxyTarget,
     find_backend, check_security, SecurityCheckResult,
     encode_prometheus_metrics, record_request_metrics,
     AcceptedEncoding, CompressionConfig, resolve_http3_compression_config,
@@ -242,7 +242,7 @@ struct Http3Handler {
     /// ホストルーティング設定
     host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
     /// パスルーティング設定
-    path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+    path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
 }
 
 impl Http3Handler {
@@ -251,7 +251,7 @@ impl Http3Handler {
         conn: quiche::Connection,
         peer_addr: SocketAddr,
         host_routes: Arc<HashMap<Box<[u8]>, Backend>>,
-        path_routes: Arc<HashMap<Box<[u8]>, SortedPathMap>>,
+        path_routes: Arc<HashMap<Box<[u8]>, PathRouter>>,
     ) -> Self {
         Self {
             conn,
