@@ -10385,6 +10385,7 @@ async fn proxy_http_pooled(
                     compression,
                     client_encoding,
                     cache_ctx,
+                    security,
                 ).await
             }
         } else if buffering_enabled && !compression_enabled {
@@ -10415,6 +10416,7 @@ async fn proxy_http_pooled(
                 compression,
                 client_encoding,
                 cache_ctx,
+                security,
             ).await
         }
     };
@@ -10435,18 +10437,19 @@ async fn proxy_http_pooled(
             cache_ctx,
         ).await
     } else {
-        proxy_http_request_with_compression(
-            &mut client_stream,
-            &mut backend_stream,
-            request,
-            content_length,
-            is_chunked,
-            initial_body,
-            max_chunked,
-            compression,
-            client_encoding,
-            cache_ctx,
-        ).await
+                proxy_http_request_with_compression(
+                    &mut client_stream,
+                    &mut backend_stream,
+                    request,
+                    content_length,
+                    is_chunked,
+                    initial_body,
+                    max_chunked,
+                    compression,
+                    client_encoding,
+                    cache_ctx,
+                    security,
+                ).await
     };
 
     match result {
@@ -11430,6 +11433,7 @@ async fn proxy_http_request_with_compression(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     cache_ctx: Option<&mut CacheSaveContext>,
+    security: &SecurityConfig,
 ) -> Option<(u16, u64, bool)> {
     // 1. リクエストヘッダー送信（タイムアウト付き）
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -11469,7 +11473,7 @@ async fn proxy_http_request_with_compression(
 
     // 4. レスポンスを受信して転送（圧縮対応、キャッシュ保存対応）
     let (total, status_code, backend_wants_keep_alive) = 
-        transfer_response_with_compression(backend_stream, client_stream, compression, client_encoding, cache_ctx).await;
+        transfer_response_with_compression(backend_stream, client_stream, compression, client_encoding, cache_ctx, security).await;
 
     Some((status_code, total, backend_wants_keep_alive))
 }
@@ -11486,6 +11490,7 @@ async fn transfer_response_with_compression(
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
     mut cache_ctx: Option<&mut CacheSaveContext>,
+    security: &SecurityConfig,
 ) -> (u64, u16, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -11554,6 +11559,7 @@ async fn transfer_response_with_compression(
                     encoding,
                     compression,
                     backend_wants_keep_alive,
+                    security,
                 ).await;
                 
                 return (result.0, status_code, result.1);
@@ -11576,9 +11582,49 @@ async fn transfer_response_with_compression(
                     ctx.append_body(body_start);
                 }
                 
-                // ヘッダーをそのまま送信
-                let header_data = accumulated[..header_len].to_vec();
-                let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(header_data)).await;
+                // ヘッダーを修正（security.add_response_headersを追加、remove_response_headersを削除）
+                let mut modified_headers = accumulated[..header_len].to_vec();
+                
+                // ヘッダーをパースして操作
+                let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+                let mut response = httparse::Response::new(&mut headers_storage);
+                if response.parse(&modified_headers).is_ok() {
+                    let mut new_header_lines = Vec::new();
+                    
+                    // ステータス行を追加
+                    let status_line = format!("HTTP/1.1 {} {}\r\n", 
+                        status_code, 
+                        status_code_to_reason(status_code));
+                    new_header_lines.push(status_line.into_bytes());
+                    
+                    // 既存のヘッダーを追加（削除対象を除外）
+                    let remove_headers_lower: Vec<String> = security.remove_response_headers.iter()
+                        .map(|h| h.to_lowercase())
+                        .collect();
+                    
+                    for header in response.headers.iter() {
+                        let header_name_lower = header.name.to_lowercase();
+                        if !remove_headers_lower.iter().any(|h| h == &header_name_lower) {
+                            new_header_lines.push(format!("{}: {}\r\n", 
+                                header.name, 
+                                std::str::from_utf8(header.value).unwrap_or("")).into_bytes());
+                        }
+                    }
+                    
+                    // 追加するヘッダーを追加
+                    for (header_name, header_value) in &security.add_response_headers {
+                        new_header_lines.push(format!("{}: {}\r\n", header_name, header_value).into_bytes());
+                    }
+                    
+                    // ヘッダー終了マーカーを追加
+                    new_header_lines.push(b"\r\n".to_vec());
+                    
+                    // 結合
+                    modified_headers = new_header_lines.into_iter().flatten().collect();
+                }
+                
+                // 修正したヘッダーを送信
+                let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(modified_headers)).await;
                 if !matches!(write_result, Ok((Ok(_), _))) {
                     return (total, status_code, false);
                 }
@@ -11654,6 +11700,7 @@ async fn transfer_compressed_response(
     encoding: AcceptedEncoding,
     compression: &CompressionConfig,
     backend_wants_keep_alive: bool,
+    security: &SecurityConfig,
 ) -> (u64, bool) {
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -11828,6 +11875,7 @@ async fn transfer_compressed_response(
         original_headers,
         encoding,
         compressed_body.len(),
+        security,
     );
     
     // 4. ヘッダー送信
@@ -11911,6 +11959,7 @@ fn build_compressed_headers(
     original_headers: &[u8],
     encoding: AcceptedEncoding,
     compressed_length: usize,
+    security: &SecurityConfig,
 ) -> Vec<u8> {
     let mut headers_storage = [httparse::EMPTY_HEADER; 64];
     let mut response = httparse::Response::new(&mut headers_storage);
@@ -11933,11 +11982,17 @@ fn build_compressed_headers(
     new_headers.extend_from_slice(b"\r\n");
     
     // 元のヘッダーをコピー（Content-Length, Content-Encoding, Transfer-Encoding を除く）
+    // 削除対象のヘッダーも除外
+    let remove_headers_lower: Vec<String> = security.remove_response_headers.iter()
+        .map(|h| h.to_lowercase())
+        .collect();
+    
     for header in response.headers.iter() {
         let name_lower = header.name.to_ascii_lowercase();
         if name_lower == "content-length" 
             || name_lower == "content-encoding"
-            || name_lower == "transfer-encoding" {
+            || name_lower == "transfer-encoding"
+            || remove_headers_lower.iter().any(|h| h == &name_lower) {
             continue;
         }
         new_headers.extend_from_slice(header.name.as_bytes());
@@ -11959,6 +12014,14 @@ fn build_compressed_headers(
     
     // Vary ヘッダーを追加（キャッシュ制御）
     new_headers.extend_from_slice(b"Vary: Accept-Encoding\r\n");
+    
+    // 追加するヘッダーを追加
+    for (header_name, header_value) in &security.add_response_headers {
+        new_headers.extend_from_slice(header_name.as_bytes());
+        new_headers.extend_from_slice(b": ");
+        new_headers.extend_from_slice(header_value.as_bytes());
+        new_headers.extend_from_slice(b"\r\n");
+    }
     
     // ヘッダー終端
     new_headers.extend_from_slice(b"\r\n");
@@ -12496,6 +12559,7 @@ async fn proxy_https_pooled(
         max_chunked,
         compression,
         client_encoding,
+        security,
     ).await;
 
     match result {
@@ -12529,6 +12593,7 @@ async fn proxy_https_request_with_compression(
     max_chunked_body_size: u64,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    security: &SecurityConfig,
 ) -> Option<(u16, u64, bool)> {
     // 1. リクエストヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, backend_stream.write_all(request)).await;
@@ -12566,7 +12631,7 @@ async fn proxy_https_request_with_compression(
 
     // 4. レスポンスを受信して転送（圧縮対応）
     let (total, status_code, backend_wants_keep_alive) = 
-        transfer_https_response_with_compression(backend_stream, client_stream, compression, client_encoding).await;
+        transfer_https_response_with_compression(backend_stream, client_stream, compression, client_encoding, security).await;
 
     Some((status_code, total, backend_wants_keep_alive))
 }
@@ -12577,6 +12642,7 @@ async fn transfer_https_response_with_compression(
     client_stream: &mut ServerTls,
     compression: &CompressionConfig,
     client_encoding: AcceptedEncoding,
+    security: &SecurityConfig,
 ) -> (u64, u16, bool) {
     let mut accumulated = Vec::with_capacity(BUF_SIZE);
     let mut total = 0u64;
@@ -12644,13 +12710,53 @@ async fn transfer_https_response_with_compression(
                     encoding,
                     compression,
                     backend_wants_keep_alive,
+                    security,
                 ).await;
                 
                 return (result.0, status_code, result.1);
             } else {
-                // 圧縮無効: そのまま転送
-                let header_data = accumulated[..header_len].to_vec();
-                let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(header_data)).await;
+                // 圧縮無効: そのまま転送（ヘッダー追加処理）
+                let mut modified_headers = accumulated[..header_len].to_vec();
+                
+                // ヘッダーをパースして操作
+                let mut headers_storage = [httparse::EMPTY_HEADER; 64];
+                let mut response = httparse::Response::new(&mut headers_storage);
+                if response.parse(&modified_headers).is_ok() {
+                    let mut new_header_lines = Vec::new();
+                    
+                    // ステータス行を追加
+                    let status_line = format!("HTTP/1.1 {} {}\r\n", 
+                        status_code, 
+                        status_code_to_reason(status_code));
+                    new_header_lines.push(status_line.into_bytes());
+                    
+                    // 既存のヘッダーを追加（削除対象を除外）
+                    let remove_headers_lower: Vec<String> = security.remove_response_headers.iter()
+                        .map(|h| h.to_lowercase())
+                        .collect();
+                    
+                    for header in response.headers.iter() {
+                        let header_name_lower = header.name.to_lowercase();
+                        if !remove_headers_lower.iter().any(|h| h == &header_name_lower) {
+                            new_header_lines.push(format!("{}: {}\r\n", 
+                                header.name, 
+                                std::str::from_utf8(header.value).unwrap_or("")).into_bytes());
+                        }
+                    }
+                    
+                    // 追加するヘッダーを追加
+                    for (header_name, header_value) in &security.add_response_headers {
+                        new_header_lines.push(format!("{}: {}\r\n", header_name, header_value).into_bytes());
+                    }
+                    
+                    // ヘッダー終了マーカーを追加
+                    new_header_lines.push(b"\r\n".to_vec());
+                    
+                    // 結合
+                    modified_headers = new_header_lines.into_iter().flatten().collect();
+                }
+                
+                let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(modified_headers)).await;
                 if !matches!(write_result, Ok((Ok(_), _))) {
                     return (total, status_code, false);
                 }
@@ -12706,6 +12812,7 @@ async fn transfer_compressed_https_response(
     encoding: AcceptedEncoding,
     compression: &CompressionConfig,
     backend_wants_keep_alive: bool,
+    security: &SecurityConfig,
 ) -> (u64, bool) {
     use flate2::Compression;
     use flate2::write::GzEncoder;
@@ -12843,7 +12950,7 @@ async fn transfer_compressed_https_response(
     };
     
     // 3. 新しいヘッダーを構築
-    let new_headers = build_compressed_headers(original_headers, encoding, compressed_body.len());
+    let new_headers = build_compressed_headers(original_headers, encoding, compressed_body.len(), security);
     
     // 4. ヘッダー送信
     let write_result = timeout(WRITE_TIMEOUT, client_stream.write_all(new_headers.clone())).await;

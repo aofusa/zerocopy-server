@@ -28,7 +28,7 @@
 //! - レスポンス圧縮
 //! - ヘルスチェック
 
-use std::io::{Read, Write};
+use std::io::Read;
 use std::net::TcpStream;
 use std::time::Duration;
 use std::sync::Arc;
@@ -181,19 +181,39 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<Strin
     tls_stream.flush().ok()?;
     
     // レスポンス受信
+    // ヘッダー部分を読み取る（\r\n\r\nまで）
     let mut response = Vec::new();
-    // read_to_endは接続が閉じられるまで読み続ける
-    // エラーが発生した場合でも、既に読み取ったデータがあれば返す
-    match tls_stream.read_to_end(&mut response) {
-        Ok(_) => {}
-        Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
-            // EOFは正常終了（サーバーが接続を閉じた）
-            // 既に読み取ったデータがあれば返す
-        }
-        Err(_) => {
-            // その他のエラーは、既に読み取ったデータがあれば返す
-            if response.is_empty() {
-                return None;
+    let mut header_end = None;
+    let mut buf = [0u8; 1];
+    
+    // ヘッダー部分を読み取る
+    loop {
+        match tls_stream.read_exact(&mut buf) {
+            Ok(_) => {
+                response.push(buf[0]);
+                // \r\n\r\nを検出（ヘッダー終了）
+                if response.len() >= 4 {
+                    let len = response.len();
+                    if &response[len-4..] == b"\r\n\r\n" {
+                        header_end = Some(len);
+                        break;
+                    }
+                }
+                // ヘッダーが大きすぎる場合は中止
+                if response.len() > 8192 {
+                    return None;
+                }
+            }
+            Err(e) if e.kind() == ErrorKind::UnexpectedEof => {
+                // EOFに達した場合は既に読み取ったデータを返す
+                break;
+            }
+            Err(_) => {
+                // その他のエラー
+                if response.is_empty() {
+                    return None;
+                }
+                break;
             }
         }
     }
@@ -202,7 +222,79 @@ fn send_request(port: u16, path: &str, headers: &[(&str, &str)]) -> Option<Strin
         return None;
     }
     
+    // ヘッダー終了位置を特定
+    let header_len = header_end.unwrap_or_else(|| {
+        // \r\n\r\nが見つからない場合、全体をヘッダーとして扱う
+        response.len()
+    });
+    
+    // 残りのボディを読み取る（Content-Lengthまたはchunkedを確認）
+    let content_length = get_content_length_from_headers(&response[..header_len]);
+    if let Some(cl) = content_length {
+        // Content-Lengthが指定されている場合
+        let body_remaining = cl.saturating_sub(response.len().saturating_sub(header_len + 4));
+        if body_remaining > 0 {
+            let mut body_buf = vec![0u8; body_remaining.min(1024 * 1024)]; // 最大1MB
+            let mut total_read = 0;
+            while total_read < body_remaining {
+                let to_read = (body_remaining - total_read).min(body_buf.len());
+                match tls_stream.read(&mut body_buf[..to_read]) {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        response.extend_from_slice(&body_buf[..n]);
+                        total_read += n;
+                    }
+                    Err(_) => break,
+                }
+            }
+        }
+    } else {
+        // ChunkedまたはConnection: closeの場合、残りを読み取る
+        let mut body_buf = [0u8; 8192];
+        loop {
+            match tls_stream.read(&mut body_buf) {
+                Ok(0) => break,
+                Ok(n) => response.extend_from_slice(&body_buf[..n]),
+                Err(_) => break,
+            }
+        }
+    }
+    
+    // レスポンスを文字列に変換（ヘッダー部分は必ずUTF-8、ボディは圧縮されている可能性がある）
+    // ヘッダー部分だけを文字列として扱う
+    if header_len <= response.len() {
+        // ヘッダー部分を文字列に変換
+        if let Ok(header_str) = String::from_utf8(response[..header_len].to_vec()) {
+            // ボディ部分も含めて返す（圧縮されている場合はバイナリだが、テストではヘッダーを確認するため）
+            if header_len < response.len() {
+                // ボディがある場合、ヘッダー文字列にボディの長さ情報を追加（実際のテストではヘッダーだけ確認）
+                return Some(header_str);
+            }
+            return Some(header_str);
+        }
+    }
+    
+    // フォールバック: 全体を文字列に変換を試みる
     String::from_utf8(response).ok()
+}
+
+/// Content-Lengthヘッダーから値を取得
+fn get_content_length_from_headers(headers: &[u8]) -> Option<usize> {
+    let header_str = String::from_utf8_lossy(headers);
+    for line in header_str.lines() {
+        if line.is_empty() {
+            break;
+        }
+        if let Some(idx) = line.find(':') {
+            let name = line[..idx].trim().to_lowercase();
+            if name == "content-length" {
+                if let Ok(len) = line[idx + 1..].trim().parse::<usize>() {
+                    return Some(len);
+                }
+            }
+        }
+    }
+    None
 }
 
 /// レスポンスからヘッダー値を抽出
