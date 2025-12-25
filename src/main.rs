@@ -2641,11 +2641,26 @@ fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
 thread_local! {
     static TLS_CONNECTOR: RustlsConnector = {
         // kTLSフィーチャーが有効な場合はシークレット抽出を有効化
-        // kTLSを有効にし、失敗時はrustlsにフォールバック
+        // 設定ファイルの ktls_fallback_enabled を読み込み
+        let fallback_enabled = CURRENT_CONFIG.load().ktls_config.fallback_enabled;
         let config = ktls_rustls::client_config(true);
         RustlsConnector::new(config)
             .with_ktls(true)        // kTLSを有効化
-            .with_fallback(true)    // kTLS失敗時はrustlsにフォールバック
+            .with_fallback(fallback_enabled)    // kTLS失敗時のフォールバック設定
+    };
+}
+
+// 証明書検証をスキップする TLS コネクター（kTLS 有効時・自己署名証明書用）
+#[cfg(feature = "ktls")]
+thread_local! {
+    static TLS_CONNECTOR_INSECURE: RustlsConnector = {
+        // 証明書検証をスキップするクライアント設定
+        // 設定ファイルの ktls_fallback_enabled を読み込み
+        let fallback_enabled = CURRENT_CONFIG.load().ktls_config.fallback_enabled;
+        let config = ktls_rustls::insecure_client_config();
+        RustlsConnector::new(config)
+            .with_ktls(true)
+            .with_fallback(fallback_enabled)
     };
 }
 
@@ -4185,11 +4200,13 @@ pub struct UpstreamGroup {
     rr_counter: Arc<AtomicUsize>,
     /// 健康チェック設定（オプション）
     health_check: Option<HealthCheckConfig>,
+    /// TLS証明書検証を無効化（自己署名証明書を許可）
+    tls_insecure: bool,
 }
 
 impl UpstreamGroup {
     /// 新しい Upstream グループを作成
-    fn new(name: String, entries: Vec<UpstreamServerEntry>, algorithm: LoadBalanceAlgorithm, health_check: Option<HealthCheckConfig>) -> Option<Self> {
+    fn new(name: String, entries: Vec<UpstreamServerEntry>, algorithm: LoadBalanceAlgorithm, health_check: Option<HealthCheckConfig>, tls_insecure: bool) -> Option<Self> {
         let servers: Vec<UpstreamServer> = entries.iter()
             .filter_map(|entry| {
                 ProxyTarget::parse(&entry.url)
@@ -4208,6 +4225,7 @@ impl UpstreamGroup {
             algorithm,
             rr_counter: Arc::new(AtomicUsize::new(0)),
             health_check,
+            tls_insecure,
         })
     }
     
@@ -4219,6 +4237,7 @@ impl UpstreamGroup {
             algorithm: LoadBalanceAlgorithm::RoundRobin,
             rr_counter: Arc::new(AtomicUsize::new(0)),
             health_check: None, // 単一サーバーでは健康チェックなし
+            tls_insecure: false, // 単一サーバーではデフォルトで証明書検証を有効
         }
     }
     
@@ -4268,6 +4287,11 @@ impl UpstreamGroup {
     /// サーバー数を取得
     fn len(&self) -> usize {
         self.servers.len()
+    }
+    
+    /// TLS証明書検証を無効化するかどうかを取得
+    fn tls_insecure(&self) -> bool {
+        self.tls_insecure
     }
 }
 
@@ -4897,6 +4921,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
                 cfg.servers.clone(), 
                 cfg.algorithm,
                 cfg.health_check.clone(),
+                cfg.tls_insecure,
             ) {
                 info!("Reloaded upstream '{}' with {} servers ({:?})", 
                       name, group.len(), cfg.algorithm);
@@ -4990,6 +5015,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
                 cfg.servers.clone(), 
                 cfg.algorithm,
                 cfg.health_check.clone(),
+                cfg.tls_insecure,
             ) {
                 info!("Loaded upstream '{}' with {} servers ({:?})", 
                       name, group.len(), cfg.algorithm);
@@ -10155,8 +10181,9 @@ async fn handle_proxy(
 
     let result = if target.use_tls {
         // HTTPS接続（キャッシュ保存はHTTPのみサポート、HTTPSは別途実装が必要）
-        // 環境変数VEIL_TLS_INSECUREでも証明書検証スキップを制御可能（E2Eテスト用）
-        let tls_insecure = std::env::var("VEIL_TLS_INSECURE").map(|v| v == "1" || v == "true").unwrap_or(false);
+        // 設定ファイルの tls_insecure、または環境変数 VEIL_TLS_INSECURE で証明書検証スキップを制御
+        let tls_insecure = upstream_group.tls_insecure() 
+            || std::env::var("VEIL_TLS_INSECURE").map(|v| v == "1" || v == "true").unwrap_or(false);
         proxy_https_pooled(client_stream, target, security, compression, client_encoding, &pool_key, request, content_length, is_chunked, initial_body, client_wants_close, tls_insecure).await
     } else if target.use_h2c {
         // H2C (HTTP/2 over cleartext) 接続
