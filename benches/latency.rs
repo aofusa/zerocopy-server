@@ -189,7 +189,7 @@ fn is_backend_running() -> bool {
 }
 
 /// HTTPSリクエストのレイテンシを測定
-fn measure_request_latency(addr: &str, port: u16) -> Duration {
+fn measure_request_latency(_addr: &str, port: u16) -> Duration {
     let start = Instant::now();
     
     init_crypto_provider();
