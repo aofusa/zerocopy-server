@@ -83,6 +83,12 @@ cargo build --release --features "ktls,http2"
 
 # フルビルド（kTLS + 全プロトコル）
 cargo build --release --features "ktls,all-protocols"
+
+# WASM拡張サポート付きビルド（Proxy-Wasm v0.2.1）
+cargo build --release --features wasm
+
+# 全機能ビルド（kTLS + HTTP/2 + WASM）
+cargo build --release --features "ktls,http2,wasm"
 ```
 
 ビルド後のバイナリは `target/release/veil` に生成されます。
@@ -94,9 +100,11 @@ cargo build --release --features "ktls,all-protocols"
 | `ktls` | kTLSカーネルオフロード | Linux 5.15+、要`modprobe tls` |
 | `http2` | HTTP/2 (ALPN h2) | TLS接続でのHTTP/2サポート |
 | `http3` | HTTP/3 (QUIC) | UDP/QUICベース、quiche使用 |
+| `wasm` | WASM拡張（Proxy-Wasm v0.2.1） | Wasmtime使用、Nginx/Envoy互換 |
 | `all-protocols` | http2 + http3 | 全プロトコル有効化 |
 
 > **Note**: HTTP/3はUDPベースのため、kTLSとの併用はできません（HTTP/3はTCP/TLSを使用しないため）。
+
 
 ## 起動
 
@@ -2496,6 +2504,211 @@ ExecStart=/usr/bin/bwrap \
 - [Landlock](https://docs.kernel.org/userspace-api/landlock.html): ファイルシステムサンドボックス
 - [io_uring Security](https://www.kernel.org/doc/html/latest/userspace-api/io_uring.html): io_uringセキュリティ考慮事項
 - [bubblewrap](https://github.com/containers/bubblewrap): 非特権サンドボックスツール
+
+### WASM拡張
+
+- [Proxy-Wasm](https://github.com/proxy-wasm/spec): Proxy-Wasm ABI仕様
+- [Wasmtime](https://wasmtime.dev/): WebAssemblyランタイム
+- [proxy-wasm-rust-sdk](https://github.com/proxy-wasm/proxy-wasm-rust-sdk): Rust SDK
+
+## WASM拡張機能
+
+VeilはProxy-Wasm ABI v0.2.1に完全準拠したWASM拡張システムを提供します。Nginx/Envoy向けに作成されたProxy-WasmモジュールをそのままVeilで使用できます。
+
+### 特徴
+
+- **Proxy-Wasm v0.2.1準拠**: Nginx/Envoyと100%互換
+- **AOTコンパイル**: `.cwasm`ファイルによる高速起動
+- **Pooling Allocator**: 高速なインスタンス化
+- **Capability制限**: モジュールごとの細かい権限制御（デフォルト全て無効）
+
+### ビルド
+
+```bash
+cargo build --release --features wasm
+```
+
+### 設定
+
+```toml
+[wasm]
+enabled = true
+
+# モジュール定義
+[[wasm.modules]]
+name = "my_filter"
+path = "/etc/veil/wasm/my_filter.wasm"
+configuration = '{"key": "value"}'
+
+[wasm.modules.capabilities]
+# 全てデフォルトfalse、必要な権限のみ有効化
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_send_local_response = true
+allow_http_calls = true
+allowed_upstreams = ["webdis"]  # HTTP呼び出し許可先
+
+# ルート設定
+[wasm.routes."/api/"]
+modules = ["my_filter"]
+```
+
+### Capability一覧
+
+| Capability | 説明 | デフォルト |
+|-----------|------|----------|
+| `allow_logging` | ログ出力 | false |
+| `allow_metrics` | メトリクス操作 | false |
+| `allow_shared_data` | 共有データ | false |
+| `allow_request_headers_read` | リクエストヘッダー読み取り | false |
+| `allow_request_headers_write` | リクエストヘッダー書き換え | false |
+| `allow_request_body_read` | リクエストボディ読み取り | false |
+| `allow_request_body_write` | リクエストボディ書き換え | false |
+| `allow_response_headers_read` | レスポンスヘッダー読み取り | false |
+| `allow_response_headers_write` | レスポンスヘッダー書き換え | false |
+| `allow_response_body_read` | レスポンスボディ読み取り | false |
+| `allow_response_body_write` | レスポンスボディ書き換え | false |
+| `allow_send_local_response` | ローカルレスポンス送信 | false |
+| `allow_http_calls` | HTTP外部呼び出し | false |
+| `allowed_upstreams` | 許可upstream | [] |
+
+### Rustによる拡張機能開発
+
+#### 1. プロジェクト作成
+
+```bash
+cargo new --lib my-filter
+cd my-filter
+```
+
+#### 2. Cargo.toml
+
+```toml
+[package]
+name = "my-filter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2"
+log = "0.4"
+
+[profile.release]
+lto = true
+opt-level = "s"
+
+[workspace]
+```
+
+#### 3. src/lib.rs
+
+```rust
+use proxy_wasm::traits::*;
+use proxy_wasm::types::*;
+
+proxy_wasm::main! {{
+    proxy_wasm::set_log_level(LogLevel::Debug);
+    proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
+        Box::new(MyFilterRoot)
+    });
+}}
+
+struct MyFilterRoot;
+
+impl Context for MyFilterRoot {}
+
+impl RootContext for MyFilterRoot {
+    fn get_type(&self) -> Option<ContextType> {
+        Some(ContextType::HttpContext)
+    }
+
+    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
+        Some(Box::new(MyFilter { context_id }))
+    }
+}
+
+struct MyFilter {
+    context_id: u32,
+}
+
+impl Context for MyFilter {}
+
+impl HttpContext for MyFilter {
+    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+        // リクエストヘッダーにカスタムヘッダーを追加
+        self.add_http_request_header("X-My-Filter", "enabled");
+        
+        // ヘッダー値を取得
+        if let Some(path) = self.get_http_request_header(":path") {
+            log::info!("Request path: {}", path);
+        }
+        
+        Action::Continue
+    }
+
+    fn on_http_response_headers(&mut self, _: usize, _: bool) -> Action {
+        // レスポンスヘッダーを追加
+        self.add_http_response_header("X-Processed-By", "my-filter");
+        Action::Continue
+    }
+}
+```
+
+#### 4. ビルド
+
+```bash
+# WASIターゲットを追加
+rustup target add wasm32-wasip1
+
+# ビルド
+cargo build --target wasm32-wasip1 --release
+
+# 出力: target/wasm32-wasip1/release/my_filter.wasm
+```
+
+#### 5. 配置と設定
+
+```bash
+# WASMモジュールを配置
+cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
+
+# config.tomlに設定を追加
+```
+
+### 外部サービス連携（HTTP呼び出し）
+
+Proxy-Wasmの`dispatch_http_call`を使用して外部HTTPサービス（Redis用Webdis等）を呼び出せます：
+
+```rust
+fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+    // Webdis経由でRedisにアクセス
+    self.dispatch_http_call(
+        "webdis",  // upstream名（config.tomlで定義）
+        vec![
+            (":method", "GET"),
+            (":path", "/GET/my_key"),
+            (":authority", "webdis"),
+        ],
+        None,
+        vec![],
+        Duration::from_millis(50),
+    ).unwrap();
+    
+    Action::Pause  // レスポンス待ち
+}
+
+fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize) {
+    if let Some(body) = self.get_http_call_response_body(0, body_size) {
+        // Redisからの値を処理
+        log::info!("Redis response: {:?}", body);
+    }
+    self.resume_http_request();
+}
+```
 
 ## ロゴ
 

@@ -83,6 +83,12 @@ cargo build --release --features "ktls,http2"
 
 # Full build (kTLS + all protocols)
 cargo build --release --features "ktls,all-protocols"
+
+# Build with WASM extension support (Proxy-Wasm v0.2.1)
+cargo build --release --features wasm
+
+# Full featured build (kTLS + HTTP/2 + WASM)
+cargo build --release --features "ktls,http2,wasm"
 ```
 
 After building, the binary is generated at `target/release/veil`.
@@ -94,6 +100,7 @@ After building, the binary is generated at `target/release/veil`.
 | `ktls` | kTLS kernel offload | Linux 5.15+, requires `modprobe tls` |
 | `http2` | HTTP/2 (ALPN h2) | HTTP/2 support for TLS connections |
 | `http3` | HTTP/3 (QUIC) | UDP/QUIC based, uses quiche |
+| `wasm` | WASM Extension (Proxy-Wasm v0.2.1) | Uses Wasmtime, Nginx/Envoy compatible |
 | `all-protocols` | http2 + http3 | Enable all protocols |
 
 > **Note**: HTTP/3 is UDP-based, so it cannot be used with kTLS (HTTP/3 does not use TCP/TLS).
@@ -2496,6 +2503,211 @@ In this configuration, systemd creates the outer "container" and bubblewrap prov
 - [Landlock](https://docs.kernel.org/userspace-api/landlock.html): Filesystem sandbox
 - [io_uring Security](https://www.kernel.org/doc/html/latest/userspace-api/io_uring.html): io_uring security considerations
 - [bubblewrap](https://github.com/containers/bubblewrap): Unprivileged sandboxing tool
+
+### WASM Extensions
+
+- [Proxy-Wasm](https://github.com/proxy-wasm/spec): Proxy-Wasm ABI Specification
+- [Wasmtime](https://wasmtime.dev/): WebAssembly Runtime
+- [proxy-wasm-rust-sdk](https://github.com/proxy-wasm/proxy-wasm-rust-sdk): Rust SDK
+
+## WASM Extension System
+
+Veil provides a WASM extension system fully compliant with Proxy-Wasm ABI v0.2.1. Proxy-Wasm modules created for Nginx/Envoy can be used with Veil without modification.
+
+### Features
+
+- **Proxy-Wasm v0.2.1 Compliant**: 100% compatible with Nginx/Envoy
+- **AOT Compilation**: Fast startup with `.cwasm` files
+- **Pooling Allocator**: High-speed instance creation
+- **Capability Restrictions**: Fine-grained per-module permission control (all disabled by default)
+
+### Build
+
+```bash
+cargo build --release --features wasm
+```
+
+### Configuration
+
+```toml
+[wasm]
+enabled = true
+
+# Module definition
+[[wasm.modules]]
+name = "my_filter"
+path = "/etc/veil/wasm/my_filter.wasm"
+configuration = '{"key": "value"}'
+
+[wasm.modules.capabilities]
+# All default to false, enable only required permissions
+allow_logging = true
+allow_request_headers_read = true
+allow_request_headers_write = true
+allow_send_local_response = true
+allow_http_calls = true
+allowed_upstreams = ["webdis"]  # Allowed HTTP call destinations
+
+# Route configuration
+[wasm.routes."/api/"]
+modules = ["my_filter"]
+```
+
+### Capability List
+
+| Capability | Description | Default |
+|-----------|-------------|---------|
+| `allow_logging` | Log output | false |
+| `allow_metrics` | Metrics operations | false |
+| `allow_shared_data` | Shared data access | false |
+| `allow_request_headers_read` | Read request headers | false |
+| `allow_request_headers_write` | Modify request headers | false |
+| `allow_request_body_read` | Read request body | false |
+| `allow_request_body_write` | Modify request body | false |
+| `allow_response_headers_read` | Read response headers | false |
+| `allow_response_headers_write` | Modify response headers | false |
+| `allow_response_body_read` | Read response body | false |
+| `allow_response_body_write` | Modify response body | false |
+| `allow_send_local_response` | Send local response | false |
+| `allow_http_calls` | HTTP external calls | false |
+| `allowed_upstreams` | Allowed upstreams | [] |
+
+### Developing Extensions with Rust
+
+#### 1. Create Project
+
+```bash
+cargo new --lib my-filter
+cd my-filter
+```
+
+#### 2. Cargo.toml
+
+```toml
+[package]
+name = "my-filter"
+version = "0.1.0"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+proxy-wasm = "0.2"
+log = "0.4"
+
+[profile.release]
+lto = true
+opt-level = "s"
+
+[workspace]
+```
+
+#### 3. src/lib.rs
+
+```rust
+use proxy_wasm::traits::*;
+use proxy_wasm::types::*;
+
+proxy_wasm::main! {{
+    proxy_wasm::set_log_level(LogLevel::Debug);
+    proxy_wasm::set_root_context(|_| -> Box<dyn RootContext> {
+        Box::new(MyFilterRoot)
+    });
+}}
+
+struct MyFilterRoot;
+
+impl Context for MyFilterRoot {}
+
+impl RootContext for MyFilterRoot {
+    fn get_type(&self) -> Option<ContextType> {
+        Some(ContextType::HttpContext)
+    }
+
+    fn create_http_context(&self, context_id: u32) -> Option<Box<dyn HttpContext>> {
+        Some(Box::new(MyFilter { context_id }))
+    }
+}
+
+struct MyFilter {
+    context_id: u32,
+}
+
+impl Context for MyFilter {}
+
+impl HttpContext for MyFilter {
+    fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+        // Add custom header to request
+        self.add_http_request_header("X-My-Filter", "enabled");
+        
+        // Get header value
+        if let Some(path) = self.get_http_request_header(":path") {
+            log::info!("Request path: {}", path);
+        }
+        
+        Action::Continue
+    }
+
+    fn on_http_response_headers(&mut self, _: usize, _: bool) -> Action {
+        // Add response header
+        self.add_http_response_header("X-Processed-By", "my-filter");
+        Action::Continue
+    }
+}
+```
+
+#### 4. Build
+
+```bash
+# Add WASI target
+rustup target add wasm32-wasip1
+
+# Build
+cargo build --target wasm32-wasip1 --release
+
+# Output: target/wasm32-wasip1/release/my_filter.wasm
+```
+
+#### 5. Deploy and Configure
+
+```bash
+# Deploy WASM module
+cp target/wasm32-wasip1/release/my_filter.wasm /etc/veil/wasm/
+
+# Add configuration to config.toml
+```
+
+### External Service Integration (HTTP Calls)
+
+Use Proxy-Wasm's `dispatch_http_call` to call external HTTP services (e.g., Webdis for Redis):
+
+```rust
+fn on_http_request_headers(&mut self, _: usize, _: bool) -> Action {
+    // Access Redis via Webdis
+    self.dispatch_http_call(
+        "webdis",  // upstream name (defined in config.toml)
+        vec![
+            (":method", "GET"),
+            (":path", "/GET/my_key"),
+            (":authority", "webdis"),
+        ],
+        None,
+        vec![],
+        Duration::from_millis(50),
+    ).unwrap();
+    
+    Action::Pause  // Wait for response
+}
+
+fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize) {
+    if let Some(body) = self.get_http_call_response_body(0, body_size) {
+        // Process value from Redis
+        log::info!("Redis response: {:?}", body);
+    }
+    self.resume_http_request();
+}
+```
 
 ## Logos
 

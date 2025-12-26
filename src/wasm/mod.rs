@@ -23,6 +23,9 @@ mod host;
 mod registry;
 mod types;
 
+#[cfg(test)]
+mod tests;
+
 pub use capabilities::{CapabilityPreset, ModuleCapabilities};
 pub use constants::*;
 pub use context::HttpContext;

@@ -10,3 +10,9 @@ tests/fixtures/backend1/*
 !tests/fixtures/backend1/.gitkeep
 tests/fixtures/backend2/*
 !tests/fixtures/backend2/.gitkeep
+
+# WASM ビルドアーティファクト
+# サンプルフィルタのビルド成果物
+examples/wasm-filters/*/target/
+examples/wasm-filters/*/Cargo.lock
+tests/wasm/*.wasm
