@@ -58,8 +58,8 @@ fn get_property_value(state: &HostState, path: &str) -> Option<Vec<u8>> {
 fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
     let func = caller.get_export("proxy_on_memory_allocate")?;
     let func = func.into_func()?;
-    let typed = func.typed::<i32, i32>(caller).ok()?;
-    typed.call(caller, size as i32).ok()
+    let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
+    typed.call(&mut *caller, size as i32).ok()
 }
 
 /// Helper to write to WASM memory
@@ -82,7 +82,7 @@ fn write_to_wasm(caller: &mut Caller<'_, HostState>, ptr: i32, data: &[u8]) -> b
 }
 
 /// Helper to read string from WASM memory
-fn read_bytes(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
+fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
     let memory = caller.get_export("memory")?;
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
@@ -141,7 +141,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
          return_value_size: i32|
          -> i32 {
             // Read path from WASM memory
-            let path_data = match read_bytes(&caller, path_ptr, path_size) {
+            let path_data = match read_bytes(&mut caller, path_ptr, path_size) {
                 Some(d) => d,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };

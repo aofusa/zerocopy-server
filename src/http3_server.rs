@@ -44,6 +44,7 @@ use crate::{
     CURRENT_CONFIG, SHUTDOWN_FLAG,
 };
 
+
 /// memfd_create システムコールのラッパー（セキュリティ強化版）
 /// 
 /// 匿名のメモリファイルを作成します。このファイルはファイルシステム上には
@@ -468,9 +469,66 @@ impl Http3Handler {
             return Ok(());
         }
 
+        // WASMモジュールの適用
+        #[cfg(feature = "wasm")]
+        {
+            let config = CURRENT_CONFIG.load();
+            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                let path_str = std::str::from_utf8(&path).unwrap_or("/");
+                let method_str = std::str::from_utf8(&method).unwrap_or("GET");
+                
+                let modules_to_apply = if let Some(backend_modules) = backend.modules() {
+                    backend_modules.to_vec()
+                } else {
+                    wasm_engine.get_modules_for_path(path_str)
+                        .iter()
+                        .map(|m| m.name.clone())
+                        .collect()
+                };
+                
+                if !modules_to_apply.is_empty() {
+                    // HTTP/3のヘッダーを取得
+                    let headers_vec: Vec<(String, String)> = headers.iter()
+                        .filter(|h| !h.name().starts_with(b":")) // 疑似ヘッダーを除外
+                        .map(|h| (
+                            String::from_utf8_lossy(h.name()).to_string(),
+                            String::from_utf8_lossy(h.value()).to_string()
+                        ))
+                        .collect();
+                    
+                    let wasm_result = wasm_engine.on_request_headers_with_modules(
+                        &modules_to_apply,
+                        path_str,
+                        method_str,
+                        &headers_vec,
+                        &self.client_ip,
+                        request_body.is_empty(), // end_of_stream
+                    );
+                    
+                    match wasm_result {
+                        crate::wasm::FilterResult::LocalResponse(resp) => {
+                            // ローカルレスポンスを返送
+                            self.send_response(stream_id, resp.status_code, &resp.headers.iter()
+                                .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+                                .collect::<Vec<_>>(), Some(&resp.body))?;
+                            self.record_metrics(&method, &authority, resp.status_code, request_body.len(), resp.body.len(), start_time);
+                            return Ok(());
+                        }
+                        crate::wasm::FilterResult::Pause => {
+                            warn!("WASM module requested pause, but async operations are not yet supported");
+                        }
+                        crate::wasm::FilterResult::Continue { .. } => {
+                            // ヘッダー変更はHTTP/3では複雑なため、現時点ではスキップ
+                            // 将来的に実装可能
+                        }
+                    }
+                }
+            }
+        }
+
         // バックエンド処理
         let (status, resp_size) = match backend {
-            Backend::Proxy(upstream_group, _, path_compression, _buffering, _cache) => {
+            Backend::Proxy(upstream_group, _, path_compression, _buffering, _cache, _) => {
                 debug!("[HTTP/3] Starting proxy request to upstream group");
                 
                 // HTTP/3専用圧縮設定を解決
@@ -486,7 +544,7 @@ impl Http3Handler {
                 debug!("[HTTP/3] Proxy request completed: status={}, size={}", result.0, result.1);
                 result
             }
-            Backend::MemoryFile(data, mime_type, security) => {
+            Backend::MemoryFile(data, mime_type, security, _) => {
                 // パス完全一致チェック
                 let path_str = std::str::from_utf8(&path).unwrap_or("/");
                 let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
@@ -520,11 +578,11 @@ impl Http3Handler {
                     (200, data.len())
                 }
             }
-            Backend::SendFile(base_path, is_dir, index_file, security, _cache) => {
+            Backend::SendFile(base_path, is_dir, index_file, security, _cache, _) => {
                 self.handle_sendfile(stream_id, &base_path, is_dir, index_file.as_deref(), &path, &prefix, &security)
                     .unwrap_or((404, 9))
             }
-            Backend::Redirect(redirect_url, status_code, preserve_path) => {
+            Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
                 self.handle_redirect(stream_id, &redirect_url, status_code, preserve_path, &path, &prefix)
                     .unwrap_or((500, 0))
             }

@@ -6,7 +6,7 @@ use crate::wasm::constants::*;
 use crate::wasm::context::HostState;
 
 /// Helper to read bytes from WASM memory
-fn read_bytes(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
+fn read_bytes(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<u8>> {
     let memory = caller.get_export("memory")?;
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
@@ -25,8 +25,8 @@ fn read_bytes(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<Vec<
 fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
     let func = caller.get_export("proxy_on_memory_allocate")?;
     let func = func.into_func()?;
-    let typed = func.typed::<i32, i32>(caller).ok()?;
-    typed.call(caller, size as i32).ok()
+    let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
+    typed.call(&mut *caller, size as i32).ok()
 }
 
 /// Add shared data functions to linker
@@ -51,7 +51,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Read key
-            let key = match read_bytes(&caller, key_ptr, key_size) {
+            let key = match read_bytes(&mut caller, key_ptr, key_size) {
                 Some(k) => String::from_utf8_lossy(&k).to_string(),
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
@@ -129,13 +129,13 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Read key
-            let key = match read_bytes(&caller, key_ptr, key_size) {
+            let key = match read_bytes(&mut caller, key_ptr, key_size) {
                 Some(k) => String::from_utf8_lossy(&k).to_string(),
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
             // Read value
-            let value = match read_bytes(&caller, value_ptr, value_size) {
+            let value = match read_bytes(&mut caller, value_ptr, value_size) {
                 Some(v) => v,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };

@@ -181,3 +181,41 @@ pub struct Metric {
     pub metric_type: i32,
     pub value: MetricValue,
 }
+
+impl WasmConfig {
+    /// Validate WASM configuration
+    pub fn validate(&self) -> anyhow::Result<()> {
+        use std::collections::HashSet;
+        
+        // モジュール名の重複チェック
+        let mut module_names = HashSet::new();
+        for module in &self.modules {
+            if !module_names.insert(&module.name) {
+                anyhow::bail!("Duplicate module name: {}", module.name);
+            }
+        }
+
+        // ルートで参照されているモジュールが存在するかチェック
+        for (route, route_modules) in &self.routes {
+            for module_name in &route_modules.modules {
+                if !self.modules.iter().any(|m| &m.name == module_name) {
+                    anyhow::bail!(
+                        "Route '{}' references unknown module: {}",
+                        route,
+                        module_name
+                    );
+                }
+            }
+        }
+
+        // モジュールファイルの存在チェック
+        for module in &self.modules {
+            let path = std::path::Path::new(&module.path);
+            if !path.exists() {
+                anyhow::bail!("WASM module file not found: {}", module.path);
+            }
+        }
+
+        Ok(())
+    }
+}

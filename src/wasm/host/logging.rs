@@ -1,6 +1,7 @@
 //! Logging Host Functions
 
 use wasmtime::{Caller, Linker};
+use ftlog::{trace, debug, info, warn, error};
 
 use crate::wasm::constants::*;
 use crate::wasm::context::HostState;
@@ -11,15 +12,8 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
     linker.func_wrap(
         "env",
         "proxy_log",
-        |caller: Caller<'_, HostState>, level: i32, msg_ptr: i32, msg_size: i32| -> i32 {
-            let state = caller.data();
-
-            // Check capability
-            if !state.http_ctx.capabilities.allow_logging {
-                return PROXY_RESULT_OK; // Silently ignore
-            }
-
-            // Read message from WASM memory
+        |mut caller: Caller<'_, HostState>, level: i32, msg_ptr: i32, msg_size: i32| -> i32 {
+            // Read message from WASM memory first
             let memory = match caller.get_export("memory") {
                 Some(wasmtime::Extern::Memory(mem)) => mem,
                 _ => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
@@ -38,16 +32,22 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 Err(_) => return PROXY_RESULT_PARSE_FAILURE,
             };
 
+            // Check capability after reading message
+            let state = caller.data();
+            if !state.http_ctx.capabilities.allow_logging {
+                return PROXY_RESULT_OK; // Silently ignore
+            }
+
             let plugin_name = &state.http_ctx.plugin_name;
 
             match level {
-                LOG_TRACE => log::trace!("[wasm:{}] {}", plugin_name, msg),
-                LOG_DEBUG => log::debug!("[wasm:{}] {}", plugin_name, msg),
-                LOG_INFO => log::info!("[wasm:{}] {}", plugin_name, msg),
-                LOG_WARN => log::warn!("[wasm:{}] {}", plugin_name, msg),
-                LOG_ERROR => log::error!("[wasm:{}] {}", plugin_name, msg),
-                LOG_CRITICAL => log::error!("[wasm:{}] CRITICAL: {}", plugin_name, msg),
-                _ => log::info!("[wasm:{}] {}", plugin_name, msg),
+                LOG_TRACE => trace!("[wasm:{}] {}", plugin_name, msg),
+                LOG_DEBUG => debug!("[wasm:{}] {}", plugin_name, msg),
+                LOG_INFO => info!("[wasm:{}] {}", plugin_name, msg),
+                LOG_WARN => warn!("[wasm:{}] {}", plugin_name, msg),
+                LOG_ERROR => error!("[wasm:{}] {}", plugin_name, msg),
+                LOG_CRITICAL => error!("[wasm:{}] CRITICAL: {}", plugin_name, msg),
+                _ => info!("[wasm:{}] {}", plugin_name, msg),
             }
 
             PROXY_RESULT_OK

@@ -51,8 +51,8 @@ fn check_write_capability(state: &HostState, buffer_type: i32) -> bool {
 fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Option<i32> {
     let func = caller.get_export("proxy_on_memory_allocate")?;
     let func = func.into_func()?;
-    let typed = func.typed::<i32, i32>(caller).ok()?;
-    typed.call(caller, size as i32).ok()
+    let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
+    typed.call(&mut *caller, size as i32).ok()
 }
 
 /// Helper to write to WASM memory

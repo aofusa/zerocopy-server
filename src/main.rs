@@ -140,6 +140,10 @@ pub mod buffering;
 /// - Cache-Control / Vary ヘッダー対応
 pub mod cache;
 
+/// WASM拡張モジュール（Proxy-Wasm v0.2.1互換）
+#[cfg(feature = "wasm")]
+pub mod wasm;
+
 use httparse::{Request, Status};
 use monoio::fs::OpenOptions;
 use monoio::buf::{IoBuf, IoBufMut};
@@ -3200,6 +3204,10 @@ struct Config {
     upstreams: Option<HashMap<String, UpstreamConfig>>,
     host_routes: Option<HashMap<String, BackendConfig>>,
     path_routes: Option<HashMap<String, HashMap<String, BackendConfig>>>,
+    /// WASM拡張設定（feature flagで条件付きコンパイル）
+    #[cfg(feature = "wasm")]
+    #[serde(default)]
+    wasm: Option<crate::wasm::WasmConfig>,
 }
 
 // ====================
@@ -3754,6 +3762,8 @@ enum BackendConfig {
         compression: CompressionConfig,
         buffering: buffering::BufferingConfig,
         cache: cache::CacheConfig,
+        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        modules: Option<Vec<String>>,
     },
     /// Upstream グループ参照（ロードバランシング用）
     /// - compression: 圧縮設定（オプション）
@@ -3765,6 +3775,8 @@ enum BackendConfig {
         compression: CompressionConfig,
         buffering: buffering::BufferingConfig,
         cache: cache::CacheConfig,
+        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        modules: Option<Vec<String>>,
     },
     /// File バックエンド設定
     /// - path: ファイルまたはディレクトリのパス
@@ -3778,12 +3790,20 @@ enum BackendConfig {
         index: Option<String>, 
         security: SecurityConfig,
         cache: cache::CacheConfig,
+        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        modules: Option<Vec<String>>,
     },
     /// Redirect バックエンド設定
     /// - redirect_url: リダイレクト先URL（$request_uri, $host, $path 変数使用可能）
     /// - redirect_status: ステータスコード（301, 302, 307, 308）
     /// - preserve_path: 元のパスをリダイレクト先に追加するか
-    Redirect { redirect_url: String, redirect_status: u16, preserve_path: bool },
+    Redirect { 
+        redirect_url: String, 
+        redirect_status: u16, 
+        preserve_path: bool,
+        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        modules: Option<Vec<String>>,
+    },
 }
 
 impl<'de> serde::Deserialize<'de> for BackendConfig {
@@ -3827,6 +3847,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut buffering_config: Option<buffering::BufferingConfig> = None;
                 // キャッシュ設定（Proxy/File用）
                 let mut cache_config: Option<cache::CacheConfig> = None;
+                // WASMモジュール名のリスト
+                let mut modules: Option<Vec<String>> = None;
                 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -3845,6 +3867,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "preserve_path" => preserve_path = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
+                        "modules" => modules = Some(map.next_value()?),
                         _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
                     }
                 }
@@ -3865,6 +3888,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                                 compression,
                                 buffering,
                                 cache,
+                                modules,
                             })
                         } else {
                             let url = url.ok_or_else(|| serde::de::Error::missing_field("url or upstream"))?;
@@ -3877,6 +3901,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                                 compression,
                                 buffering,
                                 cache,
+                                modules,
                             })
                         }
                     }
@@ -3891,12 +3916,24 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             )));
                         }
                         let preserve_path = preserve_path.unwrap_or(false);
-                        Ok(BackendConfig::Redirect { redirect_url, redirect_status, preserve_path })
+                        Ok(BackendConfig::Redirect { 
+                            redirect_url, 
+                            redirect_status, 
+                            preserve_path,
+                            modules,
+                        })
                     }
                     "File" | _ => {
                         let path = path.ok_or_else(|| serde::de::Error::missing_field("path"))?;
                         let mode = mode.unwrap_or_else(|| "sendfile".to_string());
-                        Ok(BackendConfig::File { path, mode, index, security, cache })
+                        Ok(BackendConfig::File { 
+                            path, 
+                            mode, 
+                            index, 
+                            security, 
+                            cache,
+                            modules,
+                        })
                     }
                 }
             }
@@ -3924,24 +3961,46 @@ enum Backend {
         Arc<CompressionConfig>,
         Arc<buffering::BufferingConfig>,
         Arc<cache::CacheConfig>,
+        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        Option<Arc<Vec<String>>>,
     ),
     /// MemoryFile バックエンド
     /// - Arc<Vec<u8>>: ファイルコンテンツ
     /// - Arc<str>: MIMEタイプ
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
-    MemoryFile(Arc<Vec<u8>>, Arc<str>, Arc<SecurityConfig>),
+    MemoryFile(
+        Arc<Vec<u8>>, 
+        Arc<str>, 
+        Arc<SecurityConfig>,
+        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        Option<Arc<Vec<String>>>,
+    ),
     /// SendFile バックエンド
     /// - Arc<PathBuf>: ベースパス
     /// - bool: ディレクトリかどうか
     /// - Option<Arc<str>>: インデックスファイル名（None = "index.html"）
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
     /// - Arc<cache::CacheConfig>: キャッシュ設定
-    SendFile(Arc<PathBuf>, bool, Option<Arc<str>>, Arc<SecurityConfig>, Arc<cache::CacheConfig>),
+    SendFile(
+        Arc<PathBuf>, 
+        bool, 
+        Option<Arc<str>>, 
+        Arc<SecurityConfig>, 
+        Arc<cache::CacheConfig>,
+        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        Option<Arc<Vec<String>>>,
+    ),
     /// Redirect バックエンド
     /// - Arc<str>: リダイレクト先URL
     /// - u16: ステータスコード（301, 302, 307, 308）
     /// - bool: 元のパスを保持するか
-    Redirect(Arc<str>, u16, bool),
+    Redirect(
+        Arc<str>, 
+        u16, 
+        bool,
+        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        Option<Arc<Vec<String>>>,
+    ),
 }
 
 impl Backend {
@@ -3952,10 +4011,21 @@ impl Backend {
         static DEFAULT_SECURITY: Lazy<SecurityConfig> = Lazy::new(SecurityConfig::default);
         
         match self {
-            Backend::Proxy(_, security, _, _, _) => security,
-            Backend::MemoryFile(_, _, security) => security,
-            Backend::SendFile(_, _, _, security, _) => security,
-            Backend::Redirect(_, _, _) => &DEFAULT_SECURITY,
+            Backend::Proxy(_, security, _, _, _, _) => security,
+            Backend::MemoryFile(_, _, security, _) => security,
+            Backend::SendFile(_, _, _, security, _, _) => security,
+            Backend::Redirect(_, _, _, _) => &DEFAULT_SECURITY,
+        }
+    }
+    
+    /// このバックエンドに適用するWASMモジュール名のリストを取得
+    #[inline]
+    pub fn modules(&self) -> Option<&[String]> {
+        match self {
+            Backend::Proxy(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
+            Backend::MemoryFile(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
+            Backend::SendFile(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
+            Backend::Redirect(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
         }
     }
     
@@ -3964,7 +4034,7 @@ impl Backend {
     #[allow(dead_code)]
     fn buffering(&self) -> Option<&buffering::BufferingConfig> {
         match self {
-            Backend::Proxy(_, _, _, buffering, _) => Some(buffering),
+            Backend::Proxy(_, _, _, buffering, _, _) => Some(buffering),
             _ => None,
         }
     }
@@ -3974,8 +4044,8 @@ impl Backend {
     #[allow(dead_code)]
     fn cache(&self) -> Option<&cache::CacheConfig> {
         match self {
-            Backend::Proxy(_, _, _, _, cache) => Some(cache),
-            Backend::SendFile(_, _, _, _, cache) => Some(cache),
+            Backend::Proxy(_, _, _, _, cache, _) => Some(cache),
+            Backend::SendFile(_, _, _, _, cache, _) => Some(cache),
             _ => None,
         }
     }
@@ -4574,7 +4644,12 @@ fn validate_config(config: &Config) -> io::Result<()> {
     // ホストルートの妥当性チェック
     if let Some(ref host_routes) = config.host_routes {
         for (host, backend) in host_routes {
-            validate_backend_config(backend, host)?;
+            validate_backend_config(
+                backend, 
+                host,
+                #[cfg(feature = "wasm")]
+                config.wasm.as_ref(),
+            )?;
         }
     }
     
@@ -4582,8 +4657,25 @@ fn validate_config(config: &Config) -> io::Result<()> {
     if let Some(ref path_routes) = config.path_routes {
         for (host, paths) in path_routes {
             for (path, backend) in paths {
-                validate_backend_config(backend, &format!("{}:{}", host, path))?;
+                validate_backend_config(
+                    backend, 
+                    &format!("{}:{}", host, path),
+                    #[cfg(feature = "wasm")]
+                    config.wasm.as_ref(),
+                )?;
             }
+        }
+    }
+    
+    // WASM設定のバリデーション
+    #[cfg(feature = "wasm")]
+    if let Some(wasm_cfg) = &config.wasm {
+        if wasm_cfg.enabled {
+            wasm_cfg.validate()
+                .map_err(|e| io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    format!("WASM config validation failed: {}", e)
+                ))?;
         }
     }
     
@@ -4591,7 +4683,12 @@ fn validate_config(config: &Config) -> io::Result<()> {
 }
 
 /// バックエンド設定の妥当性チェック
-fn validate_backend_config(config: &BackendConfig, route_name: &str) -> io::Result<()> {
+fn validate_backend_config(
+    config: &BackendConfig, 
+    route_name: &str,
+    #[cfg(feature = "wasm")]
+    wasm_config: Option<&crate::wasm::WasmConfig>,
+) -> io::Result<()> {
     match config {
         BackendConfig::Proxy { url, .. } => {
             if ProxyTarget::parse(url).is_none() {
@@ -4642,7 +4739,37 @@ fn validate_backend_config(config: &BackendConfig, route_name: &str) -> io::Resu
         }
     }
     
+    // WASMモジュールの参照チェック
+    #[cfg(feature = "wasm")]
+    if let Some(wasm_cfg) = wasm_config {
+        if let Some(modules) = config.modules() {
+            for module_name in modules {
+                if !wasm_cfg.modules.iter().any(|m| &m.name == module_name) {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        format!(
+                            "Route '{}' references unknown WASM module: {}",
+                            route_name, module_name
+                        )
+                    ));
+                }
+            }
+        }
+    }
+    
     Ok(())
+}
+
+// BackendConfigにmodules()メソッドを追加
+impl BackendConfig {
+    pub fn modules(&self) -> Option<&Vec<String>> {
+        match self {
+            BackendConfig::Proxy { modules, .. } => modules.as_ref(),
+            BackendConfig::ProxyUpstream { modules, .. } => modules.as_ref(),
+            BackendConfig::File { modules, .. } => modules.as_ref(),
+            BackendConfig::Redirect { modules, .. } => modules.as_ref(),
+        }
+    }
 }
 
 // rustls 用の TLS 設定読み込み（統一）
@@ -4745,6 +4872,9 @@ struct LoadedConfig {
     /// HTTP/3 設定（詳細設定）
     #[cfg(feature = "http3")]
     http3_config: Http3ConfigSection,
+    /// WASM Filter Engine（WASM機能が有効な場合）
+    #[cfg(feature = "wasm")]
+    wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
 }
 
 // ====================
@@ -4799,6 +4929,9 @@ struct RuntimeConfig {
     /// HTTP/3 設定（圧縮設定の解決に使用）
     #[cfg(feature = "http3")]
     http3_config: Http3ConfigSection,
+    /// WASM Filter Engine（WASM機能が有効な場合）
+    #[cfg(feature = "wasm")]
+    wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
 }
 
 impl Default for RuntimeConfig {
@@ -4817,6 +4950,8 @@ impl Default for RuntimeConfig {
             http2_config: Http2ConfigSection::default(),
             #[cfg(feature = "http3")]
             http3_config: Http3ConfigSection::default(),
+            #[cfg(feature = "wasm")]
+            wasm_filter_engine: None,
         }
     }
 }
@@ -4875,6 +5010,8 @@ fn reload_config(path: &Path) -> io::Result<()> {
         http2_config: loaded.http2_config,
         #[cfg(feature = "http3")]
         http3_config: loaded.http3_config,
+        #[cfg(feature = "wasm")]
+        wasm_filter_engine: current.wasm_filter_engine.clone(),
     };
     
     // アトミックに設定を入れ替え
@@ -5105,6 +5242,40 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
     info!("TLS certificates pre-loaded for Landlock compatibility (cert: {} bytes, key: {} bytes)",
           tls_cert_pem.len(), tls_key_pem.len());
 
+    // WASM Filter Engineの初期化
+    #[cfg(feature = "wasm")]
+    let wasm_filter_engine = if let Some(wasm_config) = &config.wasm {
+        if wasm_config.enabled {
+            // バリデーション（validate_configで既に実行されているが、念のため）
+            if let Err(e) = wasm_config.validate() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("WASM config validation failed: {}", e)
+                ));
+            }
+            
+            // FilterEngine初期化
+            info!("Initializing WASM Filter Engine...");
+            match crate::wasm::init(wasm_config) {
+                Ok(engine) => {
+                    info!("WASM Filter Engine initialized successfully");
+                    Some(Arc::new(engine))
+                }
+                Err(e) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("Failed to initialize WASM Filter Engine: {}", e)
+                    ));
+                }
+            }
+        } else {
+            info!("WASM extensions disabled");
+            None
+        }
+    } else {
+        None
+    };
+
     Ok(LoadedConfig {
         listen_addr: config.server.listen,
         listen_http_addr,
@@ -5133,6 +5304,8 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         http2_config,
         #[cfg(feature = "http3")]
         http3_config,
+        #[cfg(feature = "wasm")]
+        wasm_filter_engine,
     })
 }
 
@@ -5400,7 +5573,7 @@ fn load_backend(
     upstream_groups: &HashMap<String, Arc<UpstreamGroup>>,
 ) -> io::Result<Backend> {
     match config {
-        BackendConfig::Proxy { url, sni_name, use_h2c, security, compression, buffering, cache } => {
+        BackendConfig::Proxy { url, sni_name, use_h2c, security, compression, buffering, cache, modules } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
@@ -5430,15 +5603,17 @@ fn load_backend(
             }
             
             let group = UpstreamGroup::single(target);
+            let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
             Ok(Backend::Proxy(
                 Arc::new(group), 
                 Arc::new(security.clone()), 
                 Arc::new(compression.clone()),
                 Arc::new(buffering.clone()),
                 Arc::new(cache.clone()),
+                modules_arc,
             ))
         }
-        BackendConfig::ProxyUpstream { upstream, security, compression, buffering, cache } => {
+        BackendConfig::ProxyUpstream { upstream, security, compression, buffering, cache, modules } => {
             // Upstream グループ参照
             let group = upstream_groups.get(upstream)
                 .ok_or_else(|| io::Error::new(
@@ -5464,15 +5639,17 @@ fn load_backend(
                       upstream, cache.max_memory_size, cache.default_ttl_secs);
             }
             
+            let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
             Ok(Backend::Proxy(
                 group.clone(), 
                 Arc::new(security.clone()), 
                 Arc::new(compression.clone()),
                 Arc::new(buffering.clone()),
                 Arc::new(cache.clone()),
+                modules_arc,
             ))
         }
-        BackendConfig::File { path, mode, index, security, cache } => {
+        BackendConfig::File { path, mode, index, security, cache, modules } => {
             let metadata = fs::metadata(path)?;
             let is_dir = metadata.is_dir();
             // インデックスファイル名を Arc<str> に変換（None = デフォルトで "index.html"）
@@ -5493,15 +5670,20 @@ fn load_backend(
                     }
                     let data = fs::read(path)?;
                     let mime_type = mime_guess::from_path(path).first_or_octet_stream();
+                    let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
                     
-                    Ok(Backend::MemoryFile(Arc::new(data), Arc::from(mime_type.as_ref()), security))
+                    Ok(Backend::MemoryFile(Arc::new(data), Arc::from(mime_type.as_ref()), security, modules_arc))
                 }
-                "sendfile" | "" => Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security, cache)),
+                "sendfile" | "" => {
+                    let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
+                    Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security, cache, modules_arc))
+                }
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
         }
-        BackendConfig::Redirect { redirect_url, redirect_status, preserve_path } => {
-            Ok(Backend::Redirect(Arc::from(redirect_url.as_str()), *redirect_status, *preserve_path))
+        BackendConfig::Redirect { redirect_url, redirect_status, preserve_path, modules } => {
+            let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
+            Ok(Backend::Redirect(Arc::from(redirect_url.as_str()), *redirect_status, *preserve_path, modules_arc))
         }
     }
 }
@@ -5765,6 +5947,8 @@ fn main() {
         http2_config: loaded_config.http2_config.clone(),
         #[cfg(feature = "http3")]
         http3_config: loaded_config.http3_config.clone(),
+        #[cfg(feature = "wasm")]
+        wasm_filter_engine: loaded_config.wasm_filter_engine.clone(),
     };
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
@@ -7416,6 +7600,68 @@ where
         return Some((status, msg.len() as u64));
     }
     
+    // WASMモジュールの適用
+    #[cfg(feature = "wasm")]
+    {
+        let config = CURRENT_CONFIG.load();
+        if let Some(ref wasm_engine) = config.wasm_filter_engine {
+            let path_str = std::str::from_utf8(path).unwrap_or("/");
+            let method_str = std::str::from_utf8(method).unwrap_or("GET");
+            
+            let modules_to_apply = if let Some(backend_modules) = backend.modules() {
+                backend_modules.to_vec()
+            } else {
+                wasm_engine.get_modules_for_path(path_str)
+                    .iter()
+                    .map(|m| m.name.clone())
+                    .collect()
+            };
+            
+            if !modules_to_apply.is_empty() {
+                // HTTP/2のヘッダーを取得
+                let headers_vec: Vec<(String, String)> = if let Some(stream) = conn.get_stream(stream_id) {
+                    stream.request_headers.iter()
+                        .map(|h| (
+                            String::from_utf8_lossy(&h.name).to_string(),
+                            String::from_utf8_lossy(&h.value).to_string()
+                        ))
+                        .collect()
+                } else {
+                    Vec::new()
+                };
+                
+                let wasm_result = wasm_engine.on_request_headers_with_modules(
+                    &modules_to_apply,
+                    path_str,
+                    method_str,
+                    &headers_vec,
+                    client_ip,
+                    body_len == 0, // end_of_stream
+                );
+                
+                match wasm_result {
+                    crate::wasm::FilterResult::LocalResponse(resp) => {
+                        // ローカルレスポンスを返送
+                        let mut headers: Vec<(&[u8], &[u8])> = resp.headers.iter()
+                            .map(|(k, v)| (k.as_bytes(), v.as_bytes()))
+                            .collect();
+                        headers.push((b"server", b"veil/http2"));
+                        
+                        let _ = conn.send_response(stream_id, resp.status_code, &headers, Some(&resp.body)).await;
+                        return Some((resp.status_code, resp.body.len() as u64));
+                    }
+                    crate::wasm::FilterResult::Pause => {
+                        warn!("WASM module requested pause, but async operations are not yet supported");
+                    }
+                    crate::wasm::FilterResult::Continue { .. } => {
+                        // ヘッダー変更はHTTP/2では複雑なため、現時点ではスキップ
+                        // 将来的に実装可能
+                    }
+                }
+            }
+        }
+    }
+    
     // Accept-Encoding を取得
     let client_encoding = if let Some(stream) = conn.get_stream(stream_id) {
         stream.request_headers.iter()
@@ -7428,10 +7674,10 @@ where
     
     // Backend処理
     match backend {
-        Backend::Proxy(upstream_group, _, compression, _buffering, _cache) => {
+        Backend::Proxy(upstream_group, _, compression, _buffering, _cache, _) => {
             handle_http2_proxy(conn, stream_id, &upstream_group, &compression, client_encoding, method, path, &prefix, client_ip).await
         }
-        Backend::MemoryFile(data, mime_type, security) => {
+        Backend::MemoryFile(data, mime_type, security, _) => {
             // ファイル完全一致チェック
             let path_str = std::str::from_utf8(path).unwrap_or("/");
             let prefix_str = std::str::from_utf8(&prefix).unwrap_or("");
@@ -7469,10 +7715,10 @@ where
             }
             Some((200, data.len() as u64))
         }
-        Backend::SendFile(base_path, is_dir, index_file, security, _cache) => {
+        Backend::SendFile(base_path, is_dir, index_file, security, _cache, _) => {
             handle_http2_sendfile(conn, stream_id, &base_path, is_dir, index_file.as_deref(), path, &prefix, &security).await
         }
-        Backend::Redirect(redirect_url, status_code, preserve_path) => {
+        Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             handle_http2_redirect(conn, stream_id, &redirect_url, status_code, preserve_path, path, &prefix).await
         }
     }
@@ -8642,9 +8888,6 @@ async fn handle_requests(
                     }
                 }
 
-                // 処理時間計測開始（Instant: モノトニック・高精度）
-                let start_instant = Instant::now();
-                
                 // 初期ボディ（ヘッダー後のデータ）
                 let initial_body: Vec<u8> = if header_len < accumulated.len() {
                     accumulated[header_len..].to_vec()
@@ -8652,13 +8895,108 @@ async fn handle_requests(
                     Vec::new()
                 };
 
+                // WASMモジュールの適用
+                #[cfg(feature = "wasm")]
+                let headers_for_proxy = {
+                    let config = CURRENT_CONFIG.load();
+                    if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                        // path_routes内で指定されたmodulesを優先
+                        let path_str = std::str::from_utf8(&path_bytes).unwrap_or("/");
+                        let method_str = std::str::from_utf8(&method_bytes).unwrap_or("GET");
+                        
+                        let modules_to_apply = if let Some(backend_modules) = backend.modules() {
+                            // バックエンドにmodulesが指定されている場合はそれを使用
+                            backend_modules.to_vec()
+                        } else {
+                            // 指定されていない場合は、従来通り[wasm.routes]から取得
+                            wasm_engine.get_modules_for_path(path_str)
+                                .iter()
+                                .map(|m| m.name.clone())
+                                .collect()
+                        };
+                        
+                        // ヘッダーをString形式に変換
+                        let headers_vec: Vec<(String, String)> = headers_for_proxy.iter()
+                            .map(|(k, v)| (
+                                String::from_utf8_lossy(k).to_string(),
+                                String::from_utf8_lossy(v).to_string()
+                            ))
+                            .collect();
+                        
+                        // モジュールを実行
+                        if !modules_to_apply.is_empty() {
+                            let wasm_result = wasm_engine.on_request_headers_with_modules(
+                                &modules_to_apply,
+                                path_str,
+                                method_str,
+                                &headers_vec,
+                                client_ip,
+                                initial_body.is_empty() && !is_chunked, // end_of_stream
+                            );
+                            
+                            match wasm_result {
+                                crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
+                                    // 修正されたヘッダーを使用
+                                    modified_headers.iter()
+                                        .map(|(k, v)| (
+                                            k.as_bytes().into(),
+                                            v.as_bytes().into()
+                                        ))
+                                        .collect()
+                                }
+                                crate::wasm::FilterResult::LocalResponse(resp) => {
+                                    // ローカルレスポンスを返送
+                                    let status_line = format!("HTTP/1.1 {} {}\r\n", resp.status_code, 
+                                        match resp.status_code {
+                                            200 => "OK",
+                                            404 => "Not Found",
+                                            403 => "Forbidden",
+                                            500 => "Internal Server Error",
+                                            _ => "Unknown",
+                                        });
+                                    let mut response = status_line.into_bytes();
+                                    for (k, v) in &resp.headers {
+                                        response.extend_from_slice(format!("{}: {}\r\n", k, v).as_bytes());
+                                    }
+                                    response.extend_from_slice(b"\r\n");
+                                    response.extend_from_slice(&resp.body);
+                                    
+                                    let start_instant = Instant::now();
+                                    let resp_size = response.len() as u64;
+                                    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(response)).await;
+                                    match write_result {
+                                        Ok((Ok(_), _)) => {
+                                            log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, resp.status_code, resp_size, start_instant);
+                                        }
+                                        _ => {}
+                                    }
+                                    accumulated.clear();
+                                    return;
+                                }
+                                crate::wasm::FilterResult::Pause => {
+                                    // 非同期処理待ち（現在は未実装）
+                                    warn!("WASM module requested pause, but async operations are not yet supported");
+                                    headers_for_proxy
+                                }
+                            }
+                        } else {
+                            headers_for_proxy
+                        }
+                    } else {
+                        headers_for_proxy
+                    }
+                };
+
+                // 処理時間計測開始（Instant: モノトニック・高精度）
+                let start_instant = Instant::now();
+
                 // バッファクリア（次のリクエストに備える）
                 accumulated.clear();
 
                 // WebSocket Upgrade の場合は専用ハンドラーを使用
                 if is_websocket {
                     // WebSocket はプロキシバックエンドでのみサポート
-                    if let Backend::Proxy(ref upstream_group, ref security, _, _, _) = backend {
+                    if let Backend::Proxy(ref upstream_group, ref security, _, _, _, _) = backend {
                         info!("WebSocket upgrade request detected for path: {}", 
                               std::str::from_utf8(&path_bytes).unwrap_or("-"));
                         
@@ -8904,7 +9242,7 @@ async fn handle_backend(
     client_ip: &str,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     match backend {
-        Backend::Proxy(upstream_group, security, compression, buffering, cache) => {
+        Backend::Proxy(upstream_group, security, compression, buffering, cache, _) => {
             handle_proxy(
                 tls_stream, 
                 &upstream_group, 
@@ -8923,7 +9261,7 @@ async fn handle_backend(
                 client_ip
             ).await
         }
-        Backend::MemoryFile(data, mime_type, security) => {
+        Backend::MemoryFile(data, mime_type, security, _) => {
             // ファイル完全一致チェック
             // MemoryFileはファイル指定なので、プレフィックス以降にパスがあれば404
             let path_str = std::str::from_utf8(req_path).unwrap_or("/");
@@ -8984,10 +9322,10 @@ async fn handle_backend(
                 _ => None,
             }
         }
-        Backend::SendFile(base_path, is_dir, index_file, security, _cache) => {
+        Backend::SendFile(base_path, is_dir, index_file, security, _cache, _) => {
             handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close, &security).await
         }
-        Backend::Redirect(redirect_url, status_code, preserve_path) => {
+        Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             handle_redirect(tls_stream, &redirect_url, status_code, preserve_path, req_path, &prefix, client_wants_close).await
         }
     }

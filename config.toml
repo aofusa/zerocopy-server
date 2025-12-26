@@ -685,10 +685,31 @@ connection_window_size = 16777216
 #
 #   # ケーパビリティ設定（モジュールが使用可能なAPIを制限）
 #   [wasm.modules.capabilities]
+#   # 基本機能
+#   allow_logging = true
+#   
+#   # HTTP外部呼び出し
 #   allow_http_calls = true
-#   allow_header_manipulation = true
-#   allow_body_manipulation = true
-#   allow_grpc_calls = false
+#   allowed_upstreams = []  # 空の場合は全て許可（allow_http_calls=true時）
+#   
+#   # リクエストヘッダー操作（allow_header_manipulationの代替）
+#   allow_request_headers_read = true
+#   allow_request_headers_write = true
+#   
+#   # レスポンスヘッダー操作（allow_header_manipulationの代替）
+#   allow_response_headers_read = true
+#   allow_response_headers_write = true
+#   
+#   # リクエストボディ操作（allow_body_manipulationの代替、必要に応じて）
+#   # allow_request_body_read = false
+#   # allow_request_body_write = false
+#   
+#   # レスポンスボディ操作（allow_body_manipulationの代替、必要に応じて）
+#   # allow_response_body_read = false
+#   # allow_response_body_write = false
+#   
+#   # 注意: 以下のcapabilityは存在しません:
+#   # - allow_grpc_calls (現在未実装)
 #
 # # ルートごとのモジュール適用
 # [wasm.routes."api.example.com"]

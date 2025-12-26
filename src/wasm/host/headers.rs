@@ -143,7 +143,7 @@ fn check_write_capability(state: &HostState, map_type: i32) -> bool {
 }
 
 /// Helper to read string from WASM memory
-fn read_string(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
+fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
     let memory = caller.get_export("memory")?;
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
@@ -163,8 +163,8 @@ fn allocate_wasm_memory(caller: &mut Caller<'_, HostState>, size: usize) -> Opti
     // Call proxy_on_memory_allocate if exported
     let func = caller.get_export("proxy_on_memory_allocate")?;
     let func = func.into_func()?;
-    let typed = func.typed::<i32, i32>(caller).ok()?;
-    typed.call(caller, size as i32).ok()
+    let typed = func.typed::<i32, i32>(&mut *caller).ok()?;
+    typed.call(&mut *caller, size as i32).ok()
 }
 
 /// Helper to write to WASM memory
@@ -317,7 +317,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 return PROXY_RESULT_NOT_ALLOWED;
             }
 
-            let key = match read_string(&caller, key_ptr, key_size) {
+            let key = match read_string(&mut caller, key_ptr, key_size) {
                 Some(k) => k,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
@@ -390,12 +390,12 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 }
             }
 
-            let key = match read_string(&caller, key_ptr, key_size) {
+            let key = match read_string(&mut caller, key_ptr, key_size) {
                 Some(k) => k,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
-            let value = match read_string(&caller, value_ptr, value_size) {
+            let value = match read_string(&mut caller, value_ptr, value_size) {
                 Some(v) => v,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
@@ -442,12 +442,12 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 }
             }
 
-            let key = match read_string(&caller, key_ptr, key_size) {
+            let key = match read_string(&mut caller, key_ptr, key_size) {
                 Some(k) => k,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
 
-            let value = match read_string(&caller, value_ptr, value_size) {
+            let value = match read_string(&mut caller, value_ptr, value_size) {
                 Some(v) => v,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
@@ -494,7 +494,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 }
             }
 
-            let key = match read_string(&caller, key_ptr, key_size) {
+            let key = match read_string(&mut caller, key_ptr, key_size) {
                 Some(k) => k,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };

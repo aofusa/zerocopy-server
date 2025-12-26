@@ -7,7 +7,7 @@ use crate::wasm::context::HostState;
 use crate::wasm::types::PendingHttpCall;
 
 /// Helper to read string from WASM memory
-fn read_string(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
+fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
     let memory = caller.get_export("memory")?;
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
@@ -44,7 +44,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             {
                 let state = caller.data();
                 if !state.http_ctx.capabilities.allow_http_calls {
-                    log::warn!(
+                    ftlog::warn!(
                         "[wasm:{}] HTTP call denied: allow_http_calls=false",
                         state.http_ctx.plugin_name
                     );
@@ -55,7 +55,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 if state.http_ctx.pending_http_calls.len()
                     >= state.http_ctx.capabilities.max_http_calls
                 {
-                    log::warn!(
+                    ftlog::warn!(
                         "[wasm:{}] HTTP call denied: max_http_calls exceeded",
                         state.http_ctx.plugin_name
                     );
@@ -64,7 +64,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Read upstream name
-            let upstream = match read_string(&caller, upstream_ptr, upstream_size) {
+            let upstream = match read_string(&mut caller, upstream_ptr, upstream_size) {
                 Some(u) => u,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
@@ -73,7 +73,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             {
                 let state = caller.data();
                 if !state.http_ctx.capabilities.is_upstream_allowed(&upstream) {
-                    log::warn!(
+                    ftlog::warn!(
                         "[wasm:{}] HTTP call to '{}' denied: not in allowed_upstreams",
                         state.http_ctx.plugin_name,
                         upstream
@@ -147,7 +147,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
                 },
             );
 
-            log::debug!(
+            ftlog::debug!(
                 "[wasm:{}] HTTP call dispatched to '{}' with token {}",
                 state.http_ctx.plugin_name,
                 upstream,

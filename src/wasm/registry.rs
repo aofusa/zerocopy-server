@@ -88,7 +88,7 @@ impl ModuleRegistry {
 
     /// Load a module
     fn load_module(&mut self, config: &ModuleConfig) -> anyhow::Result<()> {
-        log::info!("Loading WASM module: {}", config.name);
+        ftlog::info!("Loading WASM module: {}", config.name);
 
         // Check if file exists
         let path = Path::new(&config.path);
@@ -120,7 +120,7 @@ impl ModuleRegistry {
             configuration: config.configuration.as_bytes().to_vec(),
         };
 
-        log::info!(
+        ftlog::info!(
             "Loaded WASM module '{}' with capabilities: http_calls={}, upstreams={:?}",
             config.name,
             config.capabilities.allow_http_calls,

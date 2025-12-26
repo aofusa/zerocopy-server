@@ -7,7 +7,7 @@ use crate::wasm::context::HostState;
 use crate::wasm::types::{Metric, MetricValue};
 
 /// Helper to read string from WASM memory
-fn read_string(caller: &Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
+fn read_string(caller: &mut Caller<'_, HostState>, ptr: i32, len: i32) -> Option<String> {
     let memory = caller.get_export("memory")?;
     let memory = memory.into_memory()?;
     let data = memory.data(caller);
@@ -43,7 +43,7 @@ pub fn add_functions(linker: &mut Linker<HostState>) -> anyhow::Result<()> {
             }
 
             // Read name
-            let name = match read_string(&caller, name_ptr, name_size) {
+            let name = match read_string(&mut caller, name_ptr, name_size) {
                 Some(n) => n,
                 None => return PROXY_RESULT_INVALID_MEMORY_ACCESS,
             };
