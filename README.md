@@ -127,8 +127,38 @@ After building, the binary is generated at `target/release/veil`.
 | Option | Description | Default |
 |--------|-------------|---------|
 | `-c, --config <PATH>` | Path to config file | `/etc/veil/config.toml` |
+| `-t, --test` | Test config file syntax and validity, then exit (nginx -t equivalent) | - |
 | `-h, --help` | Show help message | - |
 | `-V, --version` | Show version information | - |
+
+### Configuration Validation
+
+Test your configuration file before deploying or reloading:
+
+```bash
+# Test default config file
+./veil -t
+
+# Test specific config file
+./veil -t -c /path/to/config.toml
+```
+
+**Validation checks:**
+- TOML syntax parsing
+- Configuration value validation
+- TLS certificate and key file existence
+
+**Output examples:**
+```bash
+# Success
+veil: configuration file config.toml test is successful
+
+# Failure (TLS cert not found)
+veil: configuration file config.toml test failed
+veil: TLS certificate not found: /path/to/cert.pem
+```
+
+**Note**: When reloading configuration via SIGHUP, if the new configuration is invalid, the reload is rejected and the server continues running with the previous valid configuration.
 
 ## HTTP to HTTPS Redirect
 
@@ -146,7 +176,9 @@ http = "0.0.0.0:80"  # Enable HTTP redirect
 
 - Access to `http://example.com/path` is redirected to `https://example.com/path` with 301
 - Domain name is extracted from the Host header to construct the redirect URL
-- Port numbers are automatically removed (uses HTTPS default port 443)
+- **Port handling**: The redirect URL uses the port from the `[server].listen` setting
+  - If listen port is 443 (default): `https://example.com/path` (port omitted)
+  - If listen port is 8443: `https://example.com:8443/path` (port included)
 
 ### Security Considerations
 

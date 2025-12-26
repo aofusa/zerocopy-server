@@ -4834,6 +4834,14 @@ const DEFAULT_CONFIG_PATH: &str = "/etc/veil/config.toml";
 static CONFIG_PATH: Lazy<ArcSwap<PathBuf>> =
     Lazy::new(|| ArcSwap::from_pointee(PathBuf::from(DEFAULT_CONFIG_PATH)));
 
+/// HTTPSリダイレクト先のポート（listen設定から抽出）
+/// 
+/// HTTP→HTTPSリダイレクト時に使用するポート番号。
+/// デフォルトは443（HTTPSの標準ポート）。
+/// main関数で`[server].listen`の値から初期化される。
+static HTTPS_REDIRECT_PORT: std::sync::atomic::AtomicU16 = 
+    std::sync::atomic::AtomicU16::new(443);
+
 /// 設定をホットリロードする
 /// 
 /// 実行中のリクエストは古い設定を参照し続け、
@@ -5520,7 +5528,9 @@ const HTTP_301_REDIRECT_SUFFIX: &[u8] = b"\r\nConnection: close\r\nContent-Lengt
 /// HTTPリクエストを処理し、HTTPSにリダイレクトする
 /// 
 /// リクエストからHostヘッダーとパスを読み取り、
-/// https://{host}{path} への301リダイレクトを返します。
+/// https://{host}:{port}{path} への301リダイレクトを返します。
+/// ポートはHETTPS_REDIRECT_PORT（[server].listenから抽出）を使用し、
+/// 443の場合はURL中のポート指定を省略します。
 async fn handle_http_redirect(mut stream: TcpStream) {
     // リクエストを読み取るためのバッファ（ヘッダーのみなので小さめ）
     let mut buffer = vec![0u8; 4096];
@@ -5559,13 +5569,25 @@ async fn handle_http_redirect(mut stream: TcpStream) {
         .map(|h| std::str::from_utf8(h.value).unwrap_or(""))
         .unwrap_or("");
     
+    // 設定から抽出したHTTPSポートを取得
+    let port = HTTPS_REDIRECT_PORT.load(std::sync::atomic::Ordering::Relaxed);
+    
     // リダイレクトURLを構築
     let redirect_url = if host.is_empty() {
-        format!("https://localhost{}", path)
+        // Hostヘッダーがない場合はlocalhost
+        if port == 443 {
+            format!("https://localhost{}", path)
+        } else {
+            format!("https://localhost:{}{}", port, path)
+        }
     } else {
-        // ホストにポート番号が含まれている場合は除去（HTTPSのデフォルトポート443を使用）
+        // ホストにポート番号が含まれている場合は除去
         let clean_host = host.split(':').next().unwrap_or(host);
-        format!("https://{}{}", clean_host, path)
+        if port == 443 {
+            format!("https://{}{}", clean_host, path)
+        } else {
+            format!("https://{}:{}{}", clean_host, port, path)
+        }
     };
     
     // 301レスポンスを構築
@@ -5590,6 +5612,57 @@ struct CliArgs {
     /// 設定ファイルのパス
     #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     config: PathBuf,
+    
+    /// 設定ファイルの構文と内容を検証して終了（nginx -t 相当）
+    #[arg(short = 't', long = "test")]
+    test_config: bool,
+}
+
+/// 設定ファイルを検証（読み込みとバリデーションのみ、起動しない）
+/// 
+/// nginx -t 相当の機能を提供します。
+/// - TOML構文のパース
+/// - 設定値のバリデーション
+/// - TLS証明書・秘密鍵の存在確認
+fn test_config_file(path: &Path) -> io::Result<()> {
+    // ファイル存在確認
+    if !path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("configuration file not found: {}", path.display())
+        ));
+    }
+    
+    // TOMLパース
+    let config_str = std::fs::read_to_string(path)?;
+    let config: Config = toml::from_str(&config_str)
+        .map_err(|e| io::Error::new(
+            io::ErrorKind::InvalidData, 
+            format!("TOML parse error: {}", e)
+        ))?;
+    
+    // 設定バリデーション
+    validate_config(&config)?;
+    
+    // TLS証明書の存在確認
+    let cert_path = Path::new(&config.tls.cert_path);
+    if !cert_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("TLS certificate not found: {}", config.tls.cert_path)
+        ));
+    }
+    
+    // TLS秘密鍵の存在確認
+    let key_path = Path::new(&config.tls.key_path);
+    if !key_path.exists() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            format!("TLS key not found: {}", config.tls.key_path)
+        ));
+    }
+    
+    Ok(())
 }
 
 // ====================
@@ -5603,6 +5676,23 @@ fn main() {
     // 設定ファイルパスをグローバル変数に保存（ホットリロード用）
     CONFIG_PATH.store(Arc::new(cli_args.config.clone()));
     let config_path = cli_args.config;
+    
+    // -t オプション: 設定ファイルのテストのみ
+    if cli_args.test_config {
+        match test_config_file(&config_path) {
+            Ok(()) => {
+                println!("veil: configuration file {} test is successful", 
+                         config_path.display());
+                std::process::exit(0);
+            }
+            Err(e) => {
+                eprintln!("veil: configuration file {} test failed", 
+                          config_path.display());
+                eprintln!("veil: {}", e);
+                std::process::exit(1);
+            }
+        }
+    }
     
     // プロセスレベルで暗号プロバイダーをインストール（ring使用）
     CryptoProvider::install_default(rustls::crypto::ring::default_provider())
@@ -5653,6 +5743,10 @@ fn main() {
     
     let listen_addr = loaded_config.listen_addr.parse::<SocketAddr>()
         .unwrap_or_else(|_| SocketAddr::from(([0, 0, 0, 0], 443)));
+    
+    // HTTPSリダイレクト用ポートを保存（HTTP→HTTPSリダイレクト時に使用）
+    HTTPS_REDIRECT_PORT.store(listen_addr.port(), std::sync::atomic::Ordering::Relaxed);
+    
     let ktls_config = Arc::new(loaded_config.ktls_config.clone());
     
     // CURRENT_CONFIG を初期化（ホットリロード対応）

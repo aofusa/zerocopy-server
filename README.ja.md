@@ -128,8 +128,38 @@ cargo build --release --features "ktls,http2,wasm"
 | オプション | 説明 | デフォルト |
 |-----------|------|-----------|
 | `-c, --config <PATH>` | 設定ファイルのパス | `/etc/veil/config.toml` |
+| `-t, --test` | 設定ファイルの構文と内容を検証して終了（nginx -t 相当） | - |
 | `-h, --help` | ヘルプメッセージを表示 | - |
 | `-V, --version` | バージョン情報を表示 | - |
+
+### 設定ファイルの検証
+
+デプロイやリロード前に設定ファイルを検証できます：
+
+```bash
+# デフォルト設定ファイルをテスト
+./veil -t
+
+# 指定設定ファイルをテスト
+./veil -t -c /path/to/config.toml
+```
+
+**検証内容:**
+- TOML構文のパース
+- 設定値のバリデーション
+- TLS証明書・秘密鍵ファイルの存在確認
+
+**出力例:**
+```bash
+# 成功
+veil: configuration file config.toml test is successful
+
+# 失敗（TLS証明書が見つからない）
+veil: configuration file config.toml test failed
+veil: TLS certificate not found: /path/to/cert.pem
+```
+
+**注意**: SIGHUPによる設定リロード時、新しい設定が不正な場合はリロードが拒否され、サーバーは以前の有効な設定で動作を継続します。
 
 ## HTTP to HTTPS リダイレクト
 
@@ -147,7 +177,9 @@ http = "0.0.0.0:80"  # HTTPリダイレクトを有効化
 
 - `http://example.com/path` へのアクセスは `https://example.com/path` に301リダイレクト
 - Hostヘッダーからドメイン名を取得し、リダイレクト先URLを構築
-- ポート番号が含まれている場合は自動的に除去（HTTPSのデフォルトポート443を使用）
+- **ポートの動作**: リダイレクト先URLは `[server].listen` 設定のポートを使用
+  - listenポートが443の場合（デフォルト）: `https://example.com/path`（ポート省略）
+  - listenポートが8443の場合: `https://example.com:8443/path`（ポート包含）
 
 ### セキュリティ考慮事項
 
