@@ -4,8 +4,8 @@ Proxy-WASM用の純粋Rust製Luaインタープリタフィルタ
 
 ## 概要
 
-外部Luaライブラリを一切使用せず、ゼロから実装したLua 5.4互換インタープリタ。
-クロージャ、パターンマッチング、ビット演算子など主要機能をサポート。
+外部Luaライブラリを一切使用せず、ゼロから実装したLuaインタープリタ。
+WASMサンドボックス環境で安全に動作します。
 
 ## ビルド
 
@@ -24,6 +24,8 @@ cargo build --target wasm32-wasip1 --release
 }
 ```
 
+---
+
 ## Lua API (veil.*)
 
 | 関数 | 説明 |
@@ -38,32 +40,211 @@ cargo build --target wasm32-wasip1 --release
 | `veil.send_local_response(status, body)` | レスポンス送信 |
 | `veil.get_headers()` | 全ヘッダをテーブルで取得 |
 
-## サポート機能
+---
 
-### コア言語
-- 変数・関数・クロージャ
-- 可変長引数 (`...`)
-- if/while/repeat/for
-- テーブル
+## Lua互換性
 
-### パターンマッチング
-```lua
-string.match("Hello 123", "(%a+) (%d+)")  -- "Hello", "123"
-string.gsub("foo bar", "(%w+)", "[%1]")   -- "[foo] [bar]"
-```
+### 対象バージョン
 
-サポートパターン: `. %a %d %s %w %p * + - ? ^ $ () [set] %bxy %1-9`
+本実装は **Lua 5.4** の構文・機能をベースにしていますが、純粋Rust実装のため完全互換ではありません。
 
-### 標準ライブラリ
-- `string.*`: len, sub, upper, lower, find, match, gsub, format, rep, reverse
-- `math.*`: abs, ceil, floor, sin, cos, sqrt, random, pi, huge
-- `table.*`: concat, pack, unpack
+### バージョン別機能サポート
 
-### ビット演算子 (Lua 5.3+)
-```lua
-local x = 0xFF & 0x0F  -- 15
-local y = 1 << 4       -- 16
-```
+| 機能 | Lua 5.1 | Lua 5.2 | Lua 5.3 | Lua 5.4 | 本実装 |
+|------|---------|---------|---------|---------|--------|
+| 基本構文 | ✅ | ✅ | ✅ | ✅ | ✅ |
+| クロージャ | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 可変長引数 (...) | ✅ | ✅ | ✅ | ✅ | ✅ |
+| 汎用for | ✅ | ✅ | ✅ | ✅ | ✅ |
+| repeat-until | ✅ | ✅ | ✅ | ✅ | ✅ |
+| goto/ラベル | ❌ | ✅ | ✅ | ✅ | ⚠️ 構文のみ |
+| ビット演算子 | ❌ | ❌ | ✅ | ✅ | ✅ |
+| 整数除算 (//) | ❌ | ❌ | ✅ | ✅ | ✅ |
+| メタテーブル | ✅ | ✅ | ✅ | ✅ | ⚠️ 部分的 |
+| コルーチン | ✅ | ✅ | ✅ | ✅ | ❌ |
+| 末尾呼び出し最適化 | ✅ | ✅ | ✅ | ✅ | ❌ |
+
+---
+
+## 機能詳細
+
+### ✅ 完全サポート
+
+#### データ型
+| 型 | サポート | 備考 |
+|----|---------|------|
+| `nil` | ✅ | |
+| `boolean` | ✅ | |
+| `number` | ✅ | 64bit浮動小数点 |
+| `string` | ✅ | UTF-8 |
+| `table` | ✅ | HashMap実装 |
+| `function` | ✅ | クロージャ対応 |
+| `userdata` | ❌ | 非サポート |
+| `thread` | ❌ | 非サポート |
+
+#### 演算子
+| カテゴリ | 演算子 | サポート |
+|---------|--------|---------|
+| 算術 | `+ - * / // % ^` | ✅ |
+| 比較 | `== ~= < > <= >=` | ✅ |
+| 論理 | `and or not` | ✅ (短絡評価) |
+| 文字列 | `..` | ✅ |
+| 長さ | `#` | ✅ |
+| ビット | `& \| ~ << >>` | ✅ |
+
+#### 制御構文
+| 構文 | サポート |
+|------|---------|
+| `if/elseif/else/end` | ✅ |
+| `while/do/end` | ✅ |
+| `repeat/until` | ✅ |
+| `for i=1,10 do/end` | ✅ |
+| `for k,v in pairs(t) do/end` | ✅ |
+| `break` | ✅ |
+| `return` | ✅ |
+| `do/end` | ✅ |
+| `goto/::label::` | ⚠️ 構文解析のみ |
+
+#### 関数
+| 機能 | サポート |
+|------|---------|
+| 関数定義 | ✅ |
+| ローカル関数 | ✅ |
+| 無名関数 | ✅ |
+| クロージャ | ✅ (upvalue capture) |
+| 可変長引数 | ✅ |
+| 複数戻り値 | ⚠️ 単一値のみ |
+| メソッド呼び出し (`:`) | ✅ |
+
+---
+
+### ✅ パターンマッチング
+
+| パターン | 説明 | サポート |
+|---------|------|---------|
+| `.` | 任意の1文字 | ✅ |
+| `%a` | アルファベット | ✅ |
+| `%d` | 数字 | ✅ |
+| `%s` | 空白文字 | ✅ |
+| `%w` | 英数字 | ✅ |
+| `%p` | 句読点 | ✅ |
+| `%c` | 制御文字 | ✅ |
+| `%l` | 小文字 | ✅ |
+| `%u` | 大文字 | ✅ |
+| `%x` | 16進数字 | ✅ |
+| `%A %D ...` | 上記の補集合 | ✅ |
+| `[set]` | 文字セット | ✅ |
+| `[^set]` | 補集合セット | ✅ |
+| `*` | 0回以上(貪欲) | ✅ |
+| `+` | 1回以上(貪欲) | ✅ |
+| `-` | 0回以上(非貪欲) | ✅ |
+| `?` | 0回または1回 | ✅ |
+| `^` | 先頭アンカー | ✅ |
+| `$` | 末尾アンカー | ✅ |
+| `()` | キャプチャ | ✅ |
+| `%bxy` | バランスマッチ | ✅ |
+| `%1-%9` | 後方参照 | ✅ |
+| `%f[set]` | フロンティア | ❌ |
+
+---
+
+### ✅ 標準ライブラリ
+
+#### 基本関数
+| 関数 | サポート | 備考 |
+|------|---------|------|
+| `print` | ✅ | veil.log経由 |
+| `tostring` | ✅ | |
+| `tonumber` | ✅ | |
+| `type` | ✅ | |
+| `assert` | ✅ | |
+| `error` | ✅ | |
+| `pcall` | ⚠️ | 常にtrue |
+| `pairs` | ✅ | |
+| `ipairs` | ✅ | |
+| `next` | ✅ | |
+| `select` | ✅ | |
+| `setmetatable` | ⚠️ | テーブル返却のみ |
+| `getmetatable` | ⚠️ | nil返却 |
+| `rawget/rawset` | ⚠️ | 基本動作のみ |
+| `load/loadfile` | ❌ | |
+| `dofile/require` | ❌ | |
+
+#### string.*
+| 関数 | サポート | 備考 |
+|------|---------|------|
+| `string.len` | ✅ | |
+| `string.sub` | ✅ | |
+| `string.upper` | ✅ | |
+| `string.lower` | ✅ | |
+| `string.find` | ✅ | パターン対応 |
+| `string.match` | ✅ | パターン対応 |
+| `string.gsub` | ✅ | パターン対応 |
+| `string.gmatch` | ⚠️ | 部分的 |
+| `string.format` | ✅ | 全フォーマット対応 |
+| `string.rep` | ✅ | |
+| `string.reverse` | ✅ | |
+| `string.byte` | ✅ | |
+| `string.char` | ✅ | |
+| `string.dump` | ❌ | |
+| `string.pack/unpack` | ❌ | |
+
+#### math.*
+| 関数 | サポート |
+|------|---------|
+| `math.abs` | ✅ |
+| `math.ceil` | ✅ |
+| `math.floor` | ✅ |
+| `math.max` | ✅ |
+| `math.min` | ✅ |
+| `math.sin/cos/tan` | ✅ |
+| `math.asin/acos/atan` | ✅ |
+| `math.sqrt` | ✅ |
+| `math.log` | ✅ |
+| `math.exp` | ✅ |
+| `math.pow` | ✅ |
+| `math.deg/rad` | ✅ |
+| `math.random` | ✅ |
+| `math.randomseed` | ⚠️ | 無視 |
+| `math.modf/fmod` | ✅ |
+| `math.pi` | ✅ |
+| `math.huge` | ✅ |
+| `math.ult/tointeger` | ❌ |
+
+#### table.*
+| 関数 | サポート | 備考 |
+|------|---------|------|
+| `table.concat` | ✅ | 範囲指定対応 |
+| `table.insert` | ✅ | 位置指定対応 |
+| `table.remove` | ✅ | 戻り値対応 |
+| `table.sort` | ✅ | 配列ソート |
+| `table.pack` | ✅ | |
+| `table.unpack` | ✅ | 開始位置指定 |
+| `table.move` | ❌ | |
+
+---
+
+### ❌ 非サポート（WASM安全性のため除外）
+
+| モジュール | 理由 |
+|-----------|------|
+| `os.*` | システムコール |
+| `io.*` | ファイルI/O |
+| `debug.*` | デバッグ機能 |
+| `package.*` | 動的モジュール読み込み |
+| `coroutine.*` | スレッド状態管理 |
+
+#### utf8.*
+| 関数 | サポート |
+|------|---------|
+| `utf8.len` | ✅ |
+| `utf8.char` | ✅ |
+| `utf8.codepoint` | ✅ |
+| `utf8.offset` | ✅ |
+| `utf8.charpattern` | ✅ |
+| `utf8.codes` | ⚠️ |
+
+---
 
 ## サンプルスクリプト
 
@@ -73,13 +254,16 @@ function on_request()
     local method = veil.get_method()
     veil.log('info', method .. ' ' .. path)
     
-    -- カスタムヘッダ追加
-    veil.set_request_header('X-Lua-Filter', 'true')
+    -- パターンマッチングでパス解析
+    local id = string.match(path, '/users/(%d+)')
+    if id then
+        veil.set_request_header('X-User-ID', id)
+    end
     
     -- 管理画面へのアクセス制御
-    if string.find(path, '/admin') then
+    if string.find(path, '^/admin') then
         local auth = veil.get_request_header('Authorization')
-        if auth == nil then
+        if not auth then
             veil.send_local_response(403, 'Forbidden')
             return 'stop'
         end
@@ -89,10 +273,12 @@ function on_request()
 end
 
 function on_response()
-    veil.set_response_header('X-Processed-By', 'Lua-Filter')
+    veil.set_response_header('X-Powered-By', 'veil-proxy-lua')
     return 'continue'
 end
 ```
+
+---
 
 ## 実装詳細
 

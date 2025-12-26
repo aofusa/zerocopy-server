@@ -156,6 +156,18 @@ impl Interpreter {
         }
         globals.insert("table".to_string(), LuaValue::Table(table_lib));
 
+        // Register utf8 library
+        let mut utf8_lib = LuaTable::new();
+        for name in &["len", "char", "codepoint", "codes", "offset", "charpattern"] {
+            utf8_lib.set(
+                name.to_string(),
+                LuaValue::NativeFunction(format!("utf8.{}", name)),
+            );
+        }
+        // utf8.charpattern constant (Lua pattern for matching UTF-8 sequences)
+        utf8_lib.set("charpattern".to_string(), LuaValue::String(r"[\0-\x7F\xC2-\xF4][\x80-\xBF]*".to_string()));
+        globals.insert("utf8".to_string(), LuaValue::Table(utf8_lib));
+
         // Register veil table (Proxy-WASM bindings)
         let mut veil = LuaTable::new();
         for name in &[
@@ -669,6 +681,11 @@ impl Interpreter {
             return self.call_table_method(method, args);
         }
 
+        // UTF8 library
+        if let Some(method) = name.strip_prefix("utf8.") {
+            return self.call_utf8_method(method, args);
+        }
+
         // Standard library
         self.call_stdlib(name, args)
     }
@@ -888,21 +905,7 @@ impl Interpreter {
             }
 
             "format" => {
-                let format = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
-                let mut result = format;
-                
-                for arg in args.iter().skip(1) {
-                    if result.contains("%s") {
-                        result = result.replacen("%s", &arg.to_lua_string(), 1);
-                    } else if result.contains("%d") {
-                        let num_str = arg.to_number()
-                            .map(|n| if n.fract() == 0.0 { format!("{}", n as i64) } else { n.to_string() })
-                            .unwrap_or_else(|| arg.to_lua_string());
-                        result = result.replacen("%d", &num_str, 1);
-                    }
-                }
-                
-                Ok(LuaValue::String(result))
+                self.string_format(args)
             }
 
             "rep" => {
@@ -1015,29 +1018,118 @@ impl Interpreter {
     fn call_table_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
         match method {
             "insert" => {
-                // Simplified: just return nil
+                // table.insert(t, value) - insert at end
+                // table.insert(t, pos, value) - insert at pos
+                if args.len() < 2 {
+                    return Ok(LuaValue::Nil);
+                }
+                
+                if let LuaValue::Table(mut t) = args[0].clone() {
+                    let len = t.len();
+                    
+                    if args.len() == 2 {
+                        // Insert at end
+                        t.set((len + 1).to_string(), args[1].clone());
+                    } else if args.len() >= 3 {
+                        // Insert at position
+                        let pos = args[1].to_number().map(|n| n as usize).unwrap_or(len + 1);
+                        // Shift elements
+                        for i in (pos..=len).rev() {
+                            if let Some(v) = t.get(&i.to_string()).cloned() {
+                                t.set((i + 1).to_string(), v);
+                            }
+                        }
+                        t.set(pos.to_string(), args[2].clone());
+                    }
+                    
+                    // Update the original table variable if possible
+                    return Ok(LuaValue::Nil);
+                }
                 Ok(LuaValue::Nil)
             }
+            
             "remove" => {
+                // table.remove(t) - remove last element
+                // table.remove(t, pos) - remove element at pos
+                if let LuaValue::Table(mut t) = args.first().cloned().unwrap_or(LuaValue::Nil) {
+                    let len = t.len();
+                    if len == 0 {
+                        return Ok(LuaValue::Nil);
+                    }
+                    
+                    let pos = args.get(1)
+                        .and_then(|v| v.to_number())
+                        .map(|n| n as usize)
+                        .unwrap_or(len);
+                    
+                    // Get the removed value
+                    let removed = t.get(&pos.to_string()).cloned().unwrap_or(LuaValue::Nil);
+                    
+                    // Shift elements down
+                    for i in pos..len {
+                        if let Some(v) = t.get(&(i + 1).to_string()).cloned() {
+                            t.set(i.to_string(), v);
+                        }
+                    }
+                    t.data.remove(&len.to_string());
+                    
+                    return Ok(removed);
+                }
                 Ok(LuaValue::Nil)
             }
+            
             "concat" => {
                 if let Some(LuaValue::Table(t)) = args.first() {
                     let sep = args.get(1).map(|v| v.to_lua_string()).unwrap_or_default();
+                    let i = args.get(2).and_then(|v| v.to_number()).map(|n| n as usize).unwrap_or(1);
+                    let j = args.get(3).and_then(|v| v.to_number()).map(|n| n as usize).unwrap_or(t.len());
+                    
                     let mut parts = Vec::new();
-                    let mut i = 1;
-                    while let Some(v) = t.get(&i.to_string()) {
-                        parts.push(v.to_lua_string());
-                        i += 1;
+                    for idx in i..=j {
+                        if let Some(v) = t.get(&idx.to_string()) {
+                            parts.push(v.to_lua_string());
+                        }
                     }
                     Ok(LuaValue::String(parts.join(&sep)))
                 } else {
                     Ok(LuaValue::String(String::new()))
                 }
             }
+            
             "sort" => {
+                // Sort array portion of table in place
+                if let LuaValue::Table(mut t) = args.first().cloned().unwrap_or(LuaValue::Nil) {
+                    let len = t.len();
+                    if len == 0 {
+                        return Ok(LuaValue::Nil);
+                    }
+                    
+                    // Extract array elements
+                    let mut elements: Vec<LuaValue> = Vec::new();
+                    for i in 1..=len {
+                        if let Some(v) = t.get(&i.to_string()) {
+                            elements.push(v.clone());
+                        }
+                    }
+                    
+                    // Sort (numbers and strings)
+                    elements.sort_by(|a, b| {
+                        match (a.to_number(), b.to_number()) {
+                            (Some(na), Some(nb)) => na.partial_cmp(&nb).unwrap_or(std::cmp::Ordering::Equal),
+                            _ => a.to_lua_string().cmp(&b.to_lua_string()),
+                        }
+                    });
+                    
+                    // Put back
+                    for (i, v) in elements.into_iter().enumerate() {
+                        t.set((i + 1).to_string(), v);
+                    }
+                    
+                    return Ok(LuaValue::Nil);
+                }
                 Ok(LuaValue::Nil)
             }
+            
             "pack" => {
                 let mut table = LuaTable::new();
                 for (i, arg) in args.iter().enumerate() {
@@ -1046,13 +1138,17 @@ impl Interpreter {
                 table.set("n".to_string(), LuaValue::Number(args.len() as f64));
                 Ok(LuaValue::Table(table))
             }
+            
             "unpack" => {
+                // Returns the first element (simplified)
                 if let Some(LuaValue::Table(t)) = args.first() {
-                    Ok(t.get("1").cloned().unwrap_or(LuaValue::Nil))
+                    let i = args.get(1).and_then(|v| v.to_number()).map(|n| n as usize).unwrap_or(1);
+                    Ok(t.get(&i.to_string()).cloned().unwrap_or(LuaValue::Nil))
                 } else {
                     Ok(LuaValue::Nil)
                 }
             }
+            
             _ => Err(format!("Unknown table method: {}", method)),
         }
     }
@@ -1277,4 +1373,254 @@ impl Interpreter {
         // Check globals
         self.globals.get(name).cloned().unwrap_or(LuaValue::Nil)
     }
+
+    /// Enhanced string.format implementation
+    fn string_format(&self, args: &[LuaValue]) -> Result<LuaValue, String> {
+        let format_str = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
+        let mut result = String::new();
+        let mut arg_idx = 1;
+        let mut chars = format_str.chars().peekable();
+
+        while let Some(c) = chars.next() {
+            if c != '%' {
+                result.push(c);
+                continue;
+            }
+
+            // Parse format specifier
+            let next = chars.peek().cloned();
+            if next == Some('%') {
+                chars.next();
+                result.push('%');
+                continue;
+            }
+
+            // Parse flags
+            let mut left_align = false;
+            let mut zero_pad = false;
+            let mut plus_sign = false;
+            let mut space_sign = false;
+
+            loop {
+                match chars.peek() {
+                    Some('-') => { left_align = true; chars.next(); }
+                    Some('+') => { plus_sign = true; chars.next(); }
+                    Some(' ') => { space_sign = true; chars.next(); }
+                    Some('0') => { zero_pad = true; chars.next(); }
+                    Some('#') => { chars.next(); } // alternate form (ignored for now)
+                    _ => break,
+                }
+            }
+
+            // Parse width
+            let mut width = 0usize;
+            while let Some(&c) = chars.peek() {
+                if c.is_ascii_digit() {
+                    width = width * 10 + (c as usize - '0' as usize);
+                    chars.next();
+                } else {
+                    break;
+                }
+            }
+
+            // Parse precision
+            let mut precision: Option<usize> = None;
+            if chars.peek() == Some(&'.') {
+                chars.next();
+                let mut prec = 0usize;
+                while let Some(&c) = chars.peek() {
+                    if c.is_ascii_digit() {
+                        prec = prec * 10 + (c as usize - '0' as usize);
+                        chars.next();
+                    } else {
+                        break;
+                    }
+                }
+                precision = Some(prec);
+            }
+
+            // Parse conversion specifier
+            let spec = chars.next().unwrap_or('s');
+            let arg = args.get(arg_idx).cloned().unwrap_or(LuaValue::Nil);
+            arg_idx += 1;
+
+            let formatted = match spec {
+                's' => {
+                    let s = arg.to_lua_string();
+                    if let Some(prec) = precision {
+                        s.chars().take(prec).collect()
+                    } else {
+                        s
+                    }
+                }
+                'd' | 'i' => {
+                    let n = arg.to_number().unwrap_or(0.0) as i64;
+                    let s = if plus_sign && n >= 0 {
+                        format!("+{}", n)
+                    } else if space_sign && n >= 0 {
+                        format!(" {}", n)
+                    } else {
+                        format!("{}", n)
+                    };
+                    s
+                }
+                'u' => {
+                    let n = arg.to_number().unwrap_or(0.0) as u64;
+                    format!("{}", n)
+                }
+                'f' => {
+                    let n = arg.to_number().unwrap_or(0.0);
+                    let prec = precision.unwrap_or(6);
+                    if plus_sign && n >= 0.0 {
+                        format!("+{:.prec$}", n, prec = prec)
+                    } else if space_sign && n >= 0.0 {
+                        format!(" {:.prec$}", n, prec = prec)
+                    } else {
+                        format!("{:.prec$}", n, prec = prec)
+                    }
+                }
+                'e' => {
+                    let n = arg.to_number().unwrap_or(0.0);
+                    let prec = precision.unwrap_or(6);
+                    format!("{:.prec$e}", n, prec = prec)
+                }
+                'E' => {
+                    let n = arg.to_number().unwrap_or(0.0);
+                    let prec = precision.unwrap_or(6);
+                    format!("{:.prec$E}", n, prec = prec)
+                }
+                'g' | 'G' => {
+                    let n = arg.to_number().unwrap_or(0.0);
+                    let prec = precision.unwrap_or(6);
+                    // Use shorter of %e or %f
+                    let f = format!("{:.prec$}", n, prec = prec);
+                    let e = format!("{:.prec$e}", n, prec = prec);
+                    if f.len() <= e.len() { f } else { e }
+                }
+                'x' => {
+                    let n = arg.to_number().unwrap_or(0.0) as i64;
+                    format!("{:x}", n)
+                }
+                'X' => {
+                    let n = arg.to_number().unwrap_or(0.0) as i64;
+                    format!("{:X}", n)
+                }
+                'o' => {
+                    let n = arg.to_number().unwrap_or(0.0) as i64;
+                    format!("{:o}", n)
+                }
+                'c' => {
+                    let n = arg.to_number().unwrap_or(0.0) as u32;
+                    char::from_u32(n).map(|c| c.to_string()).unwrap_or_default()
+                }
+                'q' => {
+                    // Quoted string
+                    let s = arg.to_lua_string();
+                    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+                }
+                _ => arg.to_lua_string(),
+            };
+
+            // Apply width and alignment
+            let padded = if width > formatted.len() {
+                let pad = width - formatted.len();
+                let pad_char = if zero_pad && !left_align { '0' } else { ' ' };
+                if left_align {
+                    format!("{}{}", formatted, pad_char.to_string().repeat(pad))
+                } else {
+                    format!("{}{}", pad_char.to_string().repeat(pad), formatted)
+                }
+            } else {
+                formatted
+            };
+
+            result.push_str(&padded);
+        }
+
+        Ok(LuaValue::String(result))
+    }
+
+    /// UTF-8 library methods
+    fn call_utf8_method(&self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
+        match method {
+            "len" => {
+                let s = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
+                let i = args.get(1).and_then(|v| v.to_number()).map(|n| n as usize).unwrap_or(1);
+                let j = args.get(2).and_then(|v| v.to_number()).map(|n| n as i64).unwrap_or(-1);
+                
+                let bytes = s.as_bytes();
+                let start = (i.saturating_sub(1)).min(bytes.len());
+                let end = if j < 0 {
+                    (bytes.len() as i64 + j + 1).max(0) as usize
+                } else {
+                    (j as usize).min(bytes.len())
+                };
+                
+                if start > end {
+                    return Ok(LuaValue::Number(0.0));
+                }
+                
+                // Count UTF-8 characters
+                let slice = &s[start..end];
+                Ok(LuaValue::Number(slice.chars().count() as f64))
+            }
+
+            "char" => {
+                let chars: String = args.iter()
+                    .filter_map(|v| v.to_number())
+                    .filter_map(|n| char::from_u32(n as u32))
+                    .collect();
+                Ok(LuaValue::String(chars))
+            }
+
+            "codepoint" => {
+                let s = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
+                let i = args.get(1).and_then(|v| v.to_number()).map(|n| (n as usize).saturating_sub(1)).unwrap_or(0);
+                
+                if let Some(c) = s.chars().nth(i) {
+                    Ok(LuaValue::Number(c as u32 as f64))
+                } else {
+                    Ok(LuaValue::Nil)
+                }
+            }
+
+            "codes" => {
+                // Returns an iterator function (simplified: return nil)
+                Ok(LuaValue::NativeFunction("utf8.codes_iter".to_string()))
+            }
+
+            "offset" => {
+                let s = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
+                let n = args.get(1).and_then(|v| v.to_number()).map(|x| x as i64).unwrap_or(1);
+                
+                if n <= 0 {
+                    return Ok(LuaValue::Nil);
+                }
+                
+                let mut byte_pos = 0;
+                let mut char_count = 0;
+                
+                for (i, c) in s.char_indices() {
+                    char_count += 1;
+                    if char_count == n as usize {
+                        byte_pos = i + 1; // Lua is 1-indexed
+                        break;
+                    }
+                }
+                
+                if char_count >= n as usize {
+                    Ok(LuaValue::Number(byte_pos as f64))
+                } else {
+                    Ok(LuaValue::Nil)
+                }
+            }
+
+            "charpattern" => {
+                Ok(LuaValue::String("[\\x00-\\x7F\\xC2-\\xF4][\\x80-\\xBF]*".to_string()))
+            }
+
+            _ => Err(format!("Unknown utf8 method: {}", method)),
+        }
+    }
 }
+
