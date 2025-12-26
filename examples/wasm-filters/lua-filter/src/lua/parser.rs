@@ -2,7 +2,6 @@
 
 use crate::lua::ast::*;
 use crate::lua::lexer::Token;
-use crate::lua::value::LuaValue;
 
 /// Parse tokens into AST
 pub fn parse(tokens: &[Token]) -> Result<Program, String> {
@@ -62,12 +61,20 @@ impl<'a> Parser<'a> {
             Token::Local => self.parse_local(),
             Token::If => self.parse_if(),
             Token::While => self.parse_while(),
+            Token::Repeat => self.parse_repeat(),
             Token::For => self.parse_for(),
             Token::Function => self.parse_function(),
             Token::Return => self.parse_return(),
+            Token::Do => self.parse_do(),
+            Token::Goto => self.parse_goto(),
+            Token::DoubleColon => self.parse_label(),
             Token::Break => {
                 self.advance();
                 Ok(Stmt::Break)
+            }
+            Token::Semicolon => {
+                self.advance();
+                self.parse_statement()
             }
             Token::Identifier(_) => self.parse_assignment_or_call(),
             _ => Err(format!("Unexpected token: {:?}", self.current())),
@@ -81,17 +88,19 @@ impl<'a> Parser<'a> {
         if self.current() == &Token::Function {
             self.advance();
             let name = self.parse_identifier()?;
-            return self.parse_function_body(name, true);
+            return self.parse_function_body(FunctionName::simple(name), true);
         }
 
         // Variable declaration
-        let mut targets = Vec::new();
-        targets.push(self.parse_identifier()?);
+        let mut names = Vec::new();
+        names.push(self.parse_identifier()?);
 
         while self.current() == &Token::Comma {
             self.advance();
-            targets.push(self.parse_identifier()?);
+            names.push(self.parse_identifier()?);
         }
+
+        let targets: Vec<AssignTarget> = names.into_iter().map(AssignTarget::Name).collect();
 
         let mut values = Vec::new();
         if self.current() == &Token::Assign {
@@ -154,9 +163,18 @@ impl<'a> Parser<'a> {
         Ok(Stmt::While { condition, body })
     }
 
+    fn parse_repeat(&mut self) -> Result<Stmt, String> {
+        self.expect(Token::Repeat)?;
+        let body = self.parse_block(&[Token::Until])?;
+        self.expect(Token::Until)?;
+        let condition = self.parse_expression()?;
+
+        Ok(Stmt::Repeat { body, condition })
+    }
+
     fn parse_for(&mut self) -> Result<Stmt, String> {
         self.expect(Token::For)?;
-        let var = self.parse_identifier()?;
+        let first_var = self.parse_identifier()?;
 
         if self.current() == &Token::Assign {
             // Numeric for
@@ -177,33 +195,85 @@ impl<'a> Parser<'a> {
             self.expect(Token::End)?;
 
             Ok(Stmt::ForNumeric {
-                var,
+                var: first_var,
                 start,
                 end,
                 step,
                 body,
             })
         } else {
-            Err("Generic for not yet supported".to_string())
+            // Generic for
+            let mut vars = vec![first_var];
+            while self.current() == &Token::Comma {
+                self.advance();
+                vars.push(self.parse_identifier()?);
+            }
+
+            self.expect(Token::In)?;
+
+            let mut exprs = vec![self.parse_expression()?];
+            while self.current() == &Token::Comma {
+                self.advance();
+                exprs.push(self.parse_expression()?);
+            }
+
+            self.expect(Token::Do)?;
+            let body = self.parse_block(&[Token::End])?;
+            self.expect(Token::End)?;
+
+            Ok(Stmt::ForGeneric { vars, exprs, body })
         }
     }
 
     fn parse_function(&mut self) -> Result<Stmt, String> {
         self.expect(Token::Function)?;
-        let name = self.parse_identifier()?;
+        let name = self.parse_function_name()?;
         self.parse_function_body(name, false)
     }
 
-    fn parse_function_body(&mut self, name: String, _local: bool) -> Result<Stmt, String> {
+    fn parse_function_name(&mut self) -> Result<FunctionName, String> {
+        let base = self.parse_identifier()?;
+        let mut fields = Vec::new();
+        let mut method = None;
+
+        loop {
+            if self.current() == &Token::Dot {
+                self.advance();
+                fields.push(self.parse_identifier()?);
+            } else if self.current() == &Token::Colon {
+                self.advance();
+                method = Some(self.parse_identifier()?);
+                break;
+            } else {
+                break;
+            }
+        }
+
+        Ok(FunctionName { base, fields, method })
+    }
+
+    fn parse_function_body(&mut self, name: FunctionName, local: bool) -> Result<Stmt, String> {
         self.expect(Token::LParen)?;
 
         let mut params = Vec::new();
-        if self.current() != &Token::RParen {
-            params.push(self.parse_identifier()?);
+        let mut vararg = false;
 
-            while self.current() == &Token::Comma {
+        if self.current() != &Token::RParen {
+            if self.current() == &Token::Vararg {
                 self.advance();
+                vararg = true;
+            } else {
                 params.push(self.parse_identifier()?);
+
+                while self.current() == &Token::Comma {
+                    self.advance();
+                    if self.current() == &Token::Vararg {
+                        self.advance();
+                        vararg = true;
+                        break;
+                    }
+                    params.push(self.parse_identifier()?);
+                }
             }
         }
 
@@ -211,7 +281,7 @@ impl<'a> Parser<'a> {
         let body = self.parse_block(&[Token::End])?;
         self.expect(Token::End)?;
 
-        Ok(Stmt::Function { name, params, body })
+        Ok(Stmt::Function { name, params, vararg, body, local })
     }
 
     fn parse_return(&mut self) -> Result<Stmt, String> {
@@ -222,7 +292,7 @@ impl<'a> Parser<'a> {
         // Check if there's a return value
         if !matches!(
             self.current(),
-            Token::End | Token::Else | Token::Elseif | Token::Eof
+            Token::End | Token::Else | Token::Elseif | Token::Until | Token::Eof
         ) {
             values.push(self.parse_expression()?);
 
@@ -235,31 +305,77 @@ impl<'a> Parser<'a> {
         Ok(Stmt::Return(values))
     }
 
+    fn parse_do(&mut self) -> Result<Stmt, String> {
+        self.expect(Token::Do)?;
+        let body = self.parse_block(&[Token::End])?;
+        self.expect(Token::End)?;
+        Ok(Stmt::Do(body))
+    }
+
+    fn parse_goto(&mut self) -> Result<Stmt, String> {
+        self.expect(Token::Goto)?;
+        let name = self.parse_identifier()?;
+        Ok(Stmt::Goto(name))
+    }
+
+    fn parse_label(&mut self) -> Result<Stmt, String> {
+        self.expect(Token::DoubleColon)?;
+        let name = self.parse_identifier()?;
+        self.expect(Token::DoubleColon)?;
+        Ok(Stmt::Label(name))
+    }
+
     fn parse_assignment_or_call(&mut self) -> Result<Stmt, String> {
-        let expr = self.parse_primary_expression()?;
+        let expr = self.parse_prefix_expression()?;
 
         // Check for assignment
         if self.current() == &Token::Assign {
             self.advance();
             let value = self.parse_expression()?;
 
-            match expr {
-                Expr::Variable(name) => Ok(Stmt::Assign {
-                    targets: vec![name],
-                    values: vec![value],
-                    local: false,
-                }),
-                Expr::Index(table, key) => Ok(Stmt::TableAssign {
-                    table: *table,
-                    key: *key,
-                    value,
-                }),
-                _ => Err("Invalid assignment target".to_string()),
+            let target = self.expr_to_assign_target(expr)?;
+            return Ok(Stmt::Assign {
+                targets: vec![target],
+                values: vec![value],
+                local: false,
+            });
+        }
+
+        // Multiple assignment: a, b = c, d
+        if self.current() == &Token::Comma {
+            let mut targets = vec![self.expr_to_assign_target(expr)?];
+
+            while self.current() == &Token::Comma {
+                self.advance();
+                let next_expr = self.parse_prefix_expression()?;
+                targets.push(self.expr_to_assign_target(next_expr)?);
             }
-        } else {
-            // Expression statement
-            let full_expr = self.parse_expression_rest(expr)?;
-            Ok(Stmt::Expression(full_expr))
+
+            self.expect(Token::Assign)?;
+
+            let mut values = vec![self.parse_expression()?];
+            while self.current() == &Token::Comma {
+                self.advance();
+                values.push(self.parse_expression()?);
+            }
+
+            return Ok(Stmt::Assign {
+                targets,
+                values,
+                local: false,
+            });
+        }
+
+        // Expression statement (function call)
+        let full_expr = self.parse_expression_rest(expr)?;
+        Ok(Stmt::Expression(full_expr))
+    }
+
+    fn expr_to_assign_target(&self, expr: Expr) -> Result<AssignTarget, String> {
+        match expr {
+            Expr::Variable(name) => Ok(AssignTarget::Name(name)),
+            Expr::Index(table, key) => Ok(AssignTarget::Index(*table, *key)),
+            _ => Err("Invalid assignment target".to_string()),
         }
     }
 
@@ -320,7 +436,7 @@ impl<'a> Parser<'a> {
     }
 
     fn parse_comparison_expression(&mut self) -> Result<Expr, String> {
-        let mut left = self.parse_concat_expression()?;
+        let mut left = self.parse_bitor_expression()?;
 
         loop {
             let op = match self.current() {
@@ -330,6 +446,75 @@ impl<'a> Parser<'a> {
                 Token::Gt => BinaryOperator::Gt,
                 Token::Le => BinaryOperator::Le,
                 Token::Ge => BinaryOperator::Ge,
+                _ => break,
+            };
+            self.advance();
+            let right = self.parse_bitor_expression()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn parse_bitor_expression(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_bitxor_expression()?;
+
+        while self.current() == &Token::Pipe {
+            self.advance();
+            let right = self.parse_bitxor_expression()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOperator::BOr,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn parse_bitxor_expression(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_bitand_expression()?;
+
+        while self.current() == &Token::Tilde {
+            self.advance();
+            let right = self.parse_bitand_expression()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOperator::BXor,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn parse_bitand_expression(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_shift_expression()?;
+
+        while self.current() == &Token::Ampersand {
+            self.advance();
+            let right = self.parse_shift_expression()?;
+            left = Expr::BinaryOp {
+                left: Box::new(left),
+                op: BinaryOperator::BAnd,
+                right: Box::new(right),
+            };
+        }
+
+        Ok(left)
+    }
+
+    fn parse_shift_expression(&mut self) -> Result<Expr, String> {
+        let mut left = self.parse_concat_expression()?;
+
+        loop {
+            let op = match self.current() {
+                Token::Shl => BinaryOperator::Shl,
+                Token::Shr => BinaryOperator::Shr,
                 _ => break,
             };
             self.advance();
@@ -347,9 +532,10 @@ impl<'a> Parser<'a> {
     fn parse_concat_expression(&mut self) -> Result<Expr, String> {
         let mut left = self.parse_additive_expression()?;
 
-        while self.current() == &Token::Concat {
+        // Concat is right-associative
+        if self.current() == &Token::Concat {
             self.advance();
-            let right = self.parse_additive_expression()?;
+            let right = self.parse_concat_expression()?;
             left = Expr::BinaryOp {
                 left: Box::new(left),
                 op: BinaryOperator::Concat,
@@ -388,6 +574,7 @@ impl<'a> Parser<'a> {
             let op = match self.current() {
                 Token::Star => BinaryOperator::Mul,
                 Token::Slash => BinaryOperator::Div,
+                Token::DoubleSlash => BinaryOperator::IDiv,
                 Token::Percent => BinaryOperator::Mod,
                 _ => break,
             };
@@ -429,12 +616,20 @@ impl<'a> Parser<'a> {
                     operand: Box::new(operand),
                 })
             }
+            Token::Tilde => {
+                self.advance();
+                let operand = self.parse_unary_expression()?;
+                Ok(Expr::UnaryOp {
+                    op: UnaryOperator::BNot,
+                    operand: Box::new(operand),
+                })
+            }
             _ => self.parse_power_expression(),
         }
     }
 
     fn parse_power_expression(&mut self) -> Result<Expr, String> {
-        let left = self.parse_primary_expression()?;
+        let left = self.parse_prefix_expression()?;
 
         if self.current() == &Token::Caret {
             self.advance();
@@ -449,31 +644,35 @@ impl<'a> Parser<'a> {
         }
     }
 
-    fn parse_primary_expression(&mut self) -> Result<Expr, String> {
+    fn parse_prefix_expression(&mut self) -> Result<Expr, String> {
         match self.current().clone() {
             Token::Nil => {
                 self.advance();
-                Ok(Expr::Literal(LuaValue::Nil))
+                Ok(Expr::LiteralNil)
             }
             Token::True => {
                 self.advance();
-                Ok(Expr::Literal(LuaValue::Boolean(true)))
+                Ok(Expr::LiteralBool(true))
             }
             Token::False => {
                 self.advance();
-                Ok(Expr::Literal(LuaValue::Boolean(false)))
+                Ok(Expr::LiteralBool(false))
             }
             Token::Number(n) => {
                 self.advance();
-                Ok(Expr::Literal(LuaValue::Number(n)))
+                Ok(Expr::LiteralNumber(n))
             }
             Token::String(s) => {
                 self.advance();
-                Ok(Expr::Literal(LuaValue::String(s)))
+                Ok(Expr::LiteralString(s))
             }
             Token::Identifier(name) => {
                 self.advance();
                 Ok(Expr::Variable(name))
+            }
+            Token::Vararg => {
+                self.advance();
+                Ok(Expr::Vararg)
             }
             Token::LParen => {
                 self.advance();
@@ -482,8 +681,42 @@ impl<'a> Parser<'a> {
                 Ok(expr)
             }
             Token::LBrace => self.parse_table_constructor(),
+            Token::Function => self.parse_anonymous_function(),
             _ => Err(format!("Unexpected token: {:?}", self.current())),
         }
+    }
+
+    fn parse_anonymous_function(&mut self) -> Result<Expr, String> {
+        self.expect(Token::Function)?;
+        self.expect(Token::LParen)?;
+
+        let mut params = Vec::new();
+        let mut vararg = false;
+
+        if self.current() != &Token::RParen {
+            if self.current() == &Token::Vararg {
+                self.advance();
+                vararg = true;
+            } else {
+                params.push(self.parse_identifier()?);
+
+                while self.current() == &Token::Comma {
+                    self.advance();
+                    if self.current() == &Token::Vararg {
+                        self.advance();
+                        vararg = true;
+                        break;
+                    }
+                    params.push(self.parse_identifier()?);
+                }
+            }
+        }
+
+        self.expect(Token::RParen)?;
+        let body = self.parse_block(&[Token::End])?;
+        self.expect(Token::End)?;
+
+        Ok(Expr::Function { params, vararg, body })
     }
 
     fn parse_expression_rest(&mut self, mut expr: Expr) -> Result<Expr, String> {
@@ -494,7 +727,7 @@ impl<'a> Parser<'a> {
                     let field = self.parse_identifier()?;
                     expr = Expr::Index(
                         Box::new(expr),
-                        Box::new(Expr::Literal(LuaValue::String(field))),
+                        Box::new(Expr::LiteralString(field)),
                     );
                 }
                 Token::LBracket => {
@@ -543,12 +776,29 @@ impl<'a> Parser<'a> {
 
                     let func = Expr::Index(
                         Box::new(expr),
-                        Box::new(Expr::Literal(LuaValue::String(method))),
+                        Box::new(Expr::LiteralString(method)),
                     );
 
                     expr = Expr::Call {
                         func: Box::new(func),
                         args,
+                    };
+                }
+                Token::String(s) => {
+                    // Function call with string argument: print "hello"
+                    let s = s.clone();
+                    self.advance();
+                    expr = Expr::Call {
+                        func: Box::new(expr),
+                        args: vec![Expr::LiteralString(s)],
+                    };
+                }
+                Token::LBrace => {
+                    // Function call with table argument: print {}
+                    let table = self.parse_table_constructor()?;
+                    expr = Expr::Call {
+                        func: Box::new(expr),
+                        args: vec![table],
                     };
                 }
                 _ => break,
@@ -571,24 +821,24 @@ impl<'a> Parser<'a> {
                 self.expect(Token::RBracket)?;
                 self.expect(Token::Assign)?;
                 let value = self.parse_expression()?;
-                entries.push((Some(key), value));
+                entries.push(TableEntry::KeyValue(key, value));
             }
-            // key = value
+            // key = value (identifier key)
             else if let Token::Identifier(name) = self.current().clone() {
                 if self.peek(1) == &Token::Assign {
                     self.advance();
                     self.advance();
                     let value = self.parse_expression()?;
-                    entries.push((Some(Expr::Literal(LuaValue::String(name))), value));
+                    entries.push(TableEntry::KeyValue(Expr::LiteralString(name), value));
                 } else {
                     // array element
                     let value = self.parse_expression()?;
-                    entries.push((None, value));
+                    entries.push(TableEntry::Array(value));
                 }
             } else {
                 // array element
                 let value = self.parse_expression()?;
-                entries.push((None, value));
+                entries.push(TableEntry::Array(value));
             }
 
             // Optional separator

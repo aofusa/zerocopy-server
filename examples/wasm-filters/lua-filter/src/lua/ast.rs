@@ -1,15 +1,19 @@
 //! Lua Abstract Syntax Tree
 
-use crate::lua::value::LuaValue;
-
 /// Expression types
 #[derive(Debug, Clone)]
 pub enum Expr {
-    /// Literal value
-    Literal(LuaValue),
+    /// Literal value - use LiteralValue to avoid circular dependency
+    LiteralNil,
+    LiteralBool(bool),
+    LiteralNumber(f64),
+    LiteralString(String),
 
     /// Variable reference
     Variable(String),
+
+    /// Varargs (...)
+    Vararg,
 
     /// Table field access: table.field or table["field"]
     Index(Box<Expr>, Box<Expr>),
@@ -34,7 +38,23 @@ pub enum Expr {
     },
 
     /// Table constructor
-    Table(Vec<(Option<Expr>, Expr)>),
+    Table(Vec<TableEntry>),
+
+    /// Anonymous function (closure)
+    Function {
+        params: Vec<String>,
+        vararg: bool,
+        body: Vec<Stmt>,
+    },
+}
+
+/// Table constructor entry
+#[derive(Debug, Clone)]
+pub enum TableEntry {
+    /// Array-style: value
+    Array(Expr),
+    /// Key-value: key = value or [key] = value
+    KeyValue(Expr, Expr),
 }
 
 /// Binary operators
@@ -47,6 +67,7 @@ pub enum BinaryOperator {
     Div,
     Mod,
     Pow,
+    IDiv, // //
 
     // Comparison
     Eq,
@@ -62,6 +83,13 @@ pub enum BinaryOperator {
 
     // String
     Concat,
+
+    // Bitwise (Lua 5.3+)
+    BAnd,
+    BOr,
+    BXor,
+    Shl,
+    Shr,
 }
 
 /// Unary operators
@@ -70,6 +98,7 @@ pub enum UnaryOperator {
     Neg,
     Not,
     Len,
+    BNot, // Bitwise not ~
 }
 
 /// Statement types
@@ -77,16 +106,9 @@ pub enum UnaryOperator {
 pub enum Stmt {
     /// Assignment: x = expr or local x = expr
     Assign {
-        targets: Vec<String>,
+        targets: Vec<AssignTarget>,
         values: Vec<Expr>,
         local: bool,
-    },
-
-    /// Table field assignment: table.field = expr
-    TableAssign {
-        table: Expr,
-        key: Expr,
-        value: Expr,
     },
 
     /// If statement
@@ -103,6 +125,12 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
 
+    /// Repeat-until loop
+    Repeat {
+        body: Vec<Stmt>,
+        condition: Expr,
+    },
+
     /// Numeric for loop
     ForNumeric {
         var: String,
@@ -112,11 +140,20 @@ pub enum Stmt {
         body: Vec<Stmt>,
     },
 
+    /// Generic for loop
+    ForGeneric {
+        vars: Vec<String>,
+        exprs: Vec<Expr>,
+        body: Vec<Stmt>,
+    },
+
     /// Function definition
     Function {
-        name: String,
+        name: FunctionName,
         params: Vec<String>,
+        vararg: bool,
         body: Vec<Stmt>,
+        local: bool,
     },
 
     /// Return statement
@@ -127,6 +164,55 @@ pub enum Stmt {
 
     /// Break statement
     Break,
+
+    /// Do block
+    Do(Vec<Stmt>),
+
+    /// Goto statement (Lua 5.2+)
+    Goto(String),
+
+    /// Label (::name::)
+    Label(String),
+}
+
+/// Assignment target
+#[derive(Debug, Clone)]
+pub enum AssignTarget {
+    /// Simple variable
+    Name(String),
+    /// Table index: table[key] or table.field
+    Index(Expr, Expr),
+}
+
+/// Function name (can be dotted or method)
+#[derive(Debug, Clone)]
+pub struct FunctionName {
+    pub base: String,
+    pub fields: Vec<String>,
+    pub method: Option<String>,
+}
+
+impl FunctionName {
+    pub fn simple(name: String) -> Self {
+        Self {
+            base: name,
+            fields: Vec::new(),
+            method: None,
+        }
+    }
+
+    pub fn full_name(&self) -> String {
+        let mut name = self.base.clone();
+        for field in &self.fields {
+            name.push('.');
+            name.push_str(field);
+        }
+        if let Some(method) = &self.method {
+            name.push(':');
+            name.push_str(method);
+        }
+        name
+    }
 }
 
 /// A complete Lua program

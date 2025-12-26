@@ -7,7 +7,7 @@ mod ast;
 pub mod interpreter;
 pub mod lexer;
 pub mod parser;
-mod stdlib;
+pub mod pattern;
 pub mod value;
 
 pub use interpreter::Interpreter;

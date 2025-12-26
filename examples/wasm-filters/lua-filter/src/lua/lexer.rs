@@ -23,13 +23,16 @@ pub enum Token {
     End,
     For,
     Function,
+    Goto,
     If,
     In,
     Local,
     Not,
     Or,
+    Repeat,
     Return,
     Then,
+    Until,
     While,
 
     // Operators
@@ -37,9 +40,15 @@ pub enum Token {
     Minus,
     Star,
     Slash,
+    DoubleSlash, // //
     Percent,
     Caret,
     Hash,
+    Ampersand,   // &
+    Pipe,        // |
+    Tilde,       // ~
+    Shl,         // <<
+    Shr,         // >>
     Eq,
     NotEq,
     Lt,
@@ -48,7 +57,9 @@ pub enum Token {
     Ge,
     Assign,
     Concat,
+    Vararg,      // ...
     Dot,
+    DoubleColon, // ::
     Colon,
     Comma,
     Semicolon,
@@ -210,15 +221,18 @@ impl<'a> Lexer<'a> {
             "false" => Token::False,
             "for" => Token::For,
             "function" => Token::Function,
+            "goto" => Token::Goto,
             "if" => Token::If,
             "in" => Token::In,
             "local" => Token::Local,
             "nil" => Token::Nil,
             "not" => Token::Not,
             "or" => Token::Or,
+            "repeat" => Token::Repeat,
             "return" => Token::Return,
             "then" => Token::Then,
             "true" => Token::True,
+            "until" => Token::Until,
             "while" => Token::While,
             _ => Token::Identifier(s),
         }
@@ -246,7 +260,6 @@ impl<'a> Lexer<'a> {
             '+' => Ok(Token::Plus),
             '-' => Ok(Token::Minus),
             '*' => Ok(Token::Star),
-            '/' => Ok(Token::Slash),
             '%' => Ok(Token::Percent),
             '^' => Ok(Token::Caret),
             '#' => Ok(Token::Hash),
@@ -258,12 +271,16 @@ impl<'a> Lexer<'a> {
             '}' => Ok(Token::RBrace),
             ',' => Ok(Token::Comma),
             ';' => Ok(Token::Semicolon),
-            ':' => Ok(Token::Colon),
 
             '.' => {
                 if self.peek_char() == Some(&'.') {
                     self.next_char();
-                    Ok(Token::Concat)
+                    if self.peek_char() == Some(&'.') {
+                        self.next_char();
+                        Ok(Token::Vararg)
+                    } else {
+                        Ok(Token::Concat)
+                    }
                 } else if self.peek_char().map(|c| c.is_ascii_digit()).unwrap_or(false) {
                     // .5 style number
                     self.read_number(c)
@@ -271,6 +288,27 @@ impl<'a> Lexer<'a> {
                     Ok(Token::Dot)
                 }
             }
+
+            '/' => {
+                if self.peek_char() == Some(&'/') {
+                    self.next_char();
+                    Ok(Token::DoubleSlash)
+                } else {
+                    Ok(Token::Slash)
+                }
+            }
+
+            ':' => {
+                if self.peek_char() == Some(&':') {
+                    self.next_char();
+                    Ok(Token::DoubleColon)
+                } else {
+                    Ok(Token::Colon)
+                }
+            }
+
+            '&' => Ok(Token::Ampersand),
+            '|' => Ok(Token::Pipe),
 
             '=' => {
                 if self.peek_char() == Some(&'=') {
@@ -286,7 +324,7 @@ impl<'a> Lexer<'a> {
                     self.next_char();
                     Ok(Token::NotEq)
                 } else {
-                    Err(format!("Unexpected character: {}", c))
+                    Ok(Token::Tilde)
                 }
             }
 
@@ -294,6 +332,9 @@ impl<'a> Lexer<'a> {
                 if self.peek_char() == Some(&'=') {
                     self.next_char();
                     Ok(Token::Le)
+                } else if self.peek_char() == Some(&'<') {
+                    self.next_char();
+                    Ok(Token::Shl)
                 } else {
                     Ok(Token::Lt)
                 }
@@ -303,6 +344,9 @@ impl<'a> Lexer<'a> {
                 if self.peek_char() == Some(&'=') {
                     self.next_char();
                     Ok(Token::Ge)
+                } else if self.peek_char() == Some(&'>') {
+                    self.next_char();
+                    Ok(Token::Shr)
                 } else {
                     Ok(Token::Gt)
                 }
