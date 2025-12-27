@@ -145,6 +145,19 @@ pub struct ScopeSnapshot {
     pub values: HashMap<String, Rc<RefCell<LuaValue>>>,
 }
 
+/// Loop state for coroutine (saved when yield occurs inside a loop)
+#[derive(Clone, Debug)]
+pub enum LoopState {
+    ForNumeric {
+        var: String,
+        current_value: f64,
+        start_val: f64,
+        end_val: f64,
+        step_val: f64,
+        body_index: usize,  // ループボディ内のどのステートメントから再開するか
+    },
+}
+
 /// Coroutine state
 #[derive(Clone, Debug)]
 pub struct CoroutineState {
@@ -167,6 +180,9 @@ pub struct CoroutineState {
     
     /// 呼び出し元に返す値（yield時の値）
     pub yield_values: Option<Vec<LuaValue>>,
+    
+    /// ループの状態（forループ内でyieldが発生した場合に使用）
+    pub loop_state: Option<LoopState>,
 }
 
 /// Lua value types

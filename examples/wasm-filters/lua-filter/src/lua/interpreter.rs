@@ -2,7 +2,7 @@
 
 use crate::lua::ast::*;
 use crate::lua::pattern;
-use crate::lua::value::{Closure, CoroutineState, CoroutineStatus, LuaTable, LuaValue, Metatable, ScopeSnapshot, Upvalue};
+use crate::lua::value::{Closure, CoroutineState, CoroutineStatus, LoopState, LuaTable, LuaValue, Metatable, ScopeSnapshot, Upvalue};
 use crate::lua::lexer;
 use crate::lua::parser;
 use std::cell::RefCell;
@@ -481,41 +481,192 @@ impl Interpreter {
             }
 
             Stmt::ForNumeric { var, start, end, step, body } => {
-                let start_val = self.evaluate(start)?.to_number().unwrap_or(0.0);
-                let end_val = self.evaluate(end)?.to_number().unwrap_or(0.0);
-                let step_val = step
-                    .as_ref()
-                    .map(|s| self.evaluate(s).ok().and_then(|v| v.to_number()))
-                    .flatten()
-                    .unwrap_or(1.0);
-
-                self.break_flag = false;
-                self.push_scope();
-
-                let mut i = start_val;
-                while (step_val > 0.0 && i <= end_val) || (step_val < 0.0 && i >= end_val) {
-                    if self.break_flag {
-                        break;
-                    }
-
-                    self.set_local(var.clone(), LuaValue::Number(i));
+                // 既存のループ状態を復元する
+                let mut loop_state_restored = false;
+                if let Some(ref co) = self.current_coroutine {
+                    let loop_state_opt = {
+                        let co_state = co.borrow();
+                        co_state.loop_state.clone()
+                    };
                     
-                    for stmt in body {
-                        self.execute_statement(stmt)?;
-                        if self.break_flag || self.return_values.is_some() {
-                            break;
+                    if let Some(loop_state) = loop_state_opt {
+                        // LoopState currently only has ForNumeric variant
+                        let LoopState::ForNumeric {
+                            var: saved_var,
+                            current_value,
+                            start_val,
+                            end_val,
+                            step_val,
+                            body_index,
+                        } = loop_state;
+                        
+                        if &saved_var == var {
+                            // ループ状態を復元
+                            self.break_flag = false;
+                            self.push_scope();
+                            
+                            let mut i = current_value;
+                            let mut body_idx = body_index;
+                            
+                            // ループの継続
+                            while (step_val > 0.0 && i <= end_val) || (step_val < 0.0 && i >= end_val) {
+                                if self.break_flag {
+                                    break;
+                                }
+
+                                self.set_local(var.clone(), LuaValue::Number(i));
+                                
+                                // ループボディ内の特定のステートメントから再開
+                                while body_idx < body.len() {
+                                    let stmt = &body[body_idx];
+                                    match self.execute_statement(stmt) {
+                                        Ok(()) => {
+                                            // yieldチェック
+                                            if let Some(ref co) = self.current_coroutine {
+                                                let co_state_check = co.borrow();
+                                                if co_state_check.status == CoroutineStatus::Suspended {
+                                                    drop(co_state_check);
+                                                    // ループ状態を保存
+                                                    let mut co_state_mut = co.borrow_mut();
+                                                    co_state_mut.loop_state = Some(LoopState::ForNumeric {
+                                                        var: var.clone(),
+                                                        current_value: i,
+                                                        start_val,
+                                                        end_val,
+                                                        step_val,
+                                                        body_index: body_idx + 1,
+                                                    });
+                                                    return Err("__COROUTINE_YIELD__".to_string());
+                                                }
+                                            }
+                                        }
+                                        Err(e) => {
+                                            if e == "__COROUTINE_YIELD__" {
+                                                // ループ状態を保存
+                                                if let Some(ref co) = self.current_coroutine {
+                                                    let mut co_state_mut = co.borrow_mut();
+                                                    co_state_mut.loop_state = Some(LoopState::ForNumeric {
+                                                        var: var.clone(),
+                                                        current_value: i,
+                                                        start_val,
+                                                        end_val,
+                                                        step_val,
+                                                        body_index: body_idx + 1,
+                                                    });
+                                                }
+                                                return Err(e);
+                                            }
+                                            return Err(e);
+                                        }
+                                    }
+                                    body_idx += 1;
+                                    if self.break_flag || self.return_values.is_some() {
+                                        break;
+                                    }
+                                }
+                                
+                                if self.return_values.is_some() {
+                                    break;
+                                }
+                                
+                                i += step_val;
+                                body_idx = 0;  // 次のイテレーションでは最初から
+                            }
+                            
+                            self.pop_scope();
+                            self.break_flag = false;
+                            
+                            // ループ状態をクリア
+                            if let Some(ref co) = self.current_coroutine {
+                                let mut co_state_mut = co.borrow_mut();
+                                co_state_mut.loop_state = None;
+                            }
+                            
+                            loop_state_restored = true;
                         }
                     }
+                }
+                
+                // 既存のループ状態がない場合、通常のループ処理を実行
+                if !loop_state_restored {
+                    let start_val = self.evaluate(start)?.to_number().unwrap_or(0.0);
+                    let end_val = self.evaluate(end)?.to_number().unwrap_or(0.0);
+                    let step_val = step
+                        .as_ref()
+                        .map(|s| self.evaluate(s).ok().and_then(|v| v.to_number()))
+                        .flatten()
+                        .unwrap_or(1.0);
 
-                    if self.return_values.is_some() {
-                        break;
+                    self.break_flag = false;
+                    self.push_scope();
+
+                    let mut i = start_val;
+                    while (step_val > 0.0 && i <= end_val) || (step_val < 0.0 && i >= end_val) {
+                        if self.break_flag {
+                            break;
+                        }
+
+                        self.set_local(var.clone(), LuaValue::Number(i));
+                        
+                        let mut body_idx = 0;
+                        while body_idx < body.len() {
+                            let stmt = &body[body_idx];
+                            match self.execute_statement(stmt) {
+                                Ok(()) => {
+                                    // yieldチェック
+                                    if let Some(ref co) = self.current_coroutine {
+                                        let co_state_check = co.borrow();
+                                        if co_state_check.status == CoroutineStatus::Suspended {
+                                            drop(co_state_check);
+                                            // ループ状態を保存
+                                            let mut co_state_mut = co.borrow_mut();
+                                            co_state_mut.loop_state = Some(LoopState::ForNumeric {
+                                                var: var.clone(),
+                                                current_value: i,
+                                                start_val,
+                                                end_val,
+                                                step_val,
+                                                body_index: body_idx + 1,
+                                            });
+                                            return Err("__COROUTINE_YIELD__".to_string());
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    if e == "__COROUTINE_YIELD__" {
+                                        // ループ状態を保存
+                                        if let Some(ref co) = self.current_coroutine {
+                                            let mut co_state_mut = co.borrow_mut();
+                                            co_state_mut.loop_state = Some(LoopState::ForNumeric {
+                                                var: var.clone(),
+                                                current_value: i,
+                                                start_val,
+                                                end_val,
+                                                step_val,
+                                                body_index: body_idx + 1,
+                                            });
+                                        }
+                                        return Err(e);
+                                    }
+                                    return Err(e);
+                                }
+                            }
+                            body_idx += 1;
+                            if self.break_flag || self.return_values.is_some() {
+                                break;
+                            }
+                        }
+
+                        if self.return_values.is_some() {
+                            break;
+                        }
+
+                        i += step_val;
                     }
 
-                    i += step_val;
+                    self.pop_scope();
+                    self.break_flag = false;
                 }
-
-                self.pop_scope();
-                self.break_flag = false;
             }
 
             Stmt::ForGeneric { vars, exprs, body } => {
@@ -886,7 +1037,7 @@ impl Interpreter {
                     if name == "coroutine.yield" {
                         // Yield returns the arguments passed to the next resume
                         // These are stored in varargs after resume
-                        let yield_result = self.call_function(&func_val, &arg_vals)?;
+                        let _yield_result = self.call_function(&func_val, &arg_vals)?;
                         // After yield, varargs contains the arguments from resume
                         // Return first vararg as the yield return value
                         if !self.varargs.is_empty() {
@@ -3680,6 +3831,7 @@ impl Interpreter {
                     varargs: Vec::new(),
                     status: CoroutineStatus::Suspended,
                     yield_values: None,
+                    loop_state: None,
                 };
                 
                 Ok(LuaValue::Coroutine(Rc::new(RefCell::new(coroutine_state))))
@@ -3822,6 +3974,7 @@ impl Interpreter {
                     varargs: Vec::new(),
                     status: CoroutineStatus::Suspended,
                     yield_values: None,
+                    loop_state: None,
                 };
                 
                 let co = Rc::new(RefCell::new(coroutine_state));
@@ -3922,9 +4075,14 @@ impl Interpreter {
                         if co_state_check.status == CoroutineStatus::Suspended {
                             drop(co_state_check);
                             // Yield occurred - state already saved in yield(), just update index and get values
+                            // If loop_state is set, keep statement_index at current position (for loop will handle restoration)
                             let yield_values = {
                                 let mut co_state_mut = co.borrow_mut();
-                                co_state_mut.statement_index = i + 1; // Next statement after yield
+                                // Only update statement_index if there's no loop_state
+                                // (loop_state means we're inside a loop and the loop will handle restoration)
+                                if co_state_mut.loop_state.is_none() {
+                                    co_state_mut.statement_index = i + 1; // Next statement after yield
+                                }
                                 co_state_mut.yield_values.take().unwrap_or_default()
                             };
                             
@@ -3965,9 +4123,14 @@ impl Interpreter {
                     // Check if this is a yield signal
                     if e == "__COROUTINE_YIELD__" {
                         // Yield occurred - state already saved in yield(), just update index and get values
+                        // If loop_state is set, keep statement_index at current position (for loop will handle restoration)
                         let yield_values = {
                             let mut co_state_mut = co.borrow_mut();
-                            co_state_mut.statement_index = i + 1; // Next statement after yield
+                            // Only update statement_index if there's no loop_state
+                            // (loop_state means we're inside a loop and the loop will handle restoration)
+                            if co_state_mut.loop_state.is_none() {
+                                co_state_mut.statement_index = i + 1; // Next statement after yield
+                            }
                             co_state_mut.yield_values.take().unwrap_or_default()
                         };
                         
@@ -4015,6 +4178,7 @@ impl Interpreter {
     }
 
     /// Save coroutine state (scopes, variables, etc.)
+    #[allow(dead_code)]
     fn save_coroutine_state(&self, co_state: &mut CoroutineState) -> Result<(), String> {
         // Save current scopes
         co_state.scopes = self.scopes.iter().map(|scope| {
