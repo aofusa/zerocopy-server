@@ -80,8 +80,11 @@ impl ModuleRegistry {
         // Enable fuel for execution limits
         config.consume_fuel(true);
 
-        // Enable epoch interruption
-        config.epoch_interruption(true);
+        // Note: epoch_interruption requires calling store.set_epoch_deadline() before execution
+        // and incrementing engine.increment_epoch() periodically for timeout enforcement.
+        // Currently disabled as it causes immediate traps without proper epoch management.
+        // TODO: Implement proper epoch-based timeout with background thread
+        // config.epoch_interruption(true);
 
         Engine::new(&config)
     }

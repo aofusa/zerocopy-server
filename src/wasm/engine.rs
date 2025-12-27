@@ -185,24 +185,69 @@ impl FilterEngine {
         let instance = module.instance_pre.instantiate(&mut store)?;
 
         // === Proxy-Wasm SDK Lifecycle ===
-        // The SDK requires these callbacks in order:
-        // 1. _initialize (called automatically by wasmtime on instantiation)
-        // 2. proxy_on_vm_start - creates the RootContext
-        // 3. proxy_on_context_create - creates the HttpContext
-        // 4. proxy_on_request_headers - processes the request
+        // The SDK requires these callbacks in EXACT order:
+        // 0. _start - MUST be called first! This runs set_root_context() in the SDK
+        // 1. proxy_on_context_create(root_id, 0) - creates ROOT context (parent=0 means root)
+        // 2. proxy_on_vm_start(root_id, config_size) - notifies VM started
+        // 3. proxy_on_configure(root_id, config_size) - sends configuration
+        // 4. proxy_on_context_create(http_id, root_id) - creates HTTP context under root
+        // 5. proxy_on_request_headers - processes the request
 
-        // Call proxy_on_vm_start with root_context_id = 0
-        // This triggers RootContext creation in the SDK
-        let config_size = module.configuration.len() as i32;
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
-            let _ = func.call(&mut store, (0, config_size));
+        // Step 0: Call _start to initialize the SDK
+        // This is where set_root_context() is called in the proxy-wasm Rust SDK
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            match func.call(&mut store, ()) {
+                Ok(()) => ftlog::debug!("[wasm:{}] _start() OK", module.name),
+                Err(e) => ftlog::error!("[wasm:{}] _start() failed: {}", module.name, e),
+            }
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            match func.call(&mut store, ()) {
+                Ok(()) => ftlog::debug!("[wasm:{}] _initialize() OK", module.name),
+                Err(e) => ftlog::error!("[wasm:{}] _initialize() failed: {}", module.name, e),
+            }
+        } else {
+            ftlog::warn!("[wasm:{}] Neither _start nor _initialize exported", module.name);
         }
 
-        // Call proxy_on_context_create with context_id = 1, parent_context_id = 0
-        // This triggers HttpContext creation via RootContext::create_http_context()
-        let context_id = 1i32;
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_context_create") {
-            let _ = func.call(&mut store, (context_id, 0));
+        let root_context_id = 1i32;    // Root context ID (SDK uses 1)
+        let http_context_id = 2i32;    // HTTP context ID
+        let config_size = module.configuration.len() as i32;
+
+        // Step 1: Create ROOT context first (parent_context_id = 0 means root)
+        // This MUST be called BEFORE proxy_on_vm_start
+        // Note: proxy_on_context_create has signature (i32, i32) -> void
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            match func.call(&mut store, (root_context_id, 0)) {
+                Ok(()) => ftlog::debug!("[wasm:{}] proxy_on_context_create({}, 0) OK", module.name, root_context_id),
+                Err(e) => ftlog::error!("[wasm:{}] proxy_on_context_create({}, 0) failed: {}", module.name, root_context_id, e),
+            }
+        } else {
+            ftlog::debug!("[wasm:{}] proxy_on_context_create not exported", module.name);
+        }
+
+        // Step 2: Call proxy_on_vm_start on the root context
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+            match func.call(&mut store, (root_context_id, config_size)) {
+                Ok(ret) => ftlog::debug!("[wasm:{}] proxy_on_vm_start({}, {}) => {}", module.name, root_context_id, config_size, ret),
+                Err(e) => ftlog::error!("[wasm:{}] proxy_on_vm_start failed: {}", module.name, e),
+            }
+        }
+
+        // Step 3: Call proxy_on_configure on the root context
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+            match func.call(&mut store, (root_context_id, config_size)) {
+                Ok(ret) => ftlog::debug!("[wasm:{}] proxy_on_configure({}, {}) => {}", module.name, root_context_id, config_size, ret),
+                Err(e) => ftlog::error!("[wasm:{}] proxy_on_configure failed: {}", module.name, e),
+            }
+        }
+
+        // Step 4: Create HTTP context with root as parent
+        // Note: proxy_on_context_create has signature (i32, i32) -> void
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            match func.call(&mut store, (http_context_id, root_context_id)) {
+                Ok(()) => ftlog::debug!("[wasm:{}] proxy_on_context_create({}, {}) OK", module.name, http_context_id, root_context_id),
+                Err(e) => ftlog::error!("[wasm:{}] proxy_on_context_create({}, {}) failed: {}", module.name, http_context_id, root_context_id, e),
+            }
         }
 
         // Now call proxy_on_request_headers
@@ -213,7 +258,7 @@ impl FilterEngine {
             Ok(func) => {
                 let num_headers = headers.len() as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call(&mut store, (context_id, num_headers, eos))?
+                func.call(&mut store, (http_context_id, num_headers, eos))?
             }
             Err(_) => {
                 // Callback not exported, continue
@@ -314,16 +359,35 @@ impl FilterEngine {
         let instance = module.instance_pre.instantiate(&mut store)?;
 
         // === Proxy-Wasm SDK Lifecycle ===
-        // Call proxy_on_vm_start with root_context_id = 0
-        let config_size = module.configuration.len() as i32;
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
-            let _ = func.call(&mut store, (0, config_size));
+        // Step 0: Call _start to initialize the SDK
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
         }
 
-        // Call proxy_on_context_create with context_id = 1, parent_context_id = 0
-        let context_id = 1i32;
-        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_context_create") {
-            let _ = func.call(&mut store, (context_id, 0));
+        let root_context_id = 1i32;    // Root context ID
+        let http_context_id = 2i32;    // HTTP context ID
+        let config_size = module.configuration.len() as i32;
+
+        // Step 1: Create ROOT context first (parent=0 means root)
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        // Step 2: Call proxy_on_vm_start
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        // Step 3: Call proxy_on_configure
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure") {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        // Step 4: Create HTTP context with root as parent
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
         }
 
         // Now call proxy_on_response_headers
@@ -334,7 +398,7 @@ impl FilterEngine {
             Ok(func) => {
                 let num_headers = headers.len() as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call(&mut store, (context_id, num_headers, eos))?
+                func.call(&mut store, (http_context_id, num_headers, eos))?
             }
             Err(_) => 0,
         };
