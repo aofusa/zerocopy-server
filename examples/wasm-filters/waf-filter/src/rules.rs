@@ -6,6 +6,7 @@
 use regex::Regex;
 use serde::Deserialize;
 use std::collections::HashMap;
+use std::fmt;
 
 use crate::{crs_level1, crs_level2, crs_level3};
 
@@ -143,6 +144,67 @@ impl WafConfig {
         }
         false
     }
+
+    /// Check if IP address is whitelisted
+    pub fn is_ip_whitelisted(&self, ip: &str) -> bool {
+        if self.whitelist_ips.is_empty() {
+            return false;
+        }
+        
+        // Normalize IP address (remove port if present)
+        let normalized_ip = ip.split(':').next().unwrap_or(ip);
+        
+        // Check exact match
+        if self.whitelist_ips.iter().any(|w| w == normalized_ip || w == ip) {
+            return true;
+        }
+        
+        // Check CIDR notation (basic support for IPv4)
+        for whitelist_entry in &self.whitelist_ips {
+            if whitelist_entry.contains('/') {
+                if Self::match_cidr(normalized_ip, whitelist_entry) {
+                    return true;
+                }
+            }
+        }
+        
+        false
+    }
+    
+    /// Basic CIDR matching (IPv4 only)
+    fn match_cidr(ip: &str, cidr: &str) -> bool {
+        // Simplified CIDR matching for IPv4
+        // Full implementation would require proper IP parsing library
+        if let Some((network, prefix_len)) = cidr.split_once('/') {
+            if let Ok(prefix) = prefix_len.parse::<u8>() {
+                if prefix == 32 {
+                    // /32 is exact match
+                    return network == ip;
+                } else if prefix == 24 {
+                    // /24 subnet match
+                    if let Some(dot_pos) = network.rfind('.') {
+                        let network_prefix = &network[..dot_pos];
+                        if let Some(ip_dot_pos) = ip.rfind('.') {
+                            let ip_prefix = &ip[..ip_dot_pos];
+                            return network_prefix == ip_prefix;
+                        }
+                    }
+                } else if prefix == 16 {
+                    // /16 subnet match
+                    if let Some(dot_pos) = network.rfind('.') {
+                        let network_prefix = &network[..network[..dot_pos].rfind('.').unwrap_or(0)];
+                        if let Some(ip_dot_pos) = ip.rfind('.') {
+                            let ip_prefix = &ip[..ip[..ip_dot_pos].rfind('.').unwrap_or(0)];
+                            return network_prefix == ip_prefix;
+                        }
+                    }
+                }
+                // For other prefix lengths, use simple prefix matching
+                return ip.starts_with(network);
+            }
+        }
+        false
+    }
 }
 
 /// Custom rule definition
@@ -169,6 +231,24 @@ pub struct Violation {
     pub severity: Severity,
 }
 
+/// Rule compilation error
+#[derive(Debug, Clone)]
+pub struct RuleCompilationError {
+    pub rule_id: String,
+    pub pattern: String,
+    pub error: String,
+}
+
+impl fmt::Display for RuleCompilationError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "Failed to compile rule {} with pattern '{}': {}",
+            self.rule_id, self.pattern, self.error
+        )
+    }
+}
+
 /// Compiled rule with pre-compiled regex
 pub struct CompiledRule {
     pub id: String,
@@ -176,6 +256,7 @@ pub struct CompiledRule {
     pub regex: Regex,
     pub severity: Severity,
     pub action: WafAction,
+    pub targets: Vec<String>,
 }
 
 impl Clone for CompiledRule {
@@ -186,19 +267,57 @@ impl Clone for CompiledRule {
             regex: Regex::new(self.regex.as_str()).unwrap(),
             severity: self.severity,
             action: self.action.clone(),
+            targets: self.targets.clone(),
         }
     }
 }
 
 impl CompiledRule {
-    pub fn new(id: &str, category: &str, pattern: &str, severity: Severity, action: WafAction) -> Self {
-        Self {
-            id: id.to_string(),
-            category: category.to_string(),
-            regex: Regex::new(pattern).expect(&format!("Invalid regex pattern for rule {}", id)),
-            severity,
-            action,
+    /// Create a new compiled rule, returning Result instead of panicking
+    pub fn try_new(
+        id: &str,
+        category: &str,
+        pattern: &str,
+        severity: Severity,
+        action: WafAction,
+        targets: Vec<String>,
+    ) -> Result<Self, RuleCompilationError> {
+        match Regex::new(pattern) {
+            Ok(regex) => Ok(Self {
+                id: id.to_string(),
+                category: category.to_string(),
+                regex,
+                severity,
+                action,
+                targets,
+            }),
+            Err(e) => Err(RuleCompilationError {
+                rule_id: id.to_string(),
+                pattern: pattern.to_string(),
+                error: e.to_string(),
+            }),
         }
+    }
+    
+    /// Create a new compiled rule (deprecated, use try_new)
+    #[deprecated(note = "Use try_new instead to avoid panics")]
+    pub fn new(id: &str, category: &str, pattern: &str, severity: Severity, action: WafAction) -> Self {
+        Self::try_new(id, category, pattern, severity, action, vec![])
+            .unwrap_or_else(|e| {
+                log::error!("{}", e);
+                panic!("Rule compilation failed: {}", e);
+            })
+    }
+    
+    /// Check if this rule should be applied to the target
+    pub fn matches_target(&self, target_name: &str) -> bool {
+        // If no targets specified, apply to all (backward compatibility)
+        if self.targets.is_empty() {
+            return true;
+        }
+        
+        // Check if target is in the list
+        self.targets.iter().any(|t| t == target_name)
     }
 }
 
@@ -231,16 +350,34 @@ impl RuleEngine {
             CrsLevel::Level3 => crs_level3::get_rules(),
         };
 
-        // Add custom rules
+        // Add custom rules with proper error handling
+        let mut errors = Vec::new();
         for custom_rule in &config.custom_rules {
-            if let Ok(regex) = Regex::new(&custom_rule.pattern) {
-                rules.push(CompiledRule {
-                    id: custom_rule.id.clone(),
-                    category: format!("Custom: {}", custom_rule.message),
-                    regex,
-                    severity: Severity::High,
-                    action: custom_rule.action.clone(),
-                });
+            match CompiledRule::try_new(
+                &custom_rule.id,
+                &format!("Custom: {}", custom_rule.message),
+                &custom_rule.pattern,
+                Severity::High,
+                custom_rule.action.clone(),
+                custom_rule.targets.clone(),
+            ) {
+                Ok(rule) => {
+                    rules.push(rule);
+                }
+                Err(e) => {
+                    errors.push(e);
+                }
+            }
+        }
+        
+        // Log errors
+        if !errors.is_empty() {
+            log::warn!(
+                "[waf] Failed to compile {} custom rule(s), skipping them",
+                errors.len()
+            );
+            for error in &errors {
+                log::error!("[waf] {}", error);
             }
         }
 
@@ -267,6 +404,11 @@ impl RuleEngine {
             let decoded = self.url_decode(target_value);
 
             for rule in &self.rules {
+                // Check if rule applies to this target
+                if !rule.matches_target(target_name) {
+                    continue;
+                }
+                
                 if rule.regex.is_match(&decoded) {
                     let violation = Violation {
                         rule_id: rule.id.clone(),
@@ -297,29 +439,97 @@ impl RuleEngine {
         None
     }
 
-    /// Basic URL decoding
-    fn url_decode(&self, input: &str) -> String {
+    /// Enhanced URL decoding with multiple encoding support
+    pub(crate) fn url_decode(&self, input: &str) -> String {
+        self.url_decode_recursive(input, 0, 3)
+    }
+    
+    /// Recursive URL decoding with depth limit
+    fn url_decode_recursive(&self, input: &str, depth: u8, max_depth: u8) -> String {
+        if depth >= max_depth {
+            return input.to_string();
+        }
+        
         let mut result = String::new();
         let mut chars = input.chars().peekable();
-
+        let mut changed = false;
+        
+        while let Some(c) = chars.next() {
+            match c {
+                '%' => {
+                    // Try to decode %XX
+                    let hex_chars: Vec<char> = chars.by_ref().take(2).collect();
+                    if hex_chars.len() == 2 {
+                        let hex_str: String = hex_chars.iter().collect();
+                        if let Ok(byte) = u8::from_str_radix(&hex_str, 16) {
+                            // Safe UTF-8 character conversion for ASCII
+                            if byte < 0x80 {
+                                result.push(byte as char);
+                                changed = true;
+                                continue;
+                            }
+                            // For multi-byte UTF-8, we need proper handling
+                            // This is a simplified version - push as-is for now
+                            result.push(byte as char);
+                            changed = true;
+                            continue;
+                        }
+                    }
+                    // Failed to decode, keep original
+                    result.push('%');
+                    result.extend(hex_chars);
+                }
+                '+' => {
+                    result.push(' ');
+                    changed = true;
+                }
+                _ => {
+                    result.push(c);
+                }
+            }
+        }
+        
+        // Decode Unicode escape sequences (%uXXXX)
+        result = self.decode_unicode_escape(&result);
+        
+        // If changes were made, try recursive decode
+        if changed && depth < max_depth {
+            self.url_decode_recursive(&result, depth + 1, max_depth)
+        } else {
+            result
+        }
+    }
+    
+    /// Decode Unicode escape sequences (%uXXXX)
+    fn decode_unicode_escape(&self, input: &str) -> String {
+        let mut result = String::new();
+        let mut chars = input.chars().peekable();
+        
         while let Some(c) = chars.next() {
             if c == '%' {
-                let hex: String = chars.by_ref().take(2).collect();
-                if hex.len() == 2 {
-                    if let Ok(byte) = u8::from_str_radix(&hex, 16) {
-                        result.push(byte as char);
-                        continue;
+                if let Some(&'u') = chars.peek() {
+                    chars.next(); // consume 'u'
+                    let hex_chars: Vec<char> = chars.by_ref().take(4).collect();
+                    if hex_chars.len() == 4 {
+                        let hex_str: String = hex_chars.iter().collect();
+                        if let Ok(code_point) = u16::from_str_radix(&hex_str, 16) {
+                            if let Some(unicode_char) = char::from_u32(code_point as u32) {
+                                result.push(unicode_char);
+                                continue;
+                            }
+                        }
                     }
+                    result.push('%');
+                    result.push('u');
+                    result.extend(hex_chars);
+                } else {
+                    result.push(c);
                 }
-                result.push('%');
-                result.push_str(&hex);
-            } else if c == '+' {
-                result.push(' ');
             } else {
                 result.push(c);
             }
         }
-
+        
         result
     }
 }
@@ -411,5 +621,60 @@ mod tests {
         let engine = RuleEngine::new();
         assert_eq!(engine.url_decode("%3Cscript%3E"), "<script>");
         assert_eq!(engine.url_decode("hello+world"), "hello world");
+    }
+
+    #[test]
+    fn test_url_decode_double_encoding() {
+        let engine = RuleEngine::new();
+        // Double encoding: %2520 -> %20 -> space
+        assert_eq!(engine.url_decode("hello%2520world"), "hello world");
+        // Triple encoding: %252520 -> %2520 -> %20 -> space
+        assert_eq!(engine.url_decode("hello%252520world"), "hello world");
+    }
+
+    #[test]
+    fn test_url_decode_unicode_escape() {
+        let engine = RuleEngine::new();
+        // Unicode escape: %u003C -> <
+        assert_eq!(engine.url_decode("%u003Cscript%u003E"), "<script>");
+    }
+
+    #[test]
+    fn test_ip_whitelist() {
+        let config = WafConfig {
+            whitelist_ips: vec!["192.168.1.1".to_string(), "10.0.0.0/24".to_string()],
+            ..Default::default()
+        };
+        
+        assert!(config.is_ip_whitelisted("192.168.1.1"));
+        assert!(config.is_ip_whitelisted("192.168.1.1:8080")); // with port
+        assert!(config.is_ip_whitelisted("10.0.0.100")); // CIDR match
+        assert!(!config.is_ip_whitelisted("192.168.1.2"));
+        assert!(!config.is_ip_whitelisted("10.0.1.100"));
+    }
+
+    #[test]
+    fn test_custom_rule_targets() {
+        let config = WafConfig {
+            custom_rules: vec![CustomRule {
+                id: "custom-001".to_string(),
+                pattern: r"(?i)admin".to_string(),
+                targets: vec!["query".to_string()],
+                action: WafAction::Block,
+                message: "Admin keyword".to_string(),
+            }],
+            ..Default::default()
+        };
+        let engine = RuleEngine::with_config(&config);
+        
+        // Should match in query
+        let mut targets = HashMap::new();
+        targets.insert("query".to_string(), "user=admin".to_string());
+        assert!(engine.inspect(&targets).is_some());
+        
+        // Should not match in uri (target not specified)
+        let mut targets = HashMap::new();
+        targets.insert("uri".to_string(), "/admin".to_string());
+        assert!(engine.inspect(&targets).is_none());
     }
 }

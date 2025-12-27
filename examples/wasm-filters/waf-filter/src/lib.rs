@@ -97,7 +97,21 @@ impl HttpContext for WafFilter {
             return Action::Continue;
         }
 
-        // Check whitelist
+        // Check IP whitelist (優先度: パスホワイトリストより先)
+        let client_ip = self.get_http_request_header("x-forwarded-for")
+            .or_else(|| self.get_http_request_header("x-real-ip"))
+            .or_else(|| self.get_http_request_header("x-client-ip"));
+        
+        if let Some(ip) = client_ip {
+            // X-Forwarded-Forは複数IPを含む可能性がある（最初のIPを使用）
+            let first_ip = ip.split(',').next().unwrap_or(&ip).trim();
+            if self.config.is_ip_whitelisted(first_ip) {
+                log::debug!("[waf:{}] IP whitelisted: {}", self.context_id, first_ip);
+                return Action::Continue;
+            }
+        }
+
+        // Check path whitelist
         if let Some(path) = self.get_http_request_header(":path") {
             if self.config.is_path_whitelisted(&path) {
                 log::debug!("[waf:{}] Path whitelisted: {}", self.context_id, path);
