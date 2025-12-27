@@ -3962,6 +3962,7 @@ enum Backend {
         Arc<buffering::BufferingConfig>,
         Arc<cache::CacheConfig>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        #[allow(dead_code)]
         Option<Arc<Vec<String>>>,
     ),
     /// MemoryFile バックエンド
@@ -3973,6 +3974,7 @@ enum Backend {
         Arc<str>, 
         Arc<SecurityConfig>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        #[allow(dead_code)]
         Option<Arc<Vec<String>>>,
     ),
     /// SendFile バックエンド
@@ -3988,6 +3990,7 @@ enum Backend {
         Arc<SecurityConfig>, 
         Arc<cache::CacheConfig>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        #[allow(dead_code)]
         Option<Arc<Vec<String>>>,
     ),
     /// Redirect バックエンド
@@ -3999,6 +4002,7 @@ enum Backend {
         u16, 
         bool,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
+        #[allow(dead_code)]
         Option<Arc<Vec<String>>>,
     ),
 }
@@ -4020,6 +4024,7 @@ impl Backend {
     
     /// このバックエンドに適用するWASMモジュール名のリストを取得
     #[inline]
+    #[allow(dead_code)]
     pub fn modules(&self) -> Option<&[String]> {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
@@ -4762,6 +4767,7 @@ fn validate_backend_config(
 
 // BackendConfigにmodules()メソッドを追加
 impl BackendConfig {
+    #[allow(dead_code)]
     pub fn modules(&self) -> Option<&Vec<String>> {
         match self {
             BackendConfig::Proxy { modules, .. } => modules.as_ref(),
