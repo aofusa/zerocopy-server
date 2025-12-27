@@ -91,7 +91,11 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-// ktls_rustls モジュール（kTLS 対応）
+// ktls モジュール（自前 kTLS 実装）
+#[cfg(feature = "ktls")]
+mod ktls;
+
+// ktls_rustls モジュール（kTLS 対応 TLS ストリーム）
 #[cfg(feature = "ktls")]
 mod ktls_rustls;
 

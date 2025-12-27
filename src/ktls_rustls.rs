@@ -1,7 +1,7 @@
 //! # rustls + monoio + kTLS 統合モジュール
 //!
 //! このモジュールは、rustls を monoio ランタイムと統合し、
-//! ktls2 クレートによる kTLS（Kernel TLS）のサポートを提供します。
+//! 自前実装の kTLS（Kernel TLS）サポートを提供します。
 //!
 //! ## 主要コンポーネント
 //!
@@ -12,8 +12,8 @@
 //!
 //! ## kTLS サポート
 //!
-//! TLS ハンドシェイク完了後、ktls2 を使用して kTLS を有効化することで、
-//! データ転送フェーズの暗号化/復号化をカーネルにオフロードします。
+//! TLS ハンドシェイク完了後、自前実装の ktls モジュールを使用して kTLS を有効化し、
+//! データ転送フェーズの暗号化/復号化をカーネルにオフロードします。。
 //!
 //! ### メリット
 //!
@@ -467,88 +467,49 @@ fn try_enable_ktls_client(
 }
 
 /// ULP設定後のkTLS設定（シークレット抽出とTX/RX設定）
+/// 
+/// 自前実装の ktls モジュールを使用して以下を行います：
+/// 1. rustls からシークレットを抽出
+/// 2. TX/RX 用の CryptoInfo を構築
+/// 3. setsockopt でカーネルに設定
+/// 4. 鍵情報をセキュアにゼロ化
 #[cfg(feature = "ktls")]
 fn setup_ktls_after_ulp(
     fd: RawFd,
     conn: rustls::Connection,
-    cipher_suite: rustls::SupportedCipherSuite,
+    _cipher_suite: rustls::SupportedCipherSuite,
 ) -> io::Result<()> {
-    use ktls2::CryptoInfo;
+    use crate::ktls::{extract_tx_rx, setup_tls_info, TLS_TX, TLS_RX};
+    
+    // プロトコルバージョンを取得
+    let protocol_version = conn.protocol_version();
     
     // シークレットを抽出
     let secrets = conn.dangerous_extract_secrets()
         .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to extract secrets: {:?}", e)))?;
     
+    // TX/RX バッチ抽出（共有処理で効率化）
+    let (mut tx, mut rx) = extract_tx_rx(secrets, protocol_version)
+        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("Failed to build crypto info: {}", e)))?;
+    
     // TX 設定
-    let tx = CryptoInfo::from_rustls(cipher_suite, secrets.tx)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("TX crypto info: {:?}", e)))?;
-    setup_tls_info(fd, Direction::Tx, &tx)?;
+    setup_tls_info(fd, TLS_TX, &tx)?;
+    tx.secure_clear();  // 鍵をセキュアにゼロ化
     
     // RX 設定
-    let rx = CryptoInfo::from_rustls(cipher_suite, secrets.rx)
-        .map_err(|e| io::Error::new(io::ErrorKind::Other, format!("RX crypto info: {:?}", e)))?;
-    setup_tls_info(fd, Direction::Rx, &rx)?;
+    setup_tls_info(fd, TLS_RX, &rx)?;
+    rx.secure_clear();  // 鍵をセキュアにゼロ化
     
     Ok(())
 }
 
 /// setsockopt で TLS ULP を設定
+/// 
+/// 注意: この関数は crate::ktls::setup_ulp() を呼び出すラッパーです。
+/// 将来的に完全に ktls モジュールに移行する可能性があります。
 #[cfg(feature = "ktls")]
 fn setup_ulp(fd: RawFd) -> io::Result<()> {
-    const SOL_TCP: libc::c_int = 6;
-    const TCP_ULP: libc::c_int = 31;
-    
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            SOL_TCP,
-            TCP_ULP,
-            "tls".as_ptr() as *const libc::c_void,
-            3,
-        )
-    };
-    
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
-}
-
-#[cfg(feature = "ktls")]
-#[derive(Clone, Copy)]
-enum Direction {
-    Tx,
-    Rx,
-}
-
-/// setsockopt で TLS 暗号化情報を設定
-#[cfg(feature = "ktls")]
-fn setup_tls_info(fd: RawFd, dir: Direction, info: &ktls2::CryptoInfo) -> io::Result<()> {
-    const SOL_TLS: libc::c_int = 282;
-    const TLS_TX: libc::c_int = 1;
-    const TLS_RX: libc::c_int = 2;
-    
-    let direction = match dir {
-        Direction::Tx => TLS_TX,
-        Direction::Rx => TLS_RX,
-    };
-    
-    let result = unsafe {
-        libc::setsockopt(
-            fd,
-            SOL_TLS,
-            direction,
-            info.as_ptr(),
-            info.size() as libc::socklen_t,
-        )
-    };
-    
-    if result < 0 {
-        Err(io::Error::last_os_error())
-    } else {
-        Ok(())
-    }
+    crate::ktls::setup_ulp(fd)
 }
 
 // ====================
