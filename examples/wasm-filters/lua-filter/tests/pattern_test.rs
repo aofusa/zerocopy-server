@@ -52,6 +52,16 @@ fn test_match_all() {
 }
 
 #[test]
+fn test_match_all_words() {
+    let result = pattern::match_all("hello world", "%w+");
+    assert!(result.is_ok());
+    let matches = result.unwrap();
+    assert_eq!(matches.len(), 2);
+    assert_eq!(matches[0].matched, "hello");
+    assert_eq!(matches[1].matched, "world");
+}
+
+#[test]
 fn test_frontier_pattern() {
     let result = pattern::match_pattern("hello world", "%f[%w]hello");
     assert!(result.is_ok());
@@ -68,4 +78,3 @@ fn test_frontier_pattern_not_matched() {
     // Should not match because 'w' is not a word character boundary
     assert!(m.is_none() || m.unwrap().matched != "world");
 }
-

@@ -462,7 +462,15 @@ impl Interpreter {
                     }
 
                     // Call iterator function
-                    let results = self.call_function(&iter_func, &[iter_state.clone(), iter_var.clone()])?;
+                    // For single iterator function (like string.gmatch), call with no arguments
+                    // For multiple expressions, use (func, state, var) convention
+                    let results = if iterator_vals.len() == 1 {
+                        // Single iterator function - call with no arguments
+                        self.call_function(&iter_func, &[])?
+                    } else {
+                        // Multiple expressions - use (func, state, var) convention
+                        self.call_function(&iter_func, &[iter_state.clone(), iter_var.clone()])?
+                    };
                     
                     // First result is the new control variable
                     let first = results.first().cloned().unwrap_or(LuaValue::Nil);
@@ -678,6 +686,40 @@ impl Interpreter {
                     .iter()
                     .map(|a| self.evaluate(a))
                     .collect::<Result<_, _>>()?;
+
+                // Special handling for table.insert - it modifies the table in place
+                if let LuaValue::NativeFunction(ref name) = func_val {
+                    if name == "table.insert" && !args.is_empty() {
+                        // Check if first argument is a variable
+                        if let Some(Expr::Variable(var_name)) = args.first() {
+                            if let LuaValue::Table(ref t) = arg_vals[0] {
+                                // Modify the table in place
+                                let mut table = t.clone();
+                                let len = table.len();
+                                
+                                if args.len() == 2 {
+                                    // Insert at end: table.insert(t, value)
+                                    table.set((len + 1).to_string(), arg_vals[1].clone());
+                                } else if args.len() >= 3 {
+                                    // Insert at position: table.insert(t, pos, value)
+                                    let pos = arg_vals[1].to_number().map(|n| n as usize).unwrap_or(len + 1);
+                                    // Shift elements
+                                    for i in (pos..=len).rev() {
+                                        if let Some(v) = table.get(&i.to_string()).cloned() {
+                                            table.set((i + 1).to_string(), v);
+                                        }
+                                    }
+                                    table.set(pos.to_string(), arg_vals[2].clone());
+                                }
+                                
+                                // Update the original table variable
+                                self.set_variable(var_name.clone(), LuaValue::Table(table));
+                                // Return nil as per Lua semantics
+                                return Ok(LuaValue::Nil);
+                            }
+                        }
+                    }
+                }
 
                 let results = self.call_function(&func_val, &arg_vals)?;
                 // For expression evaluation, return first value
@@ -958,6 +1000,84 @@ impl Interpreter {
                 }
             }
             
+            // Check for tail call in if statement
+            if let Stmt::If { condition, then_block, elseif_blocks, else_block, .. } = stmt {
+                // Check if this is the last statement and if any branch ends with a tail call
+                if i == closure.body.len() - 1 {
+                    let cond = self.evaluate(condition)?;
+                    
+                    if cond.is_truthy() {
+                        // Check then block for tail call
+                        if let Some(Stmt::Return(return_values)) = then_block.last() {
+                            if return_values.len() == 1 {
+                                if let Expr::Call { func, args: call_args } = &return_values[0] {
+                                    let func_val = self.evaluate(func)?;
+                                    let arg_vals: Vec<LuaValue> = call_args
+                                        .iter()
+                                        .map(|a| self.evaluate(a))
+                                        .collect::<Result<_, _>>()?;
+                                    
+                                    self.return_values = prev_return;
+                                    self.varargs.clear();
+                                    self.pop_scope();
+                                    
+                                    return self.call_function(&func_val, &arg_vals);
+                                }
+                            }
+                        }
+                    } else {
+                        // Check elseif and else blocks for tail call
+                        let mut found_tail_call = false;
+                        for (elseif_cond, elseif_body) in elseif_blocks {
+                            let c = self.evaluate(elseif_cond)?;
+                            if c.is_truthy() {
+                                if let Some(Stmt::Return(return_values)) = elseif_body.last() {
+                                    if return_values.len() == 1 {
+                                        if let Expr::Call { func, args: call_args } = &return_values[0] {
+                                            let func_val = self.evaluate(func)?;
+                                            let arg_vals: Vec<LuaValue> = call_args
+                                                .iter()
+                                                .map(|a| self.evaluate(a))
+                                                .collect::<Result<_, _>>()?;
+                                            
+                                            self.return_values = prev_return;
+                                            self.varargs.clear();
+                                            self.pop_scope();
+                                            
+                                            return self.call_function(&func_val, &arg_vals);
+                                        }
+                                    }
+                                }
+                                found_tail_call = true;
+                                break;
+                            }
+                        }
+                        
+                        if !found_tail_call {
+                            if let Some(else_body) = else_block {
+                                if let Some(Stmt::Return(return_values)) = else_body.last() {
+                                    if return_values.len() == 1 {
+                                        if let Expr::Call { func, args: call_args } = &return_values[0] {
+                                            let func_val = self.evaluate(func)?;
+                                            let arg_vals: Vec<LuaValue> = call_args
+                                                .iter()
+                                                .map(|a| self.evaluate(a))
+                                                .collect::<Result<_, _>>()?;
+                                            
+                                            self.return_values = prev_return;
+                                            self.varargs.clear();
+                                            self.pop_scope();
+                                            
+                                            return self.call_function(&func_val, &arg_vals);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            
             // Normal statement execution
             self.execute_statement(stmt)?;
             if self.return_values.is_some() {
@@ -1031,26 +1151,26 @@ impl Interpreter {
     
     fn call_gmatch_iter(&mut self, closure: &Rc<Closure>) -> Result<Vec<LuaValue>, String> {
         // Get the matches table and index from upvalues
-        let matches = closure.upvalues.get("_gmatch_matches")
+        let matches_table = closure.upvalues.get("_gmatch_matches")
             .and_then(|uv| {
-                if let LuaValue::Table(ref t) = *uv.value.borrow() {
-                    Some(t.clone())
-                } else {
-                    None
+                let borrowed = uv.value.borrow();
+                match *borrowed {
+                    LuaValue::Table(ref t) => Some(t.clone()),
+                    _ => None,
                 }
             });
         
         let index = closure.upvalues.get("_gmatch_index")
             .and_then(|uv| {
-                if let LuaValue::Number(n) = *uv.value.borrow() {
-                    Some(n as usize)
-                } else {
-                    None
+                let borrowed = uv.value.borrow();
+                match *borrowed {
+                    LuaValue::Number(n) => Some(n as usize),
+                    _ => None,
                 }
             })
             .unwrap_or(0);
         
-        if let Some(matches_table) = matches {
+        if let Some(matches_table) = matches_table {
             // Use table.len() to get the number of matches
             let len = matches_table.len();
             
@@ -1073,8 +1193,8 @@ impl Interpreter {
                 Ok(vec![LuaValue::Nil])
             }
         } else {
-            // No matches - return nil to signal end
-            Ok(vec![LuaValue::Nil])
+            // No matches table found - this should not happen
+            Err("gmatch iterator: matches table not found in upvalues".to_string())
         }
     }
 
@@ -1557,7 +1677,13 @@ impl Interpreter {
                 
                 // Use pattern::match_all to get all matches
                 use crate::lua::pattern::match_all;
-                let matches = match_all(&s, &pat).unwrap_or_else(|_| vec![]);
+                let matches = match match_all(&s, &pat) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        // Return error instead of empty vector
+                        return Err(format!("pattern error in gmatch: {}", e));
+                    }
+                };
                 
                 // Create a closure that captures the matches and current index
                 let mut upvalues = HashMap::new();
@@ -1570,6 +1696,23 @@ impl Interpreter {
                         }
                     })
                     .collect();
+                
+                // Ensure we have matches - if empty, return empty iterator
+                if match_strings.is_empty() {
+                    let mut empty_upvalues = HashMap::new();
+                    let empty_table = LuaValue::table(HashMap::new());
+                    empty_upvalues.insert("_gmatch_matches".to_string(), Upvalue::new(empty_table));
+                    empty_upvalues.insert("_gmatch_index".to_string(), Upvalue::new(LuaValue::Number(0.0)));
+                    let empty_closure = Rc::new(Closure::new(
+                        Some("string.gmatch_iter".to_string()),
+                        vec![],
+                        false,
+                        vec![],
+                        empty_upvalues,
+                    ));
+                    return Ok(LuaValue::Closure(empty_closure));
+                }
+                
                 let mut match_table_data = HashMap::new();
                 for (i, s) in match_strings.iter().enumerate() {
                     match_table_data.insert((i + 1).to_string(), LuaValue::String(s.clone()));
@@ -1804,7 +1947,8 @@ impl Interpreter {
                         t.set(pos.to_string(), args[2].clone());
                     }
                     
-                    // Update the original table variable if possible
+                    // Return nil as per Lua semantics
+                    // The actual table modification is handled in Expr::Call evaluation
                     return Ok(LuaValue::Nil);
                 }
                 Ok(LuaValue::Nil)
