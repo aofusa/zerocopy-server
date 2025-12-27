@@ -239,6 +239,36 @@ impl Interpreter {
         self.modules.insert(name, module);
     }
 
+    /// Execute a Lua program and return its result.
+    ///
+    /// This is the main entry point for executing a parsed Lua program.
+    /// It initializes the execution state, collects all labels for goto support,
+    /// and executes all statements in the program.
+    ///
+    /// # Arguments
+    /// * `program` - The parsed Lua program (AST) to execute
+    ///
+    /// # Returns
+    /// * `Ok(LuaValue)` - The result of the program execution (first return value, or nil if none)
+    /// * `Err(String)` - Error message if execution fails
+    ///
+    /// # Examples
+    /// ```
+    /// use lua::parser::parse;
+    /// use lua::lexer::tokenize;
+    /// use lua::interpreter::Interpreter;
+    ///
+    /// let source = "return 42";
+    /// let tokens = tokenize(source)?;
+    /// let program = parse(&tokens)?;
+    /// let mut interpreter = Interpreter::new();
+    /// let result = interpreter.execute(&program)?;
+    /// assert_eq!(result, LuaValue::Number(42.0));
+    /// ```
+    ///
+    /// # Performance
+    /// - Time complexity: O(n) where n is the number of statements
+    /// - Space complexity: O(d) where d is the maximum nesting depth of scopes
     pub fn execute(&mut self, program: &Program) -> Result<LuaValue, String> {
         self.return_values = None;
         self.break_flag = false;
@@ -264,6 +294,37 @@ impl Interpreter {
             .unwrap_or(LuaValue::Nil))
     }
 
+    /// Execute a single Lua statement.
+    ///
+    /// This method handles all types of Lua statements including:
+    /// - Variable assignments (local and global)
+    /// - Control flow statements (if, while, repeat, for)
+    /// - Function definitions
+    /// - Return statements
+    /// - Break statements
+    /// - Goto and label statements
+    ///
+    /// # Arguments
+    /// * `stmt` - The statement to execute
+    ///
+    /// # Returns
+    /// * `Ok(())` - Statement executed successfully
+    /// * `Err(String)` - Error message if execution fails
+    ///
+    /// # Examples
+    /// ```
+    /// // Execute an assignment statement
+    /// let stmt = Stmt::Assign {
+    ///     targets: vec![AssignTarget::Name("x".to_string())],
+    ///     values: vec![Expr::LiteralNumber(42.0)],
+    ///     local: false,
+    /// };
+    /// interpreter.execute_statement(&stmt)?;
+    /// ```
+    ///
+    /// # Performance
+    /// - Time complexity: O(1) for simple statements, O(n) for loops where n is iterations
+    /// - Space complexity: O(1) for most statements, O(d) for nested scopes
     fn execute_statement(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
             Stmt::Assign { targets, values, local } => {
@@ -553,6 +614,22 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Execute a block of statements with a new scope.
+    ///
+    /// This method creates a new local scope, executes all statements in the block,
+    /// and then removes the scope when done. This is used for function bodies,
+    /// control flow blocks, and explicit do/end blocks.
+    ///
+    /// # Arguments
+    /// * `statements` - The statements to execute in the block
+    ///
+    /// # Returns
+    /// * `Ok(())` - Block executed successfully
+    /// * `Err(String)` - Error message if execution fails
+    ///
+    /// # Performance
+    /// - Time complexity: O(n) where n is the number of statements
+    /// - Space complexity: O(1) additional space for the new scope
     fn execute_block(&mut self, statements: &[Stmt]) -> Result<(), String> {
         self.execute_block_with_labels(statements, 0)
     }
@@ -616,6 +693,54 @@ impl Interpreter {
         Ok(())
     }
 
+    /// Evaluate a Lua expression and return its value.
+    ///
+    /// This method recursively evaluates Lua expressions, handling:
+    /// - Literal values (nil, boolean, number, string)
+    /// - Variable references (local and global)
+    /// - Binary and unary operations
+    /// - Function calls
+    /// - Table construction
+    /// - Anonymous function creation
+    ///
+    /// For binary operations with `and` and `or`, this method implements
+    /// short-circuit evaluation: the right operand is only evaluated if necessary.
+    ///
+    /// # Arguments
+    /// * `expr` - The expression to evaluate
+    ///
+    /// # Returns
+    /// * `Ok(LuaValue)` - The evaluated value
+    /// * `Err(String)` - Error message if evaluation fails
+    ///
+    /// # Examples
+    /// ```
+    /// // Evaluate a simple literal
+    /// let result = interpreter.evaluate(&Expr::LiteralNumber(42.0))?;
+    /// assert_eq!(result, LuaValue::Number(42.0));
+    ///
+    /// // Evaluate a binary operation
+    /// let expr = Expr::BinaryOp {
+    ///     left: Box::new(Expr::LiteralNumber(10.0)),
+    ///     op: BinaryOperator::Add,
+    ///     right: Box::new(Expr::LiteralNumber(20.0)),
+    /// };
+    /// let result = interpreter.evaluate(&expr)?;
+    /// assert_eq!(result, LuaValue::Number(30.0));
+    ///
+    /// // Short-circuit evaluation for 'and'
+    /// let expr = Expr::BinaryOp {
+    ///     left: Box::new(Expr::LiteralBool(false)),
+    ///     op: BinaryOperator::And,
+    ///     right: Box::new(Expr::Call { /* ... */ }), // Not evaluated
+    /// };
+    /// let result = interpreter.evaluate(&expr)?;
+    /// assert_eq!(result, LuaValue::Boolean(false));
+    /// ```
+    ///
+    /// # Performance
+    /// - Time complexity: O(n) where n is the depth of the expression tree
+    /// - Space complexity: O(n) for recursive calls on the call stack
     fn evaluate(&mut self, expr: &Expr) -> Result<LuaValue, String> {
         match expr {
             Expr::LiteralNil => Ok(LuaValue::Nil),
@@ -941,6 +1066,54 @@ impl Interpreter {
         table.set(key, value);
     }
 
+    /// Call a Lua closure (function) with the given arguments.
+    ///
+    /// This method executes a closure by:
+    /// 1. Creating a new scope for the function
+    /// 2. Restoring captured upvalues from the closure
+    /// 3. Binding function parameters to arguments
+    /// 4. Setting up varargs if the function accepts them
+    /// 5. Executing the function body
+    ///
+    /// **Tail Call Optimization (TCO)**: This method implements tail call optimization
+    /// to prevent stack overflow in recursive functions. When the last statement in
+    /// a function is a return with a single function call, the current scope is
+    /// reused instead of creating a new one, effectively converting recursion into
+    /// iteration. This optimization also handles tail calls in if statements.
+    ///
+    /// # Arguments
+    /// * `closure` - The closure to call
+    /// * `args` - Arguments to pass to the function
+    ///
+    /// # Returns
+    /// * `Ok(Vec<LuaValue>)` - Multiple return values (Lua supports multiple returns)
+    /// * `Err(String)` - Error message if execution fails
+    ///
+    /// # Examples
+    /// ```
+    /// // Create a simple closure
+    /// let closure = Rc::new(Closure::new(
+    ///     Some("add".to_string()),
+    ///     vec!["a".to_string(), "b".to_string()],
+    ///     false,
+    ///     vec![Stmt::Return(vec![Expr::BinaryOp {
+    ///         left: Box::new(Expr::Variable("a".to_string())),
+    ///         op: BinaryOperator::Add,
+    ///         right: Box::new(Expr::Variable("b".to_string())),
+    ///     }])],
+    ///     HashMap::new(),
+    /// ));
+    ///
+    /// // Call the closure
+    /// let args = vec![LuaValue::Number(10.0), LuaValue::Number(20.0)];
+    /// let results = interpreter.call_closure(&closure, &args)?;
+    /// assert_eq!(results[0], LuaValue::Number(30.0));
+    /// ```
+    ///
+    /// # Performance
+    /// - Time complexity: O(n) where n is the number of statements in the function body
+    /// - Space complexity: O(1) for tail calls (due to TCO), O(d) for non-tail calls where d is call depth
+    /// - Tail call optimization prevents stack overflow for recursive functions
     fn call_closure(&mut self, closure: &Rc<Closure>, args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
         // Special handling for iterator functions
         if let Some(name) = &closure.name {
@@ -1971,6 +2144,52 @@ impl Interpreter {
         }
     }
 
+    /// Call a string library method.
+    ///
+    /// This method handles all `string.*` library functions including:
+    /// - `string.len(s)`: Get string length
+    /// - `string.sub(s, start, end)`: Extract substring
+    /// - `string.upper(s)`, `string.lower(s)`: Case conversion
+    /// - `string.find(s, pattern)`: Pattern matching search
+    /// - `string.match(s, pattern)`: Pattern matching with capture
+    /// - `string.gmatch(s, pattern)`: Global pattern matching iterator
+    /// - `string.gsub(s, pattern, repl, n)`: Global substitution
+    /// - `string.format(...)`: String formatting
+    /// - `string.rep(s, n)`: String repetition
+    /// - `string.reverse(s)`: String reversal
+    /// - `string.byte(s, pos)`: Get character code
+    /// - `string.char(...)`: Convert codes to string
+    /// - `string.split(s, sep)`: Split string (Lua extension)
+    /// - `string.pack(format, ...)`: Binary packing
+    /// - `string.unpack(format, data, pos)`: Binary unpacking
+    /// - `string.dump(func)`: Function dump (simplified)
+    ///
+    /// # Arguments
+    /// * `method` - The method name (e.g., "len", "sub", "format")
+    /// * `args` - Arguments for the method
+    ///
+    /// # Returns
+    /// * `Ok(LuaValue)` - The result of the method call
+    /// * `Err(String)` - Error message if the method is unknown or arguments are invalid
+    ///
+    /// # Examples
+    /// ```
+    /// // Get string length
+    /// let result = interpreter.call_string_method("len", &[LuaValue::String("hello".to_string())])?;
+    /// assert_eq!(result, LuaValue::Number(5.0));
+    ///
+    /// // Extract substring
+    /// let result = interpreter.call_string_method("sub", &[
+    ///     LuaValue::String("hello".to_string()),
+    ///     LuaValue::Number(1.0),
+    ///     LuaValue::Number(3.0),
+    /// ])?;
+    /// assert_eq!(result, LuaValue::String("hel".to_string()));
+    /// ```
+    ///
+    /// # Performance
+    /// - Time complexity: Varies by method (O(1) for len, O(n) for pattern matching where n is string length)
+    /// - Space complexity: O(n) for methods that create new strings
     fn call_string_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
         match method {
             "len" => {
@@ -2197,6 +2416,48 @@ impl Interpreter {
         }
     }
 
+    /// Call a math library method.
+    ///
+    /// This method handles all `math.*` library functions including:
+    /// - Basic operations: `abs`, `ceil`, `floor`, `max`, `min`
+    /// - Trigonometric: `sin`, `cos`, `tan`, `asin`, `acos`, `atan`
+    /// - Exponential: `sqrt`, `log`, `exp`, `pow`
+    /// - Random: `random`, `randomseed` (using Linear Congruential Generator)
+    /// - Conversion: `deg`, `rad`, `modf`, `fmod`, `ult`, `tointeger`
+    ///
+    /// The random number generator uses a Linear Congruential Generator (LCG)
+    /// with parameters: a=1664525, c=1013904223, m=2^32.
+    ///
+    /// # Arguments
+    /// * `method` - The method name (e.g., "sin", "random", "max")
+    /// * `args` - Arguments for the method
+    ///
+    /// # Returns
+    /// * `Ok(LuaValue)` - The result of the method call
+    /// * `Err(String)` - Error message if the method is unknown or arguments are invalid
+    ///
+    /// # Examples
+    /// ```
+    /// // Calculate sine
+    /// let result = interpreter.call_math_method("sin", &[LuaValue::Number(0.0)])?;
+    /// assert_eq!(result, LuaValue::Number(0.0));
+    ///
+    /// // Get maximum value
+    /// let result = interpreter.call_math_method("max", &[
+    ///     LuaValue::Number(10.0),
+    ///     LuaValue::Number(20.0),
+    ///     LuaValue::Number(15.0),
+    /// ])?;
+    /// assert_eq!(result, LuaValue::Number(20.0));
+    ///
+    /// // Generate random number
+    /// let result = interpreter.call_math_method("random", &[])?;
+    /// // Returns a number between 0 and 1
+    /// ```
+    ///
+    /// # Performance
+    /// - Time complexity: O(1) for most operations, O(n) for max/min where n is number of arguments
+    /// - Space complexity: O(1)
     fn call_math_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
         let get_num = |idx: usize| args.get(idx).and_then(|v| v.to_number());
         
@@ -2297,6 +2558,51 @@ impl Interpreter {
         }
     }
 
+    /// Call a table library method.
+    ///
+    /// This method handles all `table.*` library functions including:
+    /// - `table.insert(t, value)`: Insert at end
+    /// - `table.insert(t, pos, value)`: Insert at position
+    /// - `table.remove(t)`: Remove last element
+    /// - `table.remove(t, pos)`: Remove element at position
+    /// - `table.concat(t, sep, i, j)`: Concatenate array elements
+    /// - `table.sort(t)`: Sort array portion in place
+    /// - `table.pack(...)`: Pack values into table
+    /// - `table.unpack(t, i, j)`: Unpack table values
+    /// - `table.move(a1, f, e, t, a2)`: Move elements between tables
+    ///
+    /// Note: `table.insert` and `table.remove` modify the table in place.
+    /// The actual table modification is handled during expression evaluation
+    /// to ensure proper variable updates.
+    ///
+    /// # Arguments
+    /// * `method` - The method name (e.g., "insert", "remove", "concat")
+    /// * `args` - Arguments for the method
+    ///
+    /// # Returns
+    /// * `Ok(LuaValue)` - The result of the method call (nil for insert, removed value for remove, etc.)
+    /// * `Err(String)` - Error message if the method is unknown or arguments are invalid
+    ///
+    /// # Examples
+    /// ```
+    /// // Insert value at end
+    /// let mut table = LuaTable::new();
+    /// table.set("1".to_string(), LuaValue::Number(10.0));
+    /// let result = interpreter.call_table_method("insert", &[
+    ///     LuaValue::Table(table.clone()),
+    ///     LuaValue::Number(20.0),
+    /// ])?;
+    ///
+    /// // Remove element
+    /// let removed = interpreter.call_table_method("remove", &[
+    ///     LuaValue::Table(table),
+    ///     LuaValue::Number(1.0),
+    /// ])?;
+    /// ```
+    ///
+    /// # Performance
+    /// - Time complexity: O(1) for insert/remove at end, O(n) for insert/remove at position or sort where n is table length
+    /// - Space complexity: O(1) for most operations, O(n) for sort
     fn call_table_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
         match method {
             "insert" => {
