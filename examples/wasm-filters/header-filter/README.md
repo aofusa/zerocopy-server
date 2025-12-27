@@ -4,7 +4,8 @@ Proxy-WASM用のシンプルなヘッダ操作フィルタ
 
 ## 概要
 
-リクエスト/レスポンスヘッダを追加・変更・削除するための基本的なフィルタ。
+リクエスト/レスポンスヘッダを追加する基本的なフィルタ。
+設定不要で動作し、固定のヘッダを自動的に追加します。
 WASM フィルタの実装例としても参照できます。
 
 ## ビルド
@@ -15,89 +16,60 @@ cargo build --target wasm32-wasip1 --release
 
 出力: `target/wasm32-wasip1/release/header_filter.wasm` (約144 KB)
 
-## 設定例
+## 機能
 
-```json
-{
-  "request_headers": {
-    "add": {
-      "X-Forwarded-By": "veil-proxy",
-      "X-Request-ID": "{{uuid}}"
-    },
-    "remove": ["X-Debug"]
-  },
-  "response_headers": {
-    "add": {
-      "X-Powered-By": "veil-proxy",
-      "X-Response-Time": "{{elapsed_ms}}"
-    },
-    "remove": ["Server"]
-  }
-}
-```
+このフィルタは設定を受け取らず、以下の固定ヘッダを自動的に追加します。
 
-## 設定オプション
+### リクエストヘッダ
 
-### request_headers
+| ヘッダ名 | 値 | 説明 |
+|---------|-----|------|
+| `X-Veil-Proxy-Filter` | `header-filter-v1` | フィルタ識別子 |
+| `X-Veil-Request-Id` | `req-{context_id}` | リクエストID（コンテキストIDを含む） |
 
-リクエストヘッダの操作設定
+### レスポンスヘッダ
 
-| フィールド | 型 | 説明 |
-|-----------|------|------|
-| `add` | object | 追加/上書きするヘッダ |
-| `remove` | array | 削除するヘッダ名 |
+| ヘッダ名 | 値 | 説明 |
+|---------|-----|------|
+| `X-Veil-Processed` | `true` | フィルタ処理済みフラグ |
+| `X-Veil-Filter-Version` | `1.0.0` | フィルタバージョン |
+| `X-Veil-Context-Id` | `{context_id}` | コンテキストID |
 
-### response_headers
+## 設定
 
-レスポンスヘッダの操作設定
-
-| フィールド | 型 | 説明 |
-|-----------|------|------|
-| `add` | object | 追加/上書きするヘッダ |
-| `remove` | array | 削除するヘッダ名 |
+このフィルタは設定を必要としません。WASMファイルを読み込むだけで動作します。
 
 ## 使用例
 
-### セキュリティヘッダの追加
+### veil-proxy設定（config.toml）
 
-```json
-{
-  "response_headers": {
-    "add": {
-      "Strict-Transport-Security": "max-age=31536000; includeSubDomains",
-      "X-Content-Type-Options": "nosniff",
-      "X-Frame-Options": "DENY",
-      "X-XSS-Protection": "1; mode=block"
-    }
-  }
-}
+```toml
+[[routes]]
+path = "/api/*"
+upstream = "backend"
+
+[[routes.wasm_filters]]
+path = "/path/to/header_filter.wasm"
+# configは不要
 ```
 
-### プロキシ情報の追加
+## 動作フロー
 
-```json
-{
-  "request_headers": {
-    "add": {
-      "X-Forwarded-For": "{{client_ip}}",
-      "X-Real-IP": "{{client_ip}}"
-    }
-  }
-}
-```
+1. **リクエスト受信時**
+   - `X-Veil-Proxy-Filter`と`X-Veil-Request-Id`ヘッダを追加
+   - ログにコンテキストIDを出力
 
-### 機密ヘッダの削除
-
-```json
-{
-  "response_headers": {
-    "remove": ["Server", "X-Powered-By", "X-AspNet-Version"]
-  }
-}
-```
+2. **レスポンス受信時**
+   - `X-Veil-Processed`、`X-Veil-Filter-Version`、`X-Veil-Context-Id`ヘッダを追加
+   - ログにコンテキストIDを出力
 
 ## 実装ファイル
 
 | ファイル | 説明 |
 |---------|------|
 | `src/lib.rs` | Proxy-WASM統合・ヘッダ操作ロジック |
+
+## 注意事項
+
+- このフィルタは設定を受け取りません。固定のヘッダを追加するだけのシンプルな実装です
+- カスタマイズが必要な場合は、ソースコードを直接編集してください
