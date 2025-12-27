@@ -16,10 +16,10 @@ pub struct MemcachedGetResponse {
 }
 
 /// Memcached SET request
-#[derive(Debug, Serialize)]
-pub struct MemcachedSetRequest<'a> {
-    pub key: &'a str,
-    pub value: &'a str,
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MemcachedSetRequest {
+    pub key: String,
+    pub value: String,
     pub ttl: u64,
 }
 
@@ -30,7 +30,11 @@ pub fn build_get_path(key: &str) -> String {
 
 /// Build Memcached SET request body
 pub fn build_set_body(key: &str, value: &str, ttl_secs: u64) -> Vec<u8> {
-    let request = MemcachedSetRequest { key, value, ttl: ttl_secs };
+    let request = MemcachedSetRequest { 
+        key: key.to_string(),
+        value: value.to_string(),
+        ttl: ttl_secs 
+    };
     serde_json::to_vec(&request).unwrap_or_default()
 }
 
