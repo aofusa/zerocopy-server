@@ -166,9 +166,11 @@ cargo build --target wasm32-wasip1 --release
 | `select` | ✅ | |
 | `setmetatable` | ✅ | メタメソッド完全対応 |
 | `getmetatable` | ✅ | メタテーブル取得対応 |
-| `rawget/rawset` | ⚠️ | 基本動作のみ |
-| `load/loadfile` | ❌ | |
-| `dofile/require` | ❌ | |
+| `rawget/rawset` | ✅ | メタテーブルをバイパスする完全実装 |
+| `load` | ✅ | 文字列からのコード読み込み対応 |
+| `loadfile` | ❌ | ファイルI/Oのため未実装 |
+| `require` | ✅ | モジュール読み込み対応 |
+| `dofile` | ❌ | ファイルI/Oのため未実装 |
 
 #### string.*
 | 関数 | サポート | 備考 |
@@ -186,7 +188,7 @@ cargo build --target wasm32-wasip1 --release
 | `string.reverse` | ✅ | |
 | `string.byte` | ✅ | |
 | `string.char` | ✅ | |
-| `string.dump` | ❌ | |
+| `string.dump` | ⚠️ | 簡易実装（関数名のみ返却） |
 | `string.pack/unpack` | ✅ | エンディアン指定対応 |
 
 #### math.*
@@ -205,7 +207,7 @@ cargo build --target wasm32-wasip1 --release
 | `math.pow` | ✅ |
 | `math.deg/rad` | ✅ |
 | `math.random` | ✅ |
-| `math.randomseed` | ⚠️ | 無視 |
+| `math.randomseed` | ✅ | シード値の設定が正しく動作 |
 | `math.modf/fmod` | ✅ |
 | `math.pi` | ✅ |
 | `math.huge` | ✅ |
