@@ -112,6 +112,7 @@ pub fn verify_rs256(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::jwks::Jwk;
     
     #[test]
     fn test_hs256_valid() {
@@ -135,6 +136,82 @@ mod tests {
         match verify_hs256(header_payload, signature, secret) {
             VerifyResult::InvalidFormat | VerifyResult::InvalidSignature => {}
             other => panic!("Expected InvalidFormat or InvalidSignature, got {:?}", other),
+        }
+    }
+    
+    #[test]
+    fn test_rs256_invalid_key_missing_n() {
+        let header_payload = "test";
+        let signature = "test";
+        let jwk = Jwk {
+            kty: "RSA".to_string(),
+            kid: None,
+            alg: None,
+            use_type: None,
+            n: None,  // Missing n
+            e: Some("AQAB".to_string()),
+        };
+        
+        match verify_rs256(header_payload, signature, &jwk) {
+            VerifyResult::InvalidKey => {}
+            other => panic!("Expected InvalidKey, got {:?}", other),
+        }
+    }
+    
+    #[test]
+    fn test_rs256_invalid_key_missing_e() {
+        let header_payload = "test";
+        let signature = "test";
+        let jwk = Jwk {
+            kty: "RSA".to_string(),
+            kid: None,
+            alg: None,
+            use_type: None,
+            n: Some("test".to_string()),
+            e: None,  // Missing e
+        };
+        
+        match verify_rs256(header_payload, signature, &jwk) {
+            VerifyResult::InvalidKey => {}
+            other => panic!("Expected InvalidKey, got {:?}", other),
+        }
+    }
+    
+    #[test]
+    fn test_rs256_invalid_format_signature() {
+        let header_payload = "test";
+        let signature = "invalid_base64!!!";  // Invalid base64url
+        let jwk = Jwk {
+            kty: "RSA".to_string(),
+            kid: None,
+            alg: None,
+            use_type: None,
+            n: Some("AQAB".to_string()),
+            e: Some("AQAB".to_string()),
+        };
+        
+        match verify_rs256(header_payload, signature, &jwk) {
+            VerifyResult::InvalidFormat | VerifyResult::InvalidKey => {}
+            other => panic!("Expected InvalidFormat or InvalidKey, got {:?}", other),
+        }
+    }
+    
+    #[test]
+    fn test_rs256_invalid_format_key() {
+        let header_payload = "test";
+        let signature = "dGVzdA";  // Valid base64url
+        let jwk = Jwk {
+            kty: "RSA".to_string(),
+            kid: None,
+            alg: None,
+            use_type: None,
+            n: Some("invalid_base64!!!".to_string()),  // Invalid base64url
+            e: Some("AQAB".to_string()),
+        };
+        
+        match verify_rs256(header_payload, signature, &jwk) {
+            VerifyResult::InvalidKey => {}
+            other => panic!("Expected InvalidKey, got {:?}", other),
         }
     }
 }

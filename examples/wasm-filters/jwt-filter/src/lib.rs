@@ -14,7 +14,7 @@ use std::collections::HashMap;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 mod crypto;
-mod jwks;
+pub mod jwks;
 
 use crypto::VerifyResult;
 use jwks::{Jwks, JwksCache};
@@ -68,12 +68,32 @@ pub struct JwtConfig {
     /// Upstream name for JWKS fetching
     #[serde(default = "default_jwks_upstream")]
     pub jwks_upstream: String,
+    
+    /// Error message level (detailed or simplified)
+    #[serde(default = "default_error_level")]
+    pub error_level: String,
+    
+    /// Clock skew tolerance in seconds (for iat validation)
+    #[serde(default = "default_clock_skew")]
+    pub clock_skew_tolerance_secs: u64,
+    
+    /// Validate nbf claim
+    #[serde(default = "default_true")]
+    pub validate_nbf: bool,
+    
+    /// Validate iat claim
+    #[serde(default = "default_false")]
+    pub validate_iat: bool,
 }
 
 fn default_jwks_ttl() -> u64 { 3600 }
 fn default_algorithms() -> Vec<String> { vec!["RS256".to_string(), "HS256".to_string()] }
 fn default_header_name() -> String { "Authorization".to_string() }
 fn default_jwks_upstream() -> String { "jwks".to_string() }
+fn default_error_level() -> String { "simplified".to_string() }
+fn default_clock_skew() -> u64 { 300 }  // 5分
+fn default_true() -> bool { true }
+fn default_false() -> bool { false }
 
 impl Default for JwtConfig {
     fn default() -> Self {
@@ -88,6 +108,10 @@ impl Default for JwtConfig {
             claims_to_headers: HashMap::new(),
             skip_paths: vec!["/health".to_string(), "/metrics".to_string()],
             jwks_upstream: "jwks".to_string(),
+            error_level: "simplified".to_string(),
+            clock_skew_tolerance_secs: 300,
+            validate_nbf: true,
+            validate_iat: false,
         }
     }
 }
@@ -116,6 +140,10 @@ struct JwtClaims {
     #[serde(default)]
     exp: Option<u64>,
     #[serde(default)]
+    nbf: Option<u64>,  // Not Before
+    #[serde(default)]
+    iat: Option<u64>,  // Issued At
+    #[serde(default)]
     sub: Option<String>,
     #[serde(default)]
     email: Option<String>,
@@ -125,14 +153,12 @@ struct JwtClaims {
 
 struct JwtFilterRoot {
     config: JwtConfig,
-    jwks_cache: JwksCache,
 }
 
 impl JwtFilterRoot {
     fn new() -> Self {
         Self {
             config: JwtConfig::default(),
-            jwks_cache: JwksCache::new(),
         }
     }
 }
@@ -195,11 +221,32 @@ impl Context for JwtFilter {
             if let Some(jwks) = Jwks::from_bytes(&body) {
                 log::info!("[jwt:{}] JWKS fetched with {} keys", self.context_id, jwks.keys.len());
                 
+                // キャッシュに保存
+                if let Some(ref jwks_url) = self.config.jwks_url {
+                    JwksCache::set_global(
+                        jwks_url.clone(),
+                        jwks.clone(),
+                        self.config.jwks_cache_ttl_secs
+                    );
+                }
+                
                 // Re-verify token with new JWKS
                 if let Some(ref token) = self.cached_token.take() {
-                    if self.verify_token_with_jwks(token, &jwks).is_ok() {
-                        self.resume_http_request();
-                        return;
+                    match self.verify_token_with_jwks(token, &jwks) {
+                        Ok(()) => {
+                            // 検証成功 - クレームをヘッダに追加
+                            let parts: Vec<&str> = token.split('.').collect();
+                            if parts.len() == 3 {
+                                if let Some(claims) = self.decode_claims(parts[1]) {
+                                    self.add_claims_headers(&claims);
+                                }
+                            }
+                            self.resume_http_request();
+                            return;
+                        }
+                        Err(e) => {
+                            log::warn!("[jwt:{}] Token verification failed: {}", self.context_id, e);
+                        }
                     }
                 }
             } else {
@@ -285,7 +332,27 @@ impl HttpContext for JwtFilter {
             }
             "RS256" => {
                 // Check if we need to fetch JWKS
-                if self.config.jwks_url.is_some() {
+                if let Some(ref jwks_url) = self.config.jwks_url {
+                    // キャッシュをチェック
+                    if let Some(jwks) = JwksCache::get_global(jwks_url) {
+                        log::debug!("[jwt:{}] JWKS found in cache", self.context_id);
+                        
+                        // キャッシュから取得したJWKSで検証
+                        match self.verify_token_with_jwks(&token, &jwks) {
+                            Ok(()) => {
+                                // 検証成功 - クレームをヘッダに追加
+                                if let Some(claims) = self.decode_claims(parts[1]) {
+                                    self.add_claims_headers(&claims);
+                                }
+                                return Action::Continue;
+                            }
+                            Err(_) => {
+                                // キャッシュのJWKSで検証失敗 - 新しいJWKSを取得
+                                log::debug!("[jwt:{}] Token verification failed with cached JWKS, fetching new", self.context_id);
+                            }
+                        }
+                    }
+                    
                     self.cached_token = Some(token.clone());
                     
                     // Try to fetch JWKS
@@ -341,15 +408,34 @@ impl JwtFilter {
     }
 
     fn validate_claims(&self, claims: &JwtClaims) -> Result<(), String> {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
         // Check expiration
         if let Some(exp) = claims.exp {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .unwrap_or_default()
-                .as_secs();
-            
             if now > exp {
                 return Err("Token expired".to_string());
+            }
+        }
+
+        // Check not before (nbf)
+        if self.config.validate_nbf {
+            if let Some(nbf) = claims.nbf {
+                if now < nbf {
+                    return Err("Token not yet valid".to_string());
+                }
+            }
+        }
+
+        // Check issued at (iat) - 未来の時刻は無効
+        if self.config.validate_iat {
+            if let Some(iat) = claims.iat {
+                // 時計のずれを考慮して、許容範囲を設ける
+                if iat > now + self.config.clock_skew_tolerance_secs {
+                    return Err("Token issued in the future".to_string());
+                }
             }
         }
 
@@ -480,14 +566,340 @@ impl JwtFilter {
     }
 
     fn send_unauthorized(&self, message: &str) {
+        // ログには詳細なメッセージを記録
         log::warn!("[jwt:{}] Unauthorized: {}", self.context_id, message);
+        
+        // レスポンスには設定に応じたメッセージを返す
+        let user_message = if self.config.error_level == "detailed" {
+            message.to_string()
+        } else {
+            self.simplify_error_message(message)
+        };
+        
         self.send_http_response(
             401,
             vec![
                 ("content-type", "application/json"),
                 ("www-authenticate", "Bearer"),
             ],
-            Some(format!(r#"{{"error":"unauthorized","message":"{}"}}"#, message).as_bytes()),
+            Some(format!(r#"{{"error":"unauthorized","message":"{}"}}"#, user_message).as_bytes()),
         );
+    }
+    
+    fn simplify_error_message(&self, message: &str) -> String {
+        // エラーメッセージを簡略化
+        if message.contains("expired") {
+            "Token expired".to_string()
+        } else if message.contains("Invalid signature") {
+            "Invalid token".to_string()
+        } else if message.contains("Invalid issuer") {
+            "Invalid token".to_string()
+        } else if message.contains("Invalid audience") {
+            "Invalid token".to_string()
+        } else if message.contains("Missing") {
+            "Authentication required".to_string()
+        } else if message.contains("not yet valid") {
+            "Token not yet valid".to_string()
+        } else if message.contains("future") {
+            "Invalid token".to_string()
+        } else {
+            "Invalid token".to_string()
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::{SystemTime, UNIX_EPOCH};
+    
+    fn create_test_config() -> JwtConfig {
+        JwtConfig {
+            issuer: Some("https://example.com".to_string()),
+            audience: Some("api.example.com".to_string()),
+            jwks_url: None,
+            jwks_cache_ttl_secs: 3600,
+            algorithms: vec!["HS256".to_string(), "RS256".to_string()],
+            static_keys: HashMap::new(),
+            header_name: "Authorization".to_string(),
+            claims_to_headers: HashMap::new(),
+            skip_paths: vec!["/health".to_string()],
+            jwks_upstream: "jwks".to_string(),
+            error_level: "simplified".to_string(),
+            clock_skew_tolerance_secs: 300,
+            validate_nbf: true,
+            validate_iat: false,
+        }
+    }
+    
+    fn create_test_filter() -> JwtFilter {
+        JwtFilter {
+            context_id: 1,
+            config: create_test_config(),
+            pending_jwks_fetch: false,
+            cached_token: None,
+        }
+    }
+    
+    #[test]
+    fn test_decode_header_valid() {
+        let filter = create_test_filter();
+        // Base64url encoded: {"alg":"HS256","typ":"JWT"}
+        let header_b64 = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9";
+        let header = filter.decode_header(header_b64);
+        assert!(header.is_some());
+        let header = header.unwrap();
+        assert_eq!(header.alg, "HS256");
+    }
+    
+    #[test]
+    fn test_decode_header_invalid() {
+        let filter = create_test_filter();
+        let header_b64 = "invalid_base64!!!";
+        let header = filter.decode_header(header_b64);
+        assert!(header.is_none());
+    }
+    
+    #[test]
+    fn test_decode_claims_valid() {
+        let filter = create_test_filter();
+        // Base64url encoded: {"sub":"1234567890","name":"John Doe","iat":1516239022}
+        let claims_b64 = "eyJzdWIiOiIxMjM0NTY3ODkwIiwibmFtZSI6IkpvaG4gRG9lIiwiaWF0IjoxNTE2MjM5MDIyfQ";
+        let claims = filter.decode_claims(claims_b64);
+        assert!(claims.is_some());
+        let claims = claims.unwrap();
+        assert_eq!(claims.sub, Some("1234567890".to_string()));
+    }
+    
+    #[test]
+    fn test_decode_claims_invalid() {
+        let filter = create_test_filter();
+        let claims_b64 = "invalid_base64!!!";
+        let claims = filter.decode_claims(claims_b64);
+        assert!(claims.is_none());
+    }
+    
+    #[test]
+    fn test_validate_claims_exp_valid() {
+        let mut config = create_test_config();
+        config.issuer = None;  // Disable issuer check
+        config.audience = None;  // Disable audience check
+        let filter = JwtFilter {
+            context_id: 1,
+            config,
+            pending_jwks_fetch: false,
+            cached_token: None,
+        };
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let claims = JwtClaims {
+            exp: Some(now + 3600),  // 1 hour in future
+            ..Default::default()
+        };
+        
+        assert!(filter.validate_claims(&claims).is_ok());
+    }
+    
+    #[test]
+    fn test_validate_claims_exp_expired() {
+        let filter = create_test_filter();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let claims = JwtClaims {
+            exp: Some(now - 3600),  // 1 hour in past
+            ..Default::default()
+        };
+        
+        let result = filter.validate_claims(&claims);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("expired"));
+    }
+    
+    #[test]
+    fn test_validate_claims_nbf_valid() {
+        let mut config = create_test_config();
+        config.validate_nbf = true;
+        config.issuer = None;  // Disable issuer check
+        config.audience = None;  // Disable audience check
+        let filter = JwtFilter {
+            context_id: 1,
+            config,
+            pending_jwks_fetch: false,
+            cached_token: None,
+        };
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let claims = JwtClaims {
+            nbf: Some(now - 3600),  // 1 hour in past
+            ..Default::default()
+        };
+        
+        assert!(filter.validate_claims(&claims).is_ok());
+    }
+    
+    #[test]
+    fn test_validate_claims_nbf_not_yet_valid() {
+        let mut config = create_test_config();
+        config.validate_nbf = true;
+        let filter = JwtFilter {
+            context_id: 1,
+            config,
+            pending_jwks_fetch: false,
+            cached_token: None,
+        };
+        
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs();
+        
+        let claims = JwtClaims {
+            nbf: Some(now + 3600),  // 1 hour in future
+            ..Default::default()
+        };
+        
+        let result = filter.validate_claims(&claims);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("not yet valid"));
+    }
+    
+    #[test]
+    fn test_validate_claims_iss_valid() {
+        let mut config = create_test_config();
+        config.audience = None;  // Disable audience check
+        let filter = JwtFilter {
+            context_id: 1,
+            config,
+            pending_jwks_fetch: false,
+            cached_token: None,
+        };
+        
+        let claims = JwtClaims {
+            iss: Some("https://example.com".to_string()),
+            ..Default::default()
+        };
+        
+        assert!(filter.validate_claims(&claims).is_ok());
+    }
+    
+    #[test]
+    fn test_validate_claims_iss_invalid() {
+        let filter = create_test_filter();
+        let claims = JwtClaims {
+            iss: Some("https://different.com".to_string()),
+            ..Default::default()
+        };
+        
+        let result = filter.validate_claims(&claims);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid issuer"));
+    }
+    
+    #[test]
+    fn test_validate_claims_aud_string_valid() {
+        let mut config = create_test_config();
+        config.issuer = None;  // Disable issuer check
+        let filter = JwtFilter {
+            context_id: 1,
+            config,
+            pending_jwks_fetch: false,
+            cached_token: None,
+        };
+        
+        let claims = JwtClaims {
+            aud: Some(serde_json::Value::String("api.example.com".to_string())),
+            ..Default::default()
+        };
+        
+        assert!(filter.validate_claims(&claims).is_ok());
+    }
+    
+    #[test]
+    fn test_validate_claims_aud_array_valid() {
+        let mut config = create_test_config();
+        config.issuer = None;  // Disable issuer check
+        let filter = JwtFilter {
+            context_id: 1,
+            config,
+            pending_jwks_fetch: false,
+            cached_token: None,
+        };
+        
+        let claims = JwtClaims {
+            aud: Some(serde_json::Value::Array(vec![
+                serde_json::Value::String("other.example.com".to_string()),
+                serde_json::Value::String("api.example.com".to_string()),
+            ])),
+            ..Default::default()
+        };
+        
+        assert!(filter.validate_claims(&claims).is_ok());
+    }
+    
+    #[test]
+    fn test_validate_claims_aud_invalid() {
+        let mut config = create_test_config();
+        config.issuer = None;  // Disable issuer check
+        let filter = JwtFilter {
+            context_id: 1,
+            config,
+            pending_jwks_fetch: false,
+            cached_token: None,
+        };
+        
+        let claims = JwtClaims {
+            aud: Some(serde_json::Value::String("different.example.com".to_string())),
+            ..Default::default()
+        };
+        
+        let result = filter.validate_claims(&claims);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().contains("Invalid audience"));
+    }
+    
+    #[test]
+    fn test_simplify_error_message() {
+        let filter = create_test_filter();
+        
+        assert_eq!(filter.simplify_error_message("Token expired"), "Token expired");
+        assert_eq!(filter.simplify_error_message("Invalid signature"), "Invalid token");
+        assert_eq!(filter.simplify_error_message("Invalid issuer"), "Invalid token");
+        assert_eq!(filter.simplify_error_message("Missing authentication token"), "Authentication required");
+        assert_eq!(filter.simplify_error_message("Token not yet valid"), "Token not yet valid");
+        assert_eq!(filter.simplify_error_message("Unknown error"), "Invalid token");
+    }
+    
+    #[test]
+    fn test_jwt_config_should_skip() {
+        let config = create_test_config();
+        assert!(config.should_skip("/health"));
+        assert!(config.should_skip("/health/check"));
+        assert!(!config.should_skip("/api/users"));
+    }
+}
+
+impl Default for JwtClaims {
+    fn default() -> Self {
+        Self {
+            iss: None,
+            aud: None,
+            exp: None,
+            nbf: None,
+            iat: None,
+            sub: None,
+            email: None,
+            extra: HashMap::new(),
+        }
     }
 }

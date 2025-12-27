@@ -7,7 +7,8 @@ description = "JWT Authentication Proxy-Wasm Filter with JWKS Support"
 license = "Apache-2.0"
 
 [lib]
-crate-type = ["cdylib"]
+name = "jwt_filter"
+crate-type = ["cdylib", "rlib"]
 
 [dependencies]
 proxy-wasm = "0.2"
@@ -18,6 +19,7 @@ log = "0.4"
 hmac = "0.12"
 sha2 = "0.10"
 rsa = { version = "0.9", features = ["sha2"] }
+once_cell = "1.19"
 
 [profile.release]
 opt-level = "s"
