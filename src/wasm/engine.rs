@@ -184,7 +184,28 @@ impl FilterEngine {
         // Instantiate module
         let instance = module.instance_pre.instantiate(&mut store)?;
 
-        // Get callback function
+        // === Proxy-Wasm SDK Lifecycle ===
+        // The SDK requires these callbacks in order:
+        // 1. _initialize (called automatically by wasmtime on instantiation)
+        // 2. proxy_on_vm_start - creates the RootContext
+        // 3. proxy_on_context_create - creates the HttpContext
+        // 4. proxy_on_request_headers - processes the request
+
+        // Call proxy_on_vm_start with root_context_id = 0
+        // This triggers RootContext creation in the SDK
+        let config_size = module.configuration.len() as i32;
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+            let _ = func.call(&mut store, (0, config_size));
+        }
+
+        // Call proxy_on_context_create with context_id = 1, parent_context_id = 0
+        // This triggers HttpContext creation via RootContext::create_http_context()
+        let context_id = 1i32;
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (context_id, 0));
+        }
+
+        // Now call proxy_on_request_headers
         let callback = instance
             .get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_request_headers");
 
@@ -192,7 +213,7 @@ impl FilterEngine {
             Ok(func) => {
                 let num_headers = headers.len() as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call(&mut store, (1, num_headers, eos))?
+                func.call(&mut store, (context_id, num_headers, eos))?
             }
             Err(_) => {
                 // Callback not exported, continue
@@ -292,7 +313,20 @@ impl FilterEngine {
         // Instantiate module
         let instance = module.instance_pre.instantiate(&mut store)?;
 
-        // Get callback function
+        // === Proxy-Wasm SDK Lifecycle ===
+        // Call proxy_on_vm_start with root_context_id = 0
+        let config_size = module.configuration.len() as i32;
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start") {
+            let _ = func.call(&mut store, (0, config_size));
+        }
+
+        // Call proxy_on_context_create with context_id = 1, parent_context_id = 0
+        let context_id = 1i32;
+        if let Ok(func) = instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_context_create") {
+            let _ = func.call(&mut store, (context_id, 0));
+        }
+
+        // Now call proxy_on_response_headers
         let callback = instance
             .get_typed_func::<(i32, i32, i32), i32>(&mut store, "proxy_on_response_headers");
 
@@ -300,7 +334,7 @@ impl FilterEngine {
             Ok(func) => {
                 let num_headers = headers.len() as i32;
                 let eos = if end_of_stream { 1 } else { 0 };
-                func.call(&mut store, (1, num_headers, eos))?
+                func.call(&mut store, (context_id, num_headers, eos))?
             }
             Err(_) => 0,
         };
