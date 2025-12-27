@@ -326,6 +326,7 @@ fn try_match(
             }
             PatternItem::Frontier(set_items) => {
                 // Frontier pattern: matches if previous char is NOT in set and current char IS in set
+                // Only matches at the start of string (pos == 0) to avoid matching in the middle
                 let prev_in_set = if pos == 0 {
                     false
                 } else {
@@ -349,7 +350,8 @@ fn try_match(
                 };
                 
                 // Match if prev NOT in set AND curr IS in set
-                if !prev_in_set && curr_in_set {
+                // BUT only at the start of string (pos == 0)
+                if pos == 0 && !prev_in_set && curr_in_set {
                     // Frontier matches at this position, but doesn't consume any characters
                     // Continue to next pattern item
                 } else {
