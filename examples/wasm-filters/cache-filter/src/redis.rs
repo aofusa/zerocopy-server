@@ -38,6 +38,11 @@ pub fn build_set_path(key: &str, value: &str, ttl_secs: Option<u64>) -> String {
     }
 }
 
+/// Build Redis DELETE request path
+pub fn build_delete_path(key: &str) -> String {
+    format!("/DEL/{}", url_encode(key))
+}
+
 /// Parse Redis GET response
 pub fn parse_get_response(body: &[u8]) -> Option<String> {
     let response: RedisGetResponse = serde_json::from_slice(body).ok()?;

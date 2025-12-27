@@ -34,6 +34,11 @@ pub fn build_set_body(key: &str, value: &str, ttl_secs: u64) -> Vec<u8> {
     serde_json::to_vec(&request).unwrap_or_default()
 }
 
+/// Build Memcached DELETE request path
+pub fn build_delete_path(key: &str) -> String {
+    format!("/delete?key={}", url_encode(key))
+}
+
 /// Parse Memcached GET response
 pub fn parse_get_response(body: &[u8]) -> Option<String> {
     let response: MemcachedGetResponse = serde_json::from_slice(body).ok()?;

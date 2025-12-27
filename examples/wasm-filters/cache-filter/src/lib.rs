@@ -12,8 +12,8 @@
 
 use proxy_wasm::traits::*;
 use proxy_wasm::types::*;
-use serde::Deserialize;
-use std::collections::HashMap;
+use serde::{Deserialize, Serialize};
+use base64::{engine::general_purpose::STANDARD, Engine};
 use std::time::Duration;
 
 mod memcached;
@@ -78,6 +78,34 @@ pub struct CacheConfig {
     /// Upstream cluster name for cache backend
     #[serde(default = "default_upstream")]
     pub upstream: String,
+    
+    /// Timeout for cache GET operations (seconds)
+    #[serde(default = "default_get_timeout")]
+    pub get_timeout_secs: u64,
+    
+    /// Timeout for cache SET operations (seconds)
+    #[serde(default = "default_set_timeout")]
+    pub set_timeout_secs: u64,
+    
+    /// Headers to save in cache (empty = save important headers only)
+    #[serde(default)]
+    pub save_headers: Vec<String>,
+    
+    /// Headers to exclude from cache (always excluded)
+    #[serde(default = "default_exclude_headers")]
+    pub exclude_headers: Vec<String>,
+    
+    /// Header to trigger cache invalidation
+    #[serde(default = "default_invalidate_header")]
+    pub invalidate_header: String,
+    
+    /// Enable cache invalidation
+    #[serde(default = "default_invalidate_enabled")]
+    pub invalidate_enabled: bool,
+    
+    /// Automatically include Vary headers in cache key
+    #[serde(default = "default_vary_enabled")]
+    pub vary_enabled: bool,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -100,6 +128,18 @@ fn default_bypass_header() -> String { "X-Cache-Bypass".to_string() }
 fn default_upstream() -> String { "cache".to_string() }
 fn default_redis_host() -> String { "webdis".to_string() }
 fn default_memcached_host() -> String { "memcached-http".to_string() }
+fn default_get_timeout() -> u64 { 1 }
+fn default_set_timeout() -> u64 { 1 }
+fn default_exclude_headers() -> Vec<String> {
+    vec![
+        "connection".to_string(),
+        "transfer-encoding".to_string(),
+        "content-length".to_string(),
+    ]
+}
+fn default_invalidate_header() -> String { "X-Cache-Invalidate".to_string() }
+fn default_invalidate_enabled() -> bool { false }
+fn default_vary_enabled() -> bool { true }
 
 impl Default for RedisConfig {
     fn default() -> Self {
@@ -125,6 +165,13 @@ impl Default for CacheConfig {
             bypass_header: "X-Cache-Bypass".to_string(),
             skip_paths: vec!["/health".to_string(), "/metrics".to_string()],
             upstream: "cache".to_string(),
+            get_timeout_secs: 1,
+            set_timeout_secs: 1,
+            save_headers: vec![],
+            exclude_headers: default_exclude_headers(),
+            invalidate_header: "X-Cache-Invalidate".to_string(),
+            invalidate_enabled: false,
+            vary_enabled: true,
         }
     }
 }
@@ -143,7 +190,8 @@ impl CacheConfig {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum CacheOp {
     Get,
-    Set,
+    #[allow(dead_code)]
+    Set, // Fire-and-forgetで使用されるため、pending_opには設定されない
 }
 
 struct CacheFilterRoot {
@@ -197,6 +245,9 @@ impl RootContext for CacheFilterRoot {
             cache_key: None,
             pending_op: None,
             cached_response: None,
+            if_none_match: None,
+            cache_ttl: None,
+            vary_headers: None,
         }))
     }
 }
@@ -206,14 +257,20 @@ struct CacheFilter {
     config: CacheConfig,
     cache_key: Option<String>,
     pending_op: Option<CacheOp>,
-    cached_response: Option<CachedResponse>,
+    #[allow(dead_code)]
+    cached_response: Option<CachedResponse>, // 将来の拡張用に保持
+    if_none_match: Option<String>,
+    cache_ttl: Option<u64>,
+    vary_headers: Option<Vec<String>>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedResponse {
     status: u16,
     headers: Vec<(String, String)>,
-    body: Vec<u8>,
+    body: String, // Base64エンコードされた文字列として保存
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vary_headers: Option<Vec<String>>,
 }
 
 impl Context for CacheFilter {
@@ -234,13 +291,45 @@ impl Context for CacheFilter {
                         
                         // Parse cached response and serve it
                         if let Some(cached) = self.parse_cached_response(&value) {
+                            // ETagを取得
+                            let cached_etag = cached.headers.iter()
+                                .find(|(k, _)| k.eq_ignore_ascii_case("etag"))
+                                .map(|(_, v)| v.clone());
+                            
+                            // If-None-Match と比較
+                            if let (Some(ref if_none_match), Some(ref cached_etag)) = 
+                                (&self.if_none_match, &cached_etag) {
+                                
+                                // ETagの比較
+                                if Self::etag_matches(if_none_match, cached_etag) {
+                                    // 304 Not Modified を返却
+                                    self.add_http_response_header("X-Cache", "HIT");
+                                    self.add_http_response_header("ETag", cached_etag);
+                                    
+                                    // 他のキャッシュ関連ヘッダも追加
+                                    if let Some(last_modified) = cached.headers.iter()
+                                        .find(|(k, _)| k.eq_ignore_ascii_case("last-modified"))
+                                        .map(|(_, v)| v.clone()) {
+                                        self.add_http_response_header("Last-Modified", &last_modified);
+                                    }
+                                    
+                                    self.send_http_response(304, vec![], None);
+                                    return;
+                                }
+                            }
+                            
+                            // 通常のキャッシュヒット処理
                             self.add_http_response_header("X-Cache", "HIT");
+                            
+                            // ボディをデコード
+                            let body_bytes = base64_decode(&cached.body).unwrap_or_default();
+                            
                             self.send_http_response(
                                 cached.status as u32,
                                 cached.headers.iter()
                                     .map(|(k, v)| (k.as_str(), v.as_str()))
                                     .collect(),
-                                Some(&cached.body),
+                                Some(&body_bytes),
                             );
                             return;
                         }
@@ -268,6 +357,16 @@ impl HttpContext for CacheFilter {
         let method = self.get_http_request_header(":method").unwrap_or_default();
         let path = self.get_http_request_header(":path").unwrap_or_default();
 
+        // キャッシュ無効化のチェック
+        if self.config.invalidate_enabled {
+            if let Some(invalidate_value) = self.get_http_request_header(&self.config.invalidate_header) {
+                if self.invalidate_cache(&invalidate_value) {
+                    log::info!("[cache:{}] Cache invalidated for pattern: {}", 
+                        self.context_id, invalidate_value);
+                }
+            }
+        }
+
         // Check if cacheable
         if !self.config.should_cache_method(&method) {
             return Action::Continue;
@@ -282,6 +381,9 @@ impl HttpContext for CacheFilter {
             log::debug!("[cache:{}] Cache bypassed via header", self.context_id);
             return Action::Continue;
         }
+
+        // If-None-Match ヘッダを保存
+        self.if_none_match = self.get_http_request_header("if-none-match");
 
         // Generate cache key
         let cache_key = self.generate_cache_key(&method, &path);
@@ -306,6 +408,21 @@ impl HttpContext for CacheFilter {
                 log::debug!("[cache:{}] Response not cacheable (Cache-Control)", self.context_id);
                 self.cache_key = None;
                 return Action::Continue;
+            }
+            
+            // TTLを計算（Cache-Controlから抽出）
+            let ttl = Self::parse_cache_control(&cache_control)
+                .unwrap_or(self.config.default_ttl_secs);
+            self.cache_ttl = Some(ttl);
+        } else {
+            self.cache_ttl = Some(self.config.default_ttl_secs);
+        }
+
+        // Varyヘッダを解析
+        if self.config.vary_enabled {
+            if let Some(vary_value) = self.get_http_response_header("vary") {
+                let vary_headers = Self::parse_vary_header(&vary_value);
+                self.vary_headers = Some(vary_headers);
             }
         }
 
@@ -334,16 +451,26 @@ impl HttpContext for CacheFilter {
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(200);
                 
-                let headers: Vec<(String, String)> = vec![
-                    ("content-type".to_string(), 
-                     self.get_http_response_header("content-type").unwrap_or_default()),
-                ];
+                // すべての重要なヘッダを収集
+                let headers = self.collect_response_headers();
+                
+                // BodyをBase64エンコード
+                let body_b64 = base64_encode(&body);
 
-                let cached = CachedResponse { status, headers, body };
+                let cached = CachedResponse { 
+                    status, 
+                    headers, 
+                    body: body_b64,
+                    vary_headers: self.vary_headers.clone(),
+                };
                 
                 // Store in cache
-                let serialized = self.serialize_cached_response(&cached);
-                self.store_in_cache(cache_key, &serialized, self.config.default_ttl_secs);
+                let ttl = self.cache_ttl.unwrap_or(self.config.default_ttl_secs);
+                if let Ok(serialized) = self.serialize_cached_response(&cached) {
+                    self.store_in_cache(cache_key, &serialized, ttl);
+                } else {
+                    log::error!("[cache:{}] Failed to serialize cached response", self.context_id);
+                }
             }
         }
 
@@ -356,20 +483,139 @@ impl HttpContext for CacheFilter {
 }
 
 impl CacheFilter {
-    /// Generate cache key from request
+    /// Parse Cache-Control header to extract TTL
+    fn parse_cache_control(header_value: &str) -> Option<u64> {
+        // Cache-Control: max-age=3600, public, no-cache
+        // s-maxage を優先
+        for directive in header_value.split(',') {
+            let directive = directive.trim();
+            if let Some(ttl) = Self::parse_directive(directive, "s-maxage") {
+                return Some(ttl);
+            }
+        }
+        
+        // max-age を次にチェック
+        for directive in header_value.split(',') {
+            let directive = directive.trim();
+            if let Some(ttl) = Self::parse_directive(directive, "max-age") {
+                return Some(ttl);
+            }
+        }
+        
+        None
+    }
+    
+    fn parse_directive(directive: &str, name: &str) -> Option<u64> {
+        if directive.starts_with(name) {
+            if let Some(equals_pos) = directive.find('=') {
+                let value = directive[equals_pos + 1..].trim();
+                value.parse::<u64>().ok()
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+    
+    /// Compare ETag values (supports weak ETags)
+    fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+        for tag in if_none_match.split(',') {
+            let tag = tag.trim().trim_matches('"');
+            let etag_clean = etag.trim().trim_matches('"');
+            
+            // 弱いETagの処理（W/プレフィックスを無視）
+            let tag_stripped = tag.strip_prefix("W/").unwrap_or(tag);
+            let etag_stripped = etag_clean.strip_prefix("W/").unwrap_or(etag_clean);
+            
+            if tag_stripped == etag_stripped {
+                return true;
+            }
+        }
+        
+        false
+    }
+    
+    /// Parse Vary header
+    fn parse_vary_header(vary_value: &str) -> Vec<String> {
+        vary_value.split(',')
+            .map(|s| s.trim().to_lowercase())
+            .collect()
+    }
+    
+    /// Collect response headers to save in cache
+    fn collect_response_headers(&self) -> Vec<(String, String)> {
+        let mut headers = Vec::new();
+        
+        // 重要なヘッダを優先的に取得
+        let important_headers = vec![
+            "content-type",
+            "cache-control",
+            "etag",
+            "last-modified",
+            "expires",
+            "vary",
+        ];
+        
+        for header_name in &important_headers {
+            if let Some(value) = self.get_http_response_header(header_name) {
+                // 除外リストに含まれていないかチェック
+                if !self.config.exclude_headers.iter()
+                    .any(|h| h.eq_ignore_ascii_case(header_name)) {
+                    headers.push((header_name.to_string(), value));
+                }
+            }
+        }
+        
+        // 設定で指定された追加ヘッダを取得
+        for header_name in &self.config.save_headers {
+            if !important_headers.contains(&header_name.as_str()) {
+                if let Some(value) = self.get_http_response_header(header_name) {
+                    if !self.config.exclude_headers.iter()
+                        .any(|h| h.eq_ignore_ascii_case(header_name)) {
+                        headers.push((header_name.clone(), value));
+                    }
+                }
+            }
+        }
+        
+        headers
+    }
+    
+    /// Generate cache key from request (with collision prevention)
     fn generate_cache_key(&self, method: &str, path: &str) -> String {
         let mut key_parts = vec![method.to_string(), path.to_string()];
         
         // Add configured headers to key
         for header_name in &self.config.key_headers {
             if let Some(value) = self.get_http_request_header(header_name) {
-                key_parts.push(format!("{}={}", header_name, value));
+                // ヘッダ値が長すぎる場合は切り詰める
+                let truncated_value = if value.len() > 100 {
+                    &value[..100]
+                } else {
+                    &value
+                };
+                key_parts.push(format!("{}={}", header_name, truncated_value));
             }
         }
         
-        // Simple hash of key parts
         let key_str = key_parts.join("|");
-        format!("veil:cache:{:x}", simple_hash(&key_str))
+        let hash = simple_hash(&key_str);
+        
+        // ハッシュとキー文字列の短縮版を組み合わせ（衝突対策）
+        let key_suffix = if key_str.len() > 50 {
+            base64_encode(&key_str.as_bytes()[..50])
+                .chars()
+                .take(20)
+                .collect::<String>()
+        } else {
+            base64_encode(key_str.as_bytes())
+                .chars()
+                .take(20)
+                .collect::<String>()
+        };
+        
+        format!("veil:cache:{}:{}", hash, key_suffix)
     }
 
     /// Fetch from cache backend
@@ -393,7 +639,7 @@ impl CacheFilter {
             headers,
             None,
             vec![],
-            Duration::from_secs(1),
+            Duration::from_secs(self.config.get_timeout_secs),
         ) {
             Ok(_) => true,
             Err(e) => {
@@ -436,47 +682,75 @@ impl CacheFilter {
             headers,
             body.as_deref(),
             vec![],
-            Duration::from_secs(1),
+            Duration::from_secs(self.config.set_timeout_secs),
         ) {
             log::error!("[cache:{}] Failed to store in cache: {:?}", self.context_id, e);
         }
         // Note: Store is fire-and-forget, no need to track pending_op
     }
+    
+    /// Invalidate cache for a pattern
+    fn invalidate_cache(&self, pattern: &str) -> bool {
+        // シンプルな実装: 特定のキーを削除
+        // 将来的にワイルドカードパターンをサポート可能
+        let cache_key = if pattern.starts_with("veil:cache:") {
+            pattern.to_string()
+        } else {
+            // パターンからキーを生成（簡易実装）
+            format!("veil:cache:{}", simple_hash(pattern))
+        };
+        
+        match self.config.backend {
+            CacheBackend::Redis => {
+                let path = redis::build_delete_path(&cache_key);
+                self.delete_from_cache(&path)
+            }
+            CacheBackend::Memcached => {
+                let path = memcached::build_delete_path(&cache_key);
+                self.delete_from_cache(&path)
+            }
+        }
+    }
+    
+    /// Delete from cache backend
+    fn delete_from_cache(&self, path: &str) -> bool {
+        let headers = vec![
+            (":method", "GET"), // WebdisはGET /DEL/{key}を使用
+            (":path", path),
+            (":authority", match self.config.backend {
+                CacheBackend::Redis => &self.config.redis.host,
+                CacheBackend::Memcached => &self.config.memcached.host,
+            }),
+        ];
+        
+        // 注意: DELETE操作は非同期だが、fire-and-forgetで実行
+        match self.dispatch_http_call(
+            &self.config.upstream,
+            headers,
+            None,
+            vec![],
+            Duration::from_secs(self.config.get_timeout_secs),
+        ) {
+            Ok(_) => {
+                log::debug!("[cache:{}] Cache deletion dispatched", self.context_id);
+                true
+            }
+            Err(e) => {
+                log::error!("[cache:{}] Failed to delete cache: {:?}", self.context_id, e);
+                false
+            }
+        }
+    }
 
-    /// Serialize cached response
-    fn serialize_cached_response(&self, cached: &CachedResponse) -> String {
-        // Simple JSON format
-        let headers_json: Vec<String> = cached.headers.iter()
-            .map(|(k, v)| format!(r#"["{}","{}"]"#, k, v))
-            .collect();
-        
-        let body_b64 = base64_encode(&cached.body);
-        
-        format!(
-            r#"{{"status":{},"headers":[{}],"body":"{}"}}"#,
-            cached.status,
-            headers_json.join(","),
-            body_b64
-        )
+    /// Serialize cached response using serde_json
+    fn serialize_cached_response(&self, cached: &CachedResponse) -> Result<String, serde_json::Error> {
+        serde_json::to_string(cached)
     }
 
     /// Parse cached response from serialized format
     fn parse_cached_response(&self, value: &str) -> Option<CachedResponse> {
-        #[derive(Deserialize)]
-        struct CachedJson {
-            status: u16,
-            headers: Vec<(String, String)>,
-            body: String,
-        }
-        
-        let parsed: CachedJson = serde_json::from_str(value).ok()?;
-        let body = base64_decode(&parsed.body)?;
-        
-        Some(CachedResponse {
-            status: parsed.status,
-            headers: parsed.headers,
-            body,
-        })
+        let parsed: CachedResponse = serde_json::from_str(value).ok()?;
+        Some(parsed)
     }
 }
 
@@ -490,76 +764,12 @@ fn simple_hash(s: &str) -> u64 {
     hash
 }
 
-/// Simple base64 encoding
+/// Base64 encoding using standard library
 fn base64_encode(data: &[u8]) -> String {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-    let mut result = String::new();
-    
-    for chunk in data.chunks(3) {
-        let b0 = chunk[0] as u32;
-        let b1 = chunk.get(1).map(|&b| b as u32).unwrap_or(0);
-        let b2 = chunk.get(2).map(|&b| b as u32).unwrap_or(0);
-        
-        let n = (b0 << 16) | (b1 << 8) | b2;
-        
-        result.push(CHARS[((n >> 18) & 63) as usize] as char);
-        result.push(CHARS[((n >> 12) & 63) as usize] as char);
-        
-        if chunk.len() > 1 {
-            result.push(CHARS[((n >> 6) & 63) as usize] as char);
-        } else {
-            result.push('=');
-        }
-        
-        if chunk.len() > 2 {
-            result.push(CHARS[(n & 63) as usize] as char);
-        } else {
-            result.push('=');
-        }
-    }
-    
-    result
+    STANDARD.encode(data)
 }
 
-/// Simple base64 decoding
+/// Base64 decoding using standard library
 fn base64_decode(s: &str) -> Option<Vec<u8>> {
-    const DECODE: [i8; 128] = [
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,
-        -1,-1,-1,-1,-1,-1,-1,-1,-1,-1,-1,62,-1,-1,-1,63,
-        52,53,54,55,56,57,58,59,60,61,-1,-1,-1,-1,-1,-1,
-        -1, 0, 1, 2, 3, 4, 5, 6, 7, 8, 9,10,11,12,13,14,
-        15,16,17,18,19,20,21,22,23,24,25,-1,-1,-1,-1,-1,
-        -1,26,27,28,29,30,31,32,33,34,35,36,37,38,39,40,
-        41,42,43,44,45,46,47,48,49,50,51,-1,-1,-1,-1,-1,
-    ];
-    
-    let bytes: Vec<u8> = s.bytes()
-        .filter(|&b| b != b'=' && (b as usize) < 128 && DECODE[b as usize] >= 0)
-        .collect();
-    
-    let mut result = Vec::new();
-    
-    for chunk in bytes.chunks(4) {
-        if chunk.len() < 2 {
-            break;
-        }
-        
-        let b0 = DECODE[chunk[0] as usize] as u32;
-        let b1 = DECODE[chunk[1] as usize] as u32;
-        let b2 = chunk.get(2).map(|&b| DECODE[b as usize] as u32).unwrap_or(0);
-        let b3 = chunk.get(3).map(|&b| DECODE[b as usize] as u32).unwrap_or(0);
-        
-        let n = (b0 << 18) | (b1 << 12) | (b2 << 6) | b3;
-        
-        result.push((n >> 16) as u8);
-        if chunk.len() > 2 {
-            result.push((n >> 8) as u8);
-        }
-        if chunk.len() > 3 {
-            result.push(n as u8);
-        }
-    }
-    
-    Some(result)
+    STANDARD.decode(s).ok()
 }
