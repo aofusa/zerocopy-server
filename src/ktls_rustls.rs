@@ -68,6 +68,8 @@ pub struct KtlsServerStream {
     mode: TlsMode,
     /// ALPN でネゴシエートされたプロトコル（kTLS 有効化後も保持）
     alpn_protocol: Option<Vec<u8>>,
+    /// kTLS 有効化前に rustls が復号したデータ（ドレインバッファ）
+    drained_buffer: Vec<u8>,
 }
 
 impl KtlsServerStream {
@@ -151,6 +153,8 @@ pub struct KtlsClientStream {
     conn: Option<ClientConnection>,
     /// 現在の TLS モード
     mode: TlsMode,
+    /// kTLS 有効化前に rustls が復号したデータ（ドレインバッファ）
+    drained_buffer: Vec<u8>,
 }
 
 impl KtlsClientStream {
@@ -383,8 +387,8 @@ async fn do_client_handshake(
 /// kTLS 有効化の結果
 #[cfg(feature = "ktls")]
 pub enum KtlsEnableResult<C> {
-    /// kTLS 有効化成功
-    Enabled(TlsMode),
+    /// kTLS 有効化成功 + ドレイン済みバッファ
+    Enabled(TlsMode, Vec<u8>),
     /// kTLS 有効化失敗、rustls へフォールバック（conn を返す）
     Fallback(C, String),
     /// 致命的エラー（復旧不可）
@@ -394,11 +398,14 @@ pub enum KtlsEnableResult<C> {
 /// kTLS を有効化する（サーバー側）
 /// 
 /// ULP設定を先に試み、失敗時はconnを返してrustlsへフォールバック可能にする
+/// バッファに残存データがある場合はドレインして返却する
 #[cfg(feature = "ktls")]
 fn try_enable_ktls_server(
     stream: &TcpStream,
-    conn: ServerConnection,
+    mut conn: ServerConnection,
 ) -> KtlsEnableResult<ServerConnection> {
+    use crate::ktls::drain_rustls_plaintext;
+    
     let fd = stream.as_raw_fd();
     
     // Step 1: ULP設定を試みる（connを消費しない）
@@ -419,11 +426,28 @@ fn try_enable_ktls_server(
         }
     };
     
-    // Step 3: rustls::Connection に変換してシークレット抽出とkTLS設定
+    // Step 3: rustls バッファから残存データをドレイン
+    // kTLS 有効化後はカーネルが直接読み取るため、
+    // rustls 内のデータは失われる
+    let drained = match drain_rustls_plaintext(&mut conn.reader()) {
+        Ok(data) => {
+            if !data.is_empty() {
+                ftlog::debug!("kTLS: Drained {} bytes from rustls buffer", data.len());
+            }
+            data
+        }
+        Err(e) => {
+            let msg = format!("Buffer drain failed: {}", e);
+            ftlog::warn!("kTLS: {}, falling back to rustls", msg);
+            return KtlsEnableResult::Fallback(conn, msg);
+        }
+    };
+    
+    // Step 4: rustls::Connection に変換してシークレット抽出とkTLS設定
     // この時点で conn は消費される
     let rustls_conn = rustls::Connection::Server(conn);
     match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite) {
-        Ok(()) => KtlsEnableResult::Enabled(TlsMode::KtlsFull),
+        Ok(()) => KtlsEnableResult::Enabled(TlsMode::KtlsFull, drained),
         Err(e) => {
             // シークレット抽出後の失敗は致命的（connは既に消費済み）
             KtlsEnableResult::Fatal(e)
@@ -437,8 +461,10 @@ fn try_enable_ktls_server(
 #[cfg(feature = "ktls")]
 fn try_enable_ktls_client(
     stream: &TcpStream,
-    conn: ClientConnection,
+    mut conn: ClientConnection,
 ) -> KtlsEnableResult<ClientConnection> {
+    use crate::ktls::drain_rustls_plaintext;
+    
     let fd = stream.as_raw_fd();
     
     // Step 1: ULP設定を試みる（connを消費しない）
@@ -458,10 +484,25 @@ fn try_enable_ktls_client(
         }
     };
     
-    // Step 3: rustls::Connection に変換してシークレット抽出とkTLS設定
+    // Step 3: rustls バッファから残存データをドレイン
+    let drained = match drain_rustls_plaintext(&mut conn.reader()) {
+        Ok(data) => {
+            if !data.is_empty() {
+                ftlog::debug!("kTLS: Drained {} bytes from rustls buffer", data.len());
+            }
+            data
+        }
+        Err(e) => {
+            let msg = format!("Buffer drain failed: {}", e);
+            ftlog::warn!("kTLS: {}, falling back to rustls", msg);
+            return KtlsEnableResult::Fallback(conn, msg);
+        }
+    };
+    
+    // Step 4: rustls::Connection に変換してシークレット抽出とkTLS設定
     let rustls_conn = rustls::Connection::Client(conn);
     match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite) {
-        Ok(()) => KtlsEnableResult::Enabled(TlsMode::KtlsFull),
+        Ok(()) => KtlsEnableResult::Enabled(TlsMode::KtlsFull, drained),
         Err(e) => KtlsEnableResult::Fatal(e),
     }
 }
@@ -540,18 +581,18 @@ pub async fn accept(
 
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
-    let (mode, conn_option) = if enable_ktls {
+    let (mode, conn_option, drained_buffer) = if enable_ktls {
         match try_enable_ktls_server(&stream, conn) {
-            KtlsEnableResult::Enabled(mode) => {
-                // kTLS 有効化成功
-                (mode, None)
+            KtlsEnableResult::Enabled(mode, drained) => {
+                // kTLS 有効化成功 + ドレイン済みバッファ
+                (mode, None, drained)
             }
             KtlsEnableResult::Fallback(returned_conn, reason) => {
                 if allow_fallback {
                     // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
                     // warnログは try_enable_ktls_server 内で既に出力済み
                     let _ = reason;
-                    (TlsMode::Rustls, Some(returned_conn))
+                    (TlsMode::Rustls, Some(returned_conn), Vec::new())
                 } else {
                     // フォールバック無効 - 接続を拒否
                     ftlog::error!(
@@ -571,14 +612,14 @@ pub async fn accept(
             }
         }
     } else {
-        (TlsMode::Rustls, Some(conn))
+        (TlsMode::Rustls, Some(conn), Vec::new())
     };
 
     #[cfg(not(feature = "ktls"))]
-    let (mode, conn_option) = {
+    let (mode, conn_option, drained_buffer) = {
         let _ = enable_ktls;
         let _ = allow_fallback;
-        (TlsMode::Rustls, Some(conn))
+        (TlsMode::Rustls, Some(conn), Vec::new())
     };
 
     Ok(KtlsServerStream {
@@ -586,6 +627,7 @@ pub async fn accept(
         conn: conn_option,
         mode,
         alpn_protocol,
+        drained_buffer,
     })
 }
 
@@ -611,18 +653,18 @@ pub async fn connect(
 
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
-    let (mode, conn_option) = if enable_ktls {
+    let (mode, conn_option, drained_buffer) = if enable_ktls {
         match try_enable_ktls_client(&stream, conn) {
-            KtlsEnableResult::Enabled(mode) => {
-                // kTLS 有効化成功
-                (mode, None)
+            KtlsEnableResult::Enabled(mode, drained) => {
+                // kTLS 有効化成功 + ドレイン済みバッファ
+                (mode, None, drained)
             }
             KtlsEnableResult::Fallback(returned_conn, reason) => {
                 if allow_fallback {
                     // ULP設定失敗等、復旧可能なエラー - rustls にフォールバック
                     // warnログは try_enable_ktls_client 内で既に出力済み
                     let _ = reason;
-                    (TlsMode::Rustls, Some(returned_conn))
+                    (TlsMode::Rustls, Some(returned_conn), Vec::new())
                 } else {
                     // フォールバック無効 - 接続を拒否
                     ftlog::error!(
@@ -642,20 +684,21 @@ pub async fn connect(
             }
         }
     } else {
-        (TlsMode::Rustls, Some(conn))
+        (TlsMode::Rustls, Some(conn), Vec::new())
     };
 
     #[cfg(not(feature = "ktls"))]
-    let (mode, conn_option) = {
+    let (mode, conn_option, drained_buffer) = {
         let _ = enable_ktls;
         let _ = allow_fallback;
-        (TlsMode::Rustls, Some(conn))
+        (TlsMode::Rustls, Some(conn), Vec::new())
     };
 
     Ok(KtlsClientStream {
         inner: stream,
         conn: conn_option,
         mode,
+        drained_buffer,
     })
 }
 
@@ -665,6 +708,21 @@ pub async fn connect(
 
 impl monoio::io::AsyncReadRent for KtlsServerStream {
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+        // 【Phase 2】まずドレインバッファからデータを返す
+        if !self.drained_buffer.is_empty() {
+            let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.drained_buffer.as_ptr(),
+                    buf.write_ptr(),
+                    len,
+                );
+                buf.set_init(len);
+            }
+            self.drained_buffer.drain(..len);
+            return (Ok(len), buf);
+        }
+        
         // kTLS が有効な場合は直接 TCP から読み込み（カーネルが復号化）
         if self.mode != TlsMode::Rustls {
             return self.inner.read(buf).await;
@@ -927,6 +985,21 @@ impl monoio::io::AsyncWriteRent for KtlsServerStream {
 
 impl monoio::io::AsyncReadRent for KtlsClientStream {
     async fn read<T: IoBufMut>(&mut self, mut buf: T) -> monoio::BufResult<usize, T> {
+        // 【Phase 2】まずドレインバッファからデータを返す
+        if !self.drained_buffer.is_empty() {
+            let len = std::cmp::min(self.drained_buffer.len(), buf.bytes_total());
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    self.drained_buffer.as_ptr(),
+                    buf.write_ptr(),
+                    len,
+                );
+                buf.set_init(len);
+            }
+            self.drained_buffer.drain(..len);
+            return (Ok(len), buf);
+        }
+        
         if self.mode != TlsMode::Rustls {
             return self.inner.read(buf).await;
         }

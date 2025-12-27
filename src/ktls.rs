@@ -174,6 +174,10 @@ pub enum KtlsError {
     SecretExtractionFailed,
     /// setsockopt 失敗
     SetsockoptFailed(i32),
+    /// バッファドレイン失敗
+    DrainError(String),
+    /// バッファサイズ超過 (64KB 制限)
+    BufferOverflow,
 }
 
 impl std::fmt::Display for KtlsError {
@@ -185,6 +189,8 @@ impl std::fmt::Display for KtlsError {
             KtlsError::UnsupportedProtocol => write!(f, "Unsupported TLS protocol version"),
             KtlsError::SecretExtractionFailed => write!(f, "Failed to extract TLS secrets"),
             KtlsError::SetsockoptFailed(errno) => write!(f, "setsockopt failed: errno={}", errno),
+            KtlsError::DrainError(msg) => write!(f, "Buffer drain failed: {}", msg),
+            KtlsError::BufferOverflow => write!(f, "Excessive buffered data in rustls (>64KB)"),
         }
     }
 }
@@ -195,6 +201,113 @@ impl From<KtlsError> for io::Error {
     fn from(e: KtlsError) -> Self {
         io::Error::new(io::ErrorKind::Other, e.to_string())
     }
+}
+
+// ====================
+// バッファドレイン
+// ====================
+
+/// ドレインバッファの最大サイズ (64KB)
+/// セキュリティ制限: 過度なメモリ使用を防止
+pub const MAX_DRAIN_BUFFER_SIZE: usize = 65536;
+
+/// rustls バッファから残存平文データを抽出
+///
+/// kTLS 有効化前に rustls が復号済みのデータをドレインし、
+/// カーネルハンドオフ後もアプリケーションに正しく渡せるようにします。
+///
+/// # 引数
+/// * `reader` - rustls::ServerConnection または ClientConnection の reader()
+///
+/// # 戻り値
+/// ドレインされた平文データ (通常は空)
+///
+/// # エラー
+/// バッファが 64KB を超える場合は BufferOverflow エラー
+pub fn drain_rustls_plaintext<R: std::io::Read>(reader: &mut R) -> Result<Vec<u8>, KtlsError> {
+    let mut drained = Vec::with_capacity(4096);
+    let mut buf = [0u8; 4096];
+
+    loop {
+        match reader.read(&mut buf) {
+            Ok(0) => break, // バッファ空または EOF
+            Ok(n) => {
+                drained.extend_from_slice(&buf[..n]);
+                // セキュリティ制限: 64KB 以上は異常
+                if drained.len() > MAX_DRAIN_BUFFER_SIZE {
+                    return Err(KtlsError::BufferOverflow);
+                }
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(KtlsError::DrainError(e.to_string())),
+        }
+    }
+
+    Ok(drained)
+}
+
+// ====================
+// TCP_CORK 最適化
+// ====================
+
+/// TCP_CORK を設定 (TCP セグメントのバッチ処理)
+///
+/// kTLS 設定中に小さな TCP パケットの送信を遅延し、
+/// 効率的なネットワーク転送を実現します。
+///
+/// # 引数
+/// * `fd` - ソケットファイルディスクリプタ
+/// * `enable` - true で CORK 有効化、false で無効化
+pub fn set_tcp_cork(fd: RawFd, enable: bool) -> io::Result<()> {
+    const TCP_CORK: libc::c_int = 3;
+    let val: libc::c_int = if enable { 1 } else { 0 };
+
+    let result = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_TCP,
+            TCP_CORK,
+            &val as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+        )
+    };
+
+    if result < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        Ok(())
+    }
+}
+
+// ====================
+// kTLS 互換暗号スイート
+// ====================
+
+/// kTLS 互換の暗号スイートを返す
+///
+/// Linux カーネル kTLS がサポートする暗号スイートのみを返します。
+/// TLS 設定時にこのリストを使用することで、kTLS 非互換の暗号が
+/// ネゴシエートされることを防ぎます。
+///
+/// # サポート暗号スイート
+/// - TLS 1.3: AES-128-GCM, AES-256-GCM
+/// - TLS 1.2: ECDHE-RSA-AES-128-GCM, ECDHE-RSA-AES-256-GCM
+///
+/// # 注意
+/// ChaCha20-Poly1305 は Linux 5.11+ が必要なため含まれていません。
+pub fn ktls_compatible_cipher_suites() -> Vec<rustls::SupportedCipherSuite> {
+    use rustls::crypto::ring::cipher_suite;
+    vec![
+        // TLS 1.3 AES-GCM
+        cipher_suite::TLS13_AES_128_GCM_SHA256,
+        cipher_suite::TLS13_AES_256_GCM_SHA384,
+        // TLS 1.2 ECDHE-RSA-AES-GCM
+        cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+        cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384,
+        // TLS 1.2 ECDHE-ECDSA-AES-GCM (EC 証明書用)
+        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256,
+        cipher_suite::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384,
+    ]
 }
 
 // ====================
