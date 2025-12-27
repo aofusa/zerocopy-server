@@ -219,6 +219,7 @@ impl Interpreter {
     }
     
     /// Register a module for require()
+    #[allow(dead_code)] // Public API for external use
     pub fn register_module(&mut self, name: String, module: LuaValue) {
         self.modules.insert(name, module);
     }

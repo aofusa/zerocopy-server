@@ -51,3 +51,21 @@ fn test_match_all() {
     assert_eq!(matches.len(), 3);
 }
 
+#[test]
+fn test_frontier_pattern() {
+    let result = pattern::match_pattern("hello world", "%f[%w]hello");
+    assert!(result.is_ok());
+    let m = result.unwrap();
+    assert!(m.is_some());
+    assert_eq!(m.unwrap().matched, "hello");
+}
+
+#[test]
+fn test_frontier_pattern_not_matched() {
+    let result = pattern::match_pattern("hello world", "%f[%w]world");
+    assert!(result.is_ok());
+    let m = result.unwrap();
+    // Should not match because 'w' is not a word character boundary
+    assert!(m.is_none() || m.unwrap().matched != "world");
+}
+

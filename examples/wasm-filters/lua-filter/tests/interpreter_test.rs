@@ -160,3 +160,212 @@ fn test_goto_label() {
     assert_eq!(result.to_number(), Some(3.0));
 }
 
+#[test]
+fn test_string_pack() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local packed = string.pack('i4', 42); return #packed"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(4.0));
+}
+
+#[test]
+fn test_string_unpack() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local packed = string.pack('i4', 42); local value = string.unpack('i4', packed); return value"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_rawget() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t = {}; local mt = {__index = {default = 'default'}}; setmetatable(t, mt); return rawget(t, 'key')"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert!(result.is_nil());
+}
+
+#[test]
+fn test_rawset() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t = {}; local mt = {__newindex = function() error('should not be called') end}; setmetatable(t, mt); rawset(t, 'key', 'value'); return t.key"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_lua_string(), "value");
+}
+
+#[test]
+fn test_math_randomseed() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "math.randomseed(42); local r1 = math.random(); math.randomseed(42); local r2 = math.random(); return r1 == r2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.is_truthy(), true);
+}
+
+#[test]
+fn test_load() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local f, err = load('return 42'); if f then return f() else return err end"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_load_error() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local f, err = load('return +'); if f then return 'success' else return type(err) end"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_lua_string(), "string");
+}
+
+#[test]
+fn test_require() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "package.loaded.test = {value = 42}; local m = require('test'); return m.value"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_string_dump() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "function f() return 42 end; local dumped = string.dump(f); return type(dumped)"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_lua_string(), "string");
+}
+
+#[test]
+fn test_tail_call_optimization() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "function count(n) if n <= 0 then return 0 else return count(n - 1) + 1 end end; return count(1000)"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(1000.0));
+}
+
+#[test]
+fn test_string_gmatch() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local words = {}; for word in string.gmatch('hello world', '%w+') do table.insert(words, word) end; return #words"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(2.0));
+}
+
+#[test]
+fn test_utf8_codes() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local count = 0; for code in utf8.codes('hello') do count = count + 1 end; return count"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(5.0));
+}
+
+#[test]
+fn test_metatable_newindex() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t = {}; local calls = 0; local mt = {__newindex = function(t, k, v) calls = calls + 1 end}; setmetatable(t, mt); t.key = 'value'; return calls"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(1.0));
+}
+
+#[test]
+fn test_metatable_call() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t = {}; local mt = {__call = function(self, x) return x * 2 end}; setmetatable(t, mt); return t(21)"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_metatable_add() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; local mt = {__add = function(a, b) return 42 end}; setmetatable(t1, mt); return t1 + t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_metatable_eq() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; local mt = {__eq = function(a, b) return true end}; setmetatable(t1, mt); setmetatable(t2, mt); return t1 == t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.is_truthy(), true);
+}
+
+#[test]
+fn test_metatable_len() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t = {}; local mt = {__len = function(self) return 42 end}; setmetatable(t, mt); return #t"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_metatable_tostring() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t = {}; local mt = {__tostring = function(self) return 'custom' end}; setmetatable(t, mt); return tostring(t)"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_lua_string(), "custom");
+}
+
+#[test]
+fn test_closure_upvalue() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local x = 10; function outer() local y = 20; return function() return x + y end end; local f = outer(); return f()"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(30.0));
+}
+

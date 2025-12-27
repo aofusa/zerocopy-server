@@ -30,7 +30,7 @@
 //! - `veil.send_local_response(status, body)` - Send local response
 //! - `veil.get_headers()` - Get all request headers as table
 
-mod lua;
+pub mod lua;
 
 use lua::interpreter::{Interpreter, SharedState};
 use proxy_wasm::traits::*;
