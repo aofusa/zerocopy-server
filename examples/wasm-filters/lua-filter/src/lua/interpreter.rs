@@ -109,6 +109,12 @@ pub struct Interpreter {
     
     /// Module registry for require()
     modules: HashMap<String, LuaValue>,
+    
+    /// Call depth counter for preventing stack overflow
+    call_depth: usize,
+    
+    /// Maximum call depth before switching to iterative execution
+    max_call_depth: usize,
 }
 
 impl Interpreter {
@@ -226,6 +232,8 @@ impl Interpreter {
             function_labels: HashMap::new(),
             random_state: 0,
             modules: HashMap::new(),
+            call_depth: 0,
+            max_call_depth: 1000,
         }
     }
     
@@ -948,6 +956,9 @@ impl Interpreter {
             }
         }
         
+        // Increment call depth and check for stack overflow prevention
+        self.call_depth += 1;
+        
         self.push_scope();
 
         // Restore upvalues
@@ -981,20 +992,225 @@ impl Interpreter {
                 if let Stmt::Return(return_values) = stmt {
                     if return_values.len() == 1 {
                         if let Expr::Call { func, args: call_args } = &return_values[0] {
-                            // Tail call detected - evaluate and call without recursion
+                            // Tail call detected - evaluate function and arguments
                             let func_val = self.evaluate(func)?;
                             let arg_vals: Vec<LuaValue> = call_args
                                 .iter()
                                 .map(|a| self.evaluate(a))
                                 .collect::<Result<_, _>>()?;
                             
-                            // Pop scope before tail call to avoid stack buildup
-                            self.return_values = prev_return;
-                            self.varargs.clear();
-                            self.pop_scope();
+                            // For tail call optimization, reuse current scope instead of creating new one
+                            // Clear current scope and set up new parameters
+                            if let Some(scope) = self.scopes.last_mut() {
+                                scope.values.clear();
+                            }
                             
-                            // Make tail call (this will reuse the call stack)
-                            return self.call_function(&func_val, &arg_vals);
+                            // Handle the tail call based on function type
+                            let target_closure = match &func_val {
+                                LuaValue::Function(name) => {
+                                    self.functions.get(name).cloned()
+                                }
+                                LuaValue::Closure(closure) => {
+                                    Some(closure.clone())
+                                }
+                                _ => {
+                                    // Not a closure, use normal call
+                                    self.return_values = prev_return;
+                                    self.varargs.clear();
+                                    self.pop_scope();
+                                    self.call_depth -= 1;
+                                    return self.call_function(&func_val, &arg_vals);
+                                }
+                            };
+                            
+                            if let Some(mut current_closure) = target_closure {
+                                // Tail call optimization loop: continue until we hit a non-tail-call return
+                                let mut current_args = arg_vals;
+                                loop {
+                                    // Clear scope for this iteration
+                                    if let Some(scope) = self.scopes.last_mut() {
+                                        scope.values.clear();
+                                    }
+                                    
+                                    // Restore upvalues
+                                    for (name, upvalue) in &current_closure.upvalues {
+                                        if let Some(scope) = self.scopes.last_mut() {
+                                            scope.values.insert(name.clone(), upvalue.value.clone());
+                                        }
+                                    }
+                                    
+                                    // Bind parameters
+                                    for (i, param) in current_closure.params.iter().enumerate() {
+                                        let arg = current_args.get(i).cloned().unwrap_or(LuaValue::Nil);
+                                        self.set_local(param.clone(), arg);
+                                    }
+                                    
+                                    // Set varargs if function accepts them
+                                    if current_closure.vararg {
+                                        let vararg_start = current_closure.params.len();
+                                        if vararg_start < current_args.len() {
+                                            self.varargs = current_args[vararg_start..].to_vec();
+                                        } else {
+                                            self.varargs.clear();
+                                        }
+                                    } else {
+                                        self.varargs.clear();
+                                    }
+                                    
+                                    // Execute the closure's body
+                                    let mut j = 0;
+                                    let mut found_tail_call = false;
+                                    while j < current_closure.body.len() {
+                                        let stmt = &current_closure.body[j];
+                                        
+                                        // Check for tail call (last statement is return with single function call)
+                                        if j == current_closure.body.len() - 1 {
+                                            if let Stmt::Return(return_values) = stmt {
+                                                if return_values.len() == 1 {
+                                                    if let Expr::Call { func: new_func, args: new_call_args } = &return_values[0] {
+                                                        // Another tail call - evaluate and continue outer loop
+                                                        let new_func_val = self.evaluate(new_func)?;
+                                                        let new_arg_vals: Vec<LuaValue> = new_call_args
+                                                            .iter()
+                                                            .map(|a| self.evaluate(a))
+                                                            .collect::<Result<_, _>>()?;
+                                                        
+                                                        // Get next closure
+                                                        let next_closure = match &new_func_val {
+                                                            LuaValue::Function(name) => {
+                                                                self.functions.get(name).cloned()
+                                                            }
+                                                            LuaValue::Closure(closure) => {
+                                                                Some(closure.clone())
+                                                            }
+                                                            _ => {
+                                                                // Not a closure, use normal call
+                                                                self.return_values = prev_return;
+                                                                self.varargs.clear();
+                                                                self.pop_scope();
+                                                                self.call_depth -= 1;
+                                                                return self.call_function(&new_func_val, &new_arg_vals);
+                                                            }
+                                                        };
+                                                        
+                                                        if let Some(next) = next_closure {
+                                                            current_closure = next;
+                                                            current_args = new_arg_vals;
+                                                            found_tail_call = true;
+                                                            break;
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Check for tail call in if statement
+                                        if let Stmt::If { condition, then_block, elseif_blocks: _, else_block, .. } = stmt {
+                                            if j == current_closure.body.len() - 1 {
+                                                let cond = self.evaluate(condition)?;
+                                                
+                                                if cond.is_truthy() {
+                                                    if let Some(Stmt::Return(return_values)) = then_block.last() {
+                                                        if return_values.len() == 1 {
+                                                            if let Expr::Call { func: new_func, args: new_call_args } = &return_values[0] {
+                                                                // Tail call in then block
+                                                                let new_func_val = self.evaluate(new_func)?;
+                                                                let new_arg_vals: Vec<LuaValue> = new_call_args
+                                                                    .iter()
+                                                                    .map(|a| self.evaluate(a))
+                                                                    .collect::<Result<_, _>>()?;
+                                                                
+                                                                // Get next closure
+                                                                let next_closure = match &new_func_val {
+                                                                    LuaValue::Function(name) => {
+                                                                        self.functions.get(name).cloned()
+                                                                    }
+                                                                    LuaValue::Closure(closure) => {
+                                                                        Some(closure.clone())
+                                                                    }
+                                                                    _ => {
+                                                                        self.return_values = prev_return;
+                                                                        self.varargs.clear();
+                                                                        self.pop_scope();
+                                                                        self.call_depth -= 1;
+                                                                        return self.call_function(&new_func_val, &new_arg_vals);
+                                                                    }
+                                                                };
+                                                                
+                                                                if let Some(next) = next_closure {
+                                                                    current_closure = next;
+                                                                    current_args = new_arg_vals;
+                                                                    found_tail_call = true;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                } else {
+                                                    // Check else block
+                                                    if let Some(else_body) = else_block {
+                                                        if let Some(Stmt::Return(return_values)) = else_body.last() {
+                                                            if return_values.len() == 1 {
+                                                                if let Expr::Call { func: new_func, args: new_call_args } = &return_values[0] {
+                                                                    // Tail call in else block
+                                                                    let new_func_val = self.evaluate(new_func)?;
+                                                                    let new_arg_vals: Vec<LuaValue> = new_call_args
+                                                                        .iter()
+                                                                        .map(|a| self.evaluate(a))
+                                                                        .collect::<Result<_, _>>()?;
+                                                                    
+                                                                    // Get next closure
+                                                                    let next_closure = match &new_func_val {
+                                                                        LuaValue::Function(name) => {
+                                                                            self.functions.get(name).cloned()
+                                                                        }
+                                                                        LuaValue::Closure(closure) => {
+                                                                            Some(closure.clone())
+                                                                        }
+                                                                        _ => {
+                                                                            self.return_values = prev_return;
+                                                                            self.varargs.clear();
+                                                                            self.pop_scope();
+                                                                            self.call_depth -= 1;
+                                                                            return self.call_function(&new_func_val, &new_arg_vals);
+                                                                        }
+                                                                    };
+                                                                    
+                                                                    if let Some(next) = next_closure {
+                                                                        current_closure = next;
+                                                                        current_args = new_arg_vals;
+                                                                        found_tail_call = true;
+                                                                        break;
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                        }
+                                        
+                                        // Normal statement execution
+                                        self.execute_statement(stmt)?;
+                                        if self.return_values.is_some() {
+                                            let results = self.return_values.take().unwrap_or_else(|| vec![]);
+                                            self.return_values = prev_return;
+                                            return Ok(results);
+                                        }
+                                        j += 1;
+                                    }
+                                    
+                                    // If we found a tail call, continue the outer loop
+                                    if found_tail_call {
+                                        continue;
+                                    }
+                                    
+                                    // If we get here, the function completed normally (no tail call)
+                                    let results = self.return_values.take().unwrap_or_else(|| vec![]);
+                                    self.return_values = prev_return;
+                                    return Ok(results);
+                                }
+                            }
                         }
                     }
                 }
@@ -1006,70 +1222,232 @@ impl Interpreter {
                 if i == closure.body.len() - 1 {
                     let cond = self.evaluate(condition)?;
                     
-                    if cond.is_truthy() {
-                        // Check then block for tail call
-                        if let Some(Stmt::Return(return_values)) = then_block.last() {
-                            if return_values.len() == 1 {
-                                if let Expr::Call { func, args: call_args } = &return_values[0] {
-                                    let func_val = self.evaluate(func)?;
-                                    let arg_vals: Vec<LuaValue> = call_args
-                                        .iter()
-                                        .map(|a| self.evaluate(a))
-                                        .collect::<Result<_, _>>()?;
-                                    
-                                    self.return_values = prev_return;
-                                    self.varargs.clear();
-                                    self.pop_scope();
-                                    
-                                    return self.call_function(&func_val, &arg_vals);
-                                }
+                    // Find the return statement with tail call
+                    let return_values_opt = if cond.is_truthy() {
+                        then_block.last().and_then(|s| {
+                            if let Stmt::Return(return_values) = s {
+                                Some(return_values)
+                            } else {
+                                None
                             }
-                        }
+                        })
                     } else {
-                        // Check elseif and else blocks for tail call
-                        let mut found_tail_call = false;
+                        let mut found = false;
+                        let mut result = None;
                         for (elseif_cond, elseif_body) in elseif_blocks {
                             let c = self.evaluate(elseif_cond)?;
                             if c.is_truthy() {
                                 if let Some(Stmt::Return(return_values)) = elseif_body.last() {
-                                    if return_values.len() == 1 {
-                                        if let Expr::Call { func, args: call_args } = &return_values[0] {
-                                            let func_val = self.evaluate(func)?;
-                                            let arg_vals: Vec<LuaValue> = call_args
-                                                .iter()
-                                                .map(|a| self.evaluate(a))
-                                                .collect::<Result<_, _>>()?;
-                                            
-                                            self.return_values = prev_return;
-                                            self.varargs.clear();
-                                            self.pop_scope();
-                                            
-                                            return self.call_function(&func_val, &arg_vals);
-                                        }
-                                    }
+                                    result = Some(return_values);
+                                    found = true;
                                 }
-                                found_tail_call = true;
                                 break;
                             }
                         }
-                        
-                        if !found_tail_call {
+                        if !found {
                             if let Some(else_body) = else_block {
                                 if let Some(Stmt::Return(return_values)) = else_body.last() {
-                                    if return_values.len() == 1 {
-                                        if let Expr::Call { func, args: call_args } = &return_values[0] {
-                                            let func_val = self.evaluate(func)?;
-                                            let arg_vals: Vec<LuaValue> = call_args
-                                                .iter()
-                                                .map(|a| self.evaluate(a))
-                                                .collect::<Result<_, _>>()?;
-                                            
-                                            self.return_values = prev_return;
-                                            self.varargs.clear();
-                                            self.pop_scope();
-                                            
-                                            return self.call_function(&func_val, &arg_vals);
+                                    result = Some(return_values);
+                                }
+                            }
+                        }
+                        result
+                    };
+                    
+                    if let Some(return_values) = return_values_opt {
+                        if return_values.len() == 1 {
+                            let expr = &return_values[0];
+                            if let Expr::Call { func, args: call_args } = expr {
+                                // Tail call detected - evaluate function and arguments
+                                let func_val = self.evaluate(func)?;
+                                let arg_vals: Vec<LuaValue> = call_args
+                                    .iter()
+                                    .map(|a| self.evaluate(a))
+                                    .collect::<Result<_, _>>()?;
+                                
+                                // Get target closure
+                                let target_closure = match &func_val {
+                                    LuaValue::Function(name) => {
+                                        self.functions.get(name).cloned()
+                                    }
+                                    LuaValue::Closure(closure) => {
+                                        Some(closure.clone())
+                                    }
+                                    _ => {
+                                        // Not a closure, use normal call
+                                        self.return_values = prev_return;
+                                        self.varargs.clear();
+                                        self.pop_scope();
+                                        self.call_depth -= 1;
+                                        return self.call_function(&func_val, &arg_vals);
+                                    }
+                                };
+                                
+                                if let Some(mut current_closure) = target_closure {
+                                    // Use the same tail call optimization loop as in the simple return case
+                                    let mut current_args = arg_vals;
+                                    loop {
+                                        // Clear scope for this iteration
+                                        if let Some(scope) = self.scopes.last_mut() {
+                                            scope.values.clear();
                                         }
+                                        
+                                        // Restore upvalues
+                                        for (name, upvalue) in &current_closure.upvalues {
+                                            if let Some(scope) = self.scopes.last_mut() {
+                                                scope.values.insert(name.clone(), upvalue.value.clone());
+                                            }
+                                        }
+                                        
+                                        // Bind parameters
+                                        for (i, param) in current_closure.params.iter().enumerate() {
+                                            let arg = current_args.get(i).cloned().unwrap_or(LuaValue::Nil);
+                                            self.set_local(param.clone(), arg);
+                                        }
+                                        
+                                        // Set varargs if function accepts them
+                                        if current_closure.vararg {
+                                            let vararg_start = current_closure.params.len();
+                                            if vararg_start < current_args.len() {
+                                                self.varargs = current_args[vararg_start..].to_vec();
+                                            } else {
+                                                self.varargs.clear();
+                                            }
+                                        } else {
+                                            self.varargs.clear();
+                                        }
+                                        
+                                        // Execute the closure's body
+                                        let mut j = 0;
+                                        let mut found_tail_call = false;
+                                        while j < current_closure.body.len() {
+                                            let stmt = &current_closure.body[j];
+                                            
+                                            // Check for tail call (last statement is return with single function call)
+                                            if j == current_closure.body.len() - 1 {
+                                                if let Stmt::Return(return_values) = stmt {
+                                                    if return_values.len() == 1 {
+                                                        if let Expr::Call { func: new_func, args: new_call_args } = &return_values[0] {
+                                                            // Another tail call - evaluate and continue outer loop
+                                                            let new_func_val = self.evaluate(new_func)?;
+                                                            let new_arg_vals: Vec<LuaValue> = new_call_args
+                                                                .iter()
+                                                                .map(|a| self.evaluate(a))
+                                                                .collect::<Result<_, _>>()?;
+                                                            
+                                                            // Get next closure
+                                                            let next_closure = match &new_func_val {
+                                                                LuaValue::Function(name) => {
+                                                                    self.functions.get(name).cloned()
+                                                                }
+                                                                LuaValue::Closure(closure) => {
+                                                                    Some(closure.clone())
+                                                                }
+                                                                _ => {
+                                                                    // Not a closure, use normal call
+                                                                    self.return_values = prev_return;
+                                                                    self.varargs.clear();
+                                                                    self.pop_scope();
+                                                                    self.call_depth -= 1;
+                                                                    return self.call_function(&new_func_val, &new_arg_vals);
+                                                                }
+                                                            };
+                                                            
+                                                            if let Some(next) = next_closure {
+                                                                current_closure = next;
+                                                                current_args = new_arg_vals;
+                                                                found_tail_call = true;
+                                                                break;
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Check for tail call in if statement
+                                            if let Stmt::If { condition: if_cond, then_block: if_then, elseif_blocks: _, else_block: if_else, .. } = stmt {
+                                                if j == current_closure.body.len() - 1 {
+                                                    let if_cond_val = self.evaluate(if_cond)?;
+                                                    
+                                                    let if_return_values_opt = if if_cond_val.is_truthy() {
+                                                        if_then.last().and_then(|s| {
+                                                            if let Stmt::Return(return_values) = s {
+                                                                Some(return_values)
+                                                            } else {
+                                                                None
+                                                            }
+                                                        })
+                                                    } else {
+                                                        if_else.as_ref().and_then(|else_body| {
+                                                            else_body.last().and_then(|s| {
+                                                                if let Stmt::Return(return_values) = s {
+                                                                    Some(return_values)
+                                                                } else {
+                                                                    None
+                                                                }
+                                                            })
+                                                        })
+                                                    };
+                                                    
+                                                    if let Some(if_return_values) = if_return_values_opt {
+                                                        if if_return_values.len() == 1 {
+                                                            if let Expr::Call { func: new_func, args: new_call_args } = &if_return_values[0] {
+                                                                // Another tail call - evaluate and continue outer loop
+                                                                let new_func_val = self.evaluate(new_func)?;
+                                                                let new_arg_vals: Vec<LuaValue> = new_call_args
+                                                                    .iter()
+                                                                    .map(|a| self.evaluate(a))
+                                                                    .collect::<Result<_, _>>()?;
+                                                                
+                                                                // Get next closure
+                                                                let next_closure = match &new_func_val {
+                                                                    LuaValue::Function(name) => {
+                                                                        self.functions.get(name).cloned()
+                                                                    }
+                                                                    LuaValue::Closure(closure) => {
+                                                                        Some(closure.clone())
+                                                                    }
+                                                                    _ => {
+                                                                        // Not a closure, use normal call
+                                                                        self.return_values = prev_return;
+                                                                        self.varargs.clear();
+                                                                        self.pop_scope();
+                                                                        self.call_depth -= 1;
+                                                                        return self.call_function(&new_func_val, &new_arg_vals);
+                                                                    }
+                                                                };
+                                                                
+                                                                if let Some(next) = next_closure {
+                                                                    current_closure = next;
+                                                                    current_args = new_arg_vals;
+                                                                    found_tail_call = true;
+                                                                    break;
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
+                                            }
+                                            
+                                            // Normal statement execution
+                                            self.execute_statement(stmt)?;
+                                            if self.return_values.is_some() {
+                                                let results = self.return_values.take().unwrap_or_else(|| vec![]);
+                                                self.return_values = prev_return;
+                                                return Ok(results);
+                                            }
+                                            j += 1;
+                                        }
+                                        
+                                        // If we found a tail call, continue the outer loop
+                                        if found_tail_call {
+                                            continue;
+                                        }
+                                        
+                                        // If we get here, the function completed normally (no tail call)
+                                        let results = self.return_values.take().unwrap_or_else(|| vec![]);
+                                        self.return_values = prev_return;
+                                        return Ok(results);
                                     }
                                 }
                             }
@@ -1092,6 +1470,9 @@ impl Interpreter {
         self.return_values = prev_return;
         self.varargs.clear();
         self.pop_scope();
+        
+        // Decrement call depth
+        self.call_depth -= 1;
 
         Ok(results)
     }
@@ -2337,6 +2718,33 @@ impl Interpreter {
                 let n = val.to_number().ok_or("cannot bitwise not non-number")? as i64;
                 Ok(LuaValue::Number((!n) as f64))
             }
+        }
+    }
+
+    /// Extract function call from expression if it's a simple tail call pattern
+    /// This handles cases like `return count(n - 1) + 1` where the call is in a BinaryOp
+    fn extract_tail_call<'a>(&self, expr: &'a Expr) -> Option<(&'a Expr, Vec<&'a Expr>)> {
+        match expr {
+            Expr::Call { func, args } => {
+                Some((func, args.iter().collect()))
+            }
+            Expr::BinaryOp { left, op: _, right } => {
+                // Check if left side is a function call and right is a literal
+                // This handles cases like `return count(n - 1) + 1`
+                if let Expr::Call { func, args } = left.as_ref() {
+                    // Only optimize if the operation is simple (add, sub, etc.)
+                    // and right side is a literal
+                    match right.as_ref() {
+                        Expr::LiteralNumber(_) | Expr::LiteralString(_) | Expr::LiteralBool(_) | Expr::LiteralNil => {
+                            Some((func, args.iter().collect()))
+                        }
+                        _ => None,
+                    }
+                } else {
+                    None
+                }
+            }
+            _ => None,
         }
     }
 

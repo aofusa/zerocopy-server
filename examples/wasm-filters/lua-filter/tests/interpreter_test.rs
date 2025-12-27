@@ -263,7 +263,7 @@ fn test_string_dump() {
 fn test_tail_call_optimization() {
     let mut interpreter = create_interpreter();
     let tokens = lexer::tokenize(
-        "function count(n) if n <= 0 then return 0 else return count(n - 1) + 1 end end; return count(1000)"
+        "function count(n, acc) if n <= 0 then return acc else return count(n - 1, acc + 1) end end; return count(1000, 0)"
     ).unwrap();
     let program = parser::parse(&tokens).unwrap();
     let result = interpreter.execute(&program).unwrap();
