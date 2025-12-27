@@ -19,6 +19,10 @@ impl Upvalue {
         }
     }
 
+    /// Get the current value of this upvalue
+    ///
+    /// Returns a clone of the current value stored in this upvalue.
+    #[allow(dead_code)] // Public API for future use
     pub fn get(&self) -> LuaValue {
         self.value.borrow().clone()
     }
@@ -135,6 +139,7 @@ pub enum LuaValue {
     Number(f64),
     String(String),
     Table(LuaTable),
+    #[allow(dead_code)] // Reserved for future use
     Function(String), // Named function reference
     Closure(Rc<Closure>), // Closure with captured environment
     NativeFunction(String), // Built-in function name
@@ -205,6 +210,9 @@ impl LuaValue {
     }
 
     /// Get table data if this is a table
+    ///
+    /// Returns a reference to the table if this value is a table, otherwise returns None.
+    #[allow(dead_code)] // Public API for future use
     pub fn as_table(&self) -> Option<&LuaTable> {
         match self {
             LuaValue::Table(t) => Some(t),
@@ -213,6 +221,9 @@ impl LuaValue {
     }
 
     /// Get mutable table data if this is a table
+    ///
+    /// Returns a mutable reference to the table if this value is a table, otherwise returns None.
+    #[allow(dead_code)] // Public API for future use
     pub fn as_table_mut(&mut self) -> Option<&mut LuaTable> {
         match self {
             LuaValue::Table(t) => Some(t),
@@ -239,40 +250,4 @@ impl PartialEq for LuaValue {
     }
 }
 
-/// Multiple return values
-#[derive(Clone, Debug, Default)]
-pub struct MultiValue {
-    pub values: Vec<LuaValue>,
-}
-
-impl MultiValue {
-    pub fn new() -> Self {
-        Self { values: Vec::new() }
-    }
-
-    pub fn single(value: LuaValue) -> Self {
-        Self {
-            values: vec![value],
-        }
-    }
-
-    pub fn multiple(values: Vec<LuaValue>) -> Self {
-        Self { values }
-    }
-
-    pub fn first(&self) -> LuaValue {
-        self.values.first().cloned().unwrap_or(LuaValue::Nil)
-    }
-
-    pub fn get(&self, index: usize) -> LuaValue {
-        self.values.get(index).cloned().unwrap_or(LuaValue::Nil)
-    }
-
-    pub fn len(&self) -> usize {
-        self.values.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.values.is_empty()
-    }
-}
+// MultiValue struct removed - multiple return values are now handled directly as Vec<LuaValue>

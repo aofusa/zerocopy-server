@@ -420,8 +420,8 @@ fn try_match(
                 match quantifier {
                     Quantifier::ZeroOrMore => {
                         // Greedy: match as many as possible
-                        let mut matched = 0;
-                        while let Some(_) = match_single(chars, pos + matched, inner) {
+                        let mut matched: i32 = 0;
+                        while let Some(_) = match_single(chars, pos + matched as usize, inner) {
                             matched += 1;
                         }
                         // Try rest of pattern with decreasing matches

@@ -101,6 +101,11 @@ pub struct Interpreter {
 }
 
 impl Interpreter {
+    /// Create a new interpreter with default shared state
+    ///
+    /// This creates a new interpreter instance with a default shared state.
+    /// For Proxy-WASM usage, prefer `with_state` to share state across contexts.
+    #[allow(dead_code)] // Public API for future use
     pub fn new() -> Self {
         let state = Rc::new(RefCell::new(SharedState::default()));
         Self::with_state(state)
@@ -501,7 +506,7 @@ impl Interpreter {
                     i = target_idx;
                     self.goto_target = None;
                 } else {
-                    return Err(format!("Label '{}' not found", target));
+                    return Err(format!("Label '{}' not found in current scope", target));
                 }
             }
 
@@ -563,7 +568,7 @@ impl Interpreter {
                                 .map(|c| LuaValue::String(c.to_string()))
                                 .ok_or_else(|| "index out of range".to_string())
                         } else {
-                            Err("Invalid string index".to_string())
+                            Err(format!("Invalid string index: expected positive integer, got {}", key.type_name()))
                         }
                     }
                     _ => Ok(LuaValue::Nil),
@@ -665,13 +670,35 @@ impl Interpreter {
         upvalues
     }
 
+    /// Call a function with the given arguments
+    ///
+    /// This method handles multiple types of callable values:
+    /// - Named functions (LuaValue::Function): Looks up the function in the function registry
+    /// - Closures (LuaValue::Closure): Calls the closure directly
+    /// - Native functions (LuaValue::NativeFunction): Calls built-in functions
+    /// - Tables with __call metamethod: Calls the metamethod
+    ///
+    /// # Arguments
+    /// * `func` - The function to call
+    /// * `args` - Arguments to pass to the function
+    ///
+    /// # Returns
+    /// * `Ok(Vec<LuaValue>)` - Multiple return values (Lua supports multiple returns)
+    /// * `Err(String)` - Error message if the function cannot be called or execution fails
     fn call_function(&mut self, func: &LuaValue, args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
         match func {
             LuaValue::Function(name) => {
                 if let Some(closure) = self.functions.get(name).cloned() {
                     self.call_closure(&closure, args)
                 } else {
-                    Err(format!("Function not found: {}", name))
+                    // Collect available function names for better error message
+                    let available: Vec<String> = self.functions.keys().cloned().collect();
+                    let available_str = if available.is_empty() {
+                        "none".to_string()
+                    } else {
+                        available.join(", ")
+                    };
+                    Err(format!("Function '{}' not found. Available functions: {}", name, available_str))
                 }
             }
 
@@ -694,13 +721,27 @@ impl Interpreter {
                         return self.call_function(call, &call_args);
                     }
                 }
-                Err("Cannot call table without __call metamethod".to_string())
+                Err("Cannot call table: no __call metamethod defined".to_string())
             },
 
-            _ => Err(format!("Cannot call {:?}", func)),
+            _ => Err(format!("Cannot call value of type {}: expected function or table with __call metamethod", func.type_name())),
         }
     }
     
+    /// Get a value from a table, checking metatable if needed
+    ///
+    /// This method implements Lua's table access semantics:
+    /// 1. First checks if the key exists directly in the table
+    /// 2. If not found, checks for __index metamethod
+    /// 3. If __index is a table, recursively looks up in that table
+    /// 4. If __index is a function, calls it with (table, key) as arguments
+    ///
+    /// # Arguments
+    /// * `table` - The table to access
+    /// * `key` - The key to look up
+    ///
+    /// # Returns
+    /// The value associated with the key, or Nil if not found
     fn table_get(&mut self, table: &LuaTable, key: &str) -> LuaValue {
         // First try direct access
         if let Some(v) = table.get(key) {
@@ -983,7 +1024,13 @@ impl Interpreter {
 
             "pcall" => {
                 // pcall(func, ...) - protected call
+                // 
+                // Safely calls a function and catches any errors. This is Lua's standard
+                // error handling mechanism. Unlike regular function calls, pcall never
+                // throws an error - instead it returns a status code and results.
+                //
                 // Returns: (true, result...) on success, (false, error_msg) on failure
+                // The results are returned as a table with numeric keys starting from 1
                 let func = args.first().cloned().unwrap_or(LuaValue::Nil);
                 let func_args = &args[1..];
                 
@@ -1252,6 +1299,14 @@ impl Interpreter {
 
             "gmatch" => {
                 // string.gmatch(s, pattern) - returns an iterator function
+                //
+                // This function returns an iterator that can be used in a generic for loop
+                // to iterate over all matches of a pattern in a string. The iterator
+                // function is called repeatedly, returning the next match each time.
+                //
+                // Implementation note: We pre-compute all matches and store them in a
+                // closure's upvalues. This is simpler than implementing a true iterator
+                // but uses more memory for large strings.
                 let s = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
                 let pat = args.get(1).map(|v| v.to_lua_string()).unwrap_or_default();
                 
@@ -1567,7 +1622,7 @@ impl Interpreter {
                 // table.move(a1, f, e, t[, a2])
                 // Move elements from a1[f..e] to a2[t..] (or a1[t..] if a2 is nil)
                 if args.len() < 4 {
-                    return Err("table.move requires at least 4 arguments".to_string());
+                    return Err(format!("table.move requires at least 4 arguments (got {})", args.len()));
                 }
                 
                 let a1 = args.get(0);
@@ -1600,7 +1655,7 @@ impl Interpreter {
                     // Return the target table
                     Ok(LuaValue::Table(target))
                 } else {
-                    Err("table.move: first argument must be a table".to_string())
+                    Err(format!("table.move: first argument must be a table, got {}", a1.map(|v| v.type_name()).unwrap_or("nil")))
                 }
             }
             
@@ -1779,7 +1834,7 @@ impl Interpreter {
             UnaryOperator::Len => match val {
                 LuaValue::String(s) => Ok(LuaValue::Number(s.len() as f64)),
                 LuaValue::Table(t) => Ok(LuaValue::Number(t.len() as f64)),
-                _ => Err("cannot get length of non-string/table".to_string()),
+                _ => Err(format!("cannot get length of {}: expected string or table", val.type_name())),
             },
             UnaryOperator::BNot => {
                 let n = val.to_number().ok_or("cannot bitwise not non-number")? as i64;

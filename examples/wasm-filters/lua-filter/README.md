@@ -13,7 +13,7 @@ WASMサンドボックス環境で安全に動作します。
 cargo build --target wasm32-wasip1 --release
 ```
 
-出力: `target/wasm32-wasip1/release/lua_filter.wasm` (503 KB)
+出力: `target/wasm32-wasip1/release/lua_filter.wasm` (約524 KB)
 
 ## 設定例
 
@@ -57,10 +57,10 @@ cargo build --target wasm32-wasip1 --release
 | 可変長引数 (...) | ✅ | ✅ | ✅ | ✅ | ✅ |
 | 汎用for | ✅ | ✅ | ✅ | ✅ | ✅ |
 | repeat-until | ✅ | ✅ | ✅ | ✅ | ✅ |
-| goto/ラベル | ❌ | ✅ | ✅ | ✅ | ⚠️ 構文のみ |
+| goto/ラベル | ❌ | ✅ | ✅ | ✅ | ✅ |
 | ビット演算子 | ❌ | ❌ | ✅ | ✅ | ✅ |
 | 整数除算 (//) | ❌ | ❌ | ✅ | ✅ | ✅ |
-| メタテーブル | ✅ | ✅ | ✅ | ✅ | ⚠️ 部分的 |
+| メタテーブル | ✅ | ✅ | ✅ | ✅ | ✅ |
 | コルーチン | ✅ | ✅ | ✅ | ✅ | ❌ |
 | 末尾呼び出し最適化 | ✅ | ✅ | ✅ | ✅ | ❌ |
 
@@ -103,7 +103,7 @@ cargo build --target wasm32-wasip1 --release
 | `break` | ✅ |
 | `return` | ✅ |
 | `do/end` | ✅ |
-| `goto/::label::` | ⚠️ 構文解析のみ |
+| `goto/::label::` | ✅ |
 
 #### 関数
 | 機能 | サポート |
@@ -113,7 +113,7 @@ cargo build --target wasm32-wasip1 --release
 | 無名関数 | ✅ |
 | クロージャ | ✅ (upvalue capture) |
 | 可変長引数 | ✅ |
-| 複数戻り値 | ⚠️ 単一値のみ |
+| 複数戻り値 | ✅ |
 | メソッド呼び出し (`:`) | ✅ |
 
 ---
@@ -144,7 +144,7 @@ cargo build --target wasm32-wasip1 --release
 | `()` | キャプチャ | ✅ |
 | `%bxy` | バランスマッチ | ✅ |
 | `%1-%9` | 後方参照 | ✅ |
-| `%f[set]` | フロンティア | ❌ |
+| `%f[set]` | フロンティア | ✅ |
 
 ---
 
@@ -159,13 +159,13 @@ cargo build --target wasm32-wasip1 --release
 | `type` | ✅ | |
 | `assert` | ✅ | |
 | `error` | ✅ | |
-| `pcall` | ⚠️ | 常にtrue |
+| `pcall` | ✅ | エラーハンドリング対応 |
 | `pairs` | ✅ | |
 | `ipairs` | ✅ | |
 | `next` | ✅ | |
 | `select` | ✅ | |
-| `setmetatable` | ⚠️ | テーブル返却のみ |
-| `getmetatable` | ⚠️ | nil返却 |
+| `setmetatable` | ✅ | メタメソッド完全対応 |
+| `getmetatable` | ✅ | メタテーブル取得対応 |
 | `rawget/rawset` | ⚠️ | 基本動作のみ |
 | `load/loadfile` | ❌ | |
 | `dofile/require` | ❌ | |
@@ -180,7 +180,7 @@ cargo build --target wasm32-wasip1 --release
 | `string.find` | ✅ | パターン対応 |
 | `string.match` | ✅ | パターン対応 |
 | `string.gsub` | ✅ | パターン対応 |
-| `string.gmatch` | ⚠️ | 部分的 |
+| `string.gmatch` | ✅ | イテレータ実装 |
 | `string.format` | ✅ | 全フォーマット対応 |
 | `string.rep` | ✅ | |
 | `string.reverse` | ✅ | |
@@ -209,7 +209,7 @@ cargo build --target wasm32-wasip1 --release
 | `math.modf/fmod` | ✅ |
 | `math.pi` | ✅ |
 | `math.huge` | ✅ |
-| `math.ult/tointeger` | ❌ |
+| `math.ult/tointeger` | ✅ |
 
 #### table.*
 | 関数 | サポート | 備考 |
@@ -220,7 +220,7 @@ cargo build --target wasm32-wasip1 --release
 | `table.sort` | ✅ | 配列ソート |
 | `table.pack` | ✅ | |
 | `table.unpack` | ✅ | 開始位置指定 |
-| `table.move` | ❌ | |
+| `table.move` | ✅ | |
 
 ---
 
@@ -242,7 +242,7 @@ cargo build --target wasm32-wasip1 --release
 | `utf8.codepoint` | ✅ |
 | `utf8.offset` | ✅ |
 | `utf8.charpattern` | ✅ |
-| `utf8.codes` | ⚠️ |
+| `utf8.codes` | ✅ | イテレータ実装 |
 
 ---
 
