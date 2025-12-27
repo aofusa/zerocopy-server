@@ -62,7 +62,7 @@ cargo build --target wasm32-wasip1 --release
 | 整数除算 (//) | ❌ | ❌ | ✅ | ✅ | ✅ |
 | メタテーブル | ✅ | ✅ | ✅ | ✅ | ✅ |
 | コルーチン | ✅ | ✅ | ✅ | ✅ | ❌ |
-| 末尾呼び出し最適化 | ✅ | ✅ | ✅ | ✅ | ❌ |
+| 末尾呼び出し最適化 | ✅ | ✅ | ✅ | ✅ | ✅ |
 
 ---
 
@@ -187,7 +187,7 @@ cargo build --target wasm32-wasip1 --release
 | `string.byte` | ✅ | |
 | `string.char` | ✅ | |
 | `string.dump` | ❌ | |
-| `string.pack/unpack` | ❌ | |
+| `string.pack/unpack` | ✅ | エンディアン指定対応 |
 
 #### math.*
 | 関数 | サポート |
@@ -284,10 +284,10 @@ end
 
 | コンポーネント | ファイル | 行数 |
 |---------------|---------|------|
-| 字句解析 | `src/lua/lexer.rs` | ~400 |
-| 構文解析 | `src/lua/parser.rs` | ~750 |
-| AST | `src/lua/ast.rs` | ~200 |
+| 字句解析 | `src/lua/lexer.rs` | ~390 |
+| 構文解析 | `src/lua/parser.rs` | ~860 |
+| AST | `src/lua/ast.rs` | ~220 |
 | 値型 | `src/lua/value.rs` | ~260 |
-| パターン | `src/lua/pattern.rs` | ~550 |
-| インタープリタ | `src/lua/interpreter.rs` | ~1,280 |
-| **合計** | | **~3,440** |
+| パターン | `src/lua/pattern.rs` | ~770 |
+| インタープリタ | `src/lua/interpreter.rs` | ~3,460 |
+| **合計** | | **~6,280** |
