@@ -3,6 +3,8 @@
 use crate::lua::ast::*;
 use crate::lua::pattern;
 use crate::lua::value::{Closure, LuaTable, LuaValue, Metatable, Upvalue};
+use crate::lua::lexer;
+use crate::lua::parser;
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -98,6 +100,12 @@ pub struct Interpreter {
     
     /// Goto target label (for goto statement)
     goto_target: Option<String>,
+    
+    /// Random number generator state
+    random_state: u64,
+    
+    /// Module registry for require()
+    modules: HashMap<String, LuaValue>,
 }
 
 impl Interpreter {
@@ -118,7 +126,7 @@ impl Interpreter {
         for name in &[
             "print", "tostring", "tonumber", "type", "error", "assert", "pcall",
             "pairs", "ipairs", "next", "select", "unpack", "setmetatable", "getmetatable",
-            "rawget", "rawset", "rawequal",
+            "rawget", "rawset", "rawequal", "load", "require",
         ] {
             globals.insert(name.to_string(), LuaValue::NativeFunction(name.to_string()));
         }
@@ -127,7 +135,7 @@ impl Interpreter {
         let mut string_table = LuaTable::new();
         for name in &[
             "len", "sub", "upper", "lower", "find", "match", "gmatch", "gsub",
-            "format", "rep", "reverse", "byte", "char", "split",
+            "format", "rep", "reverse", "byte", "char", "split", "pack", "unpack", "dump",
         ] {
             string_table.set(
                 name.to_string(),
@@ -205,7 +213,14 @@ impl Interpreter {
             return_values: None,
             varargs: Vec::new(),
             goto_target: None,
+            random_state: 0,
+            modules: HashMap::new(),
         }
+    }
+    
+    /// Register a module for require()
+    pub fn register_module(&mut self, name: String, module: LuaValue) {
+        self.modules.insert(name, module);
     }
 
     pub fn execute(&mut self, program: &Program) -> Result<LuaValue, String> {
@@ -843,11 +858,41 @@ impl Interpreter {
 
         let prev_return = self.return_values.take();
 
-        for stmt in &closure.body {
+        // Execute statements with tail call optimization
+        let mut i = 0;
+        while i < closure.body.len() {
+            let stmt = &closure.body[i];
+            
+            // Check if this is a tail call (last statement is return with single function call)
+            if i == closure.body.len() - 1 {
+                if let Stmt::Return(return_values) = stmt {
+                    if return_values.len() == 1 {
+                        if let Expr::Call { func, args: call_args } = &return_values[0] {
+                            // Tail call detected - evaluate and call without recursion
+                            let func_val = self.evaluate(func)?;
+                            let arg_vals: Vec<LuaValue> = call_args
+                                .iter()
+                                .map(|a| self.evaluate(a))
+                                .collect::<Result<_, _>>()?;
+                            
+                            // Pop scope before tail call to avoid stack buildup
+                            self.return_values = prev_return;
+                            self.varargs.clear();
+                            self.pop_scope();
+                            
+                            // Make tail call (this will reuse the call stack)
+                            return self.call_function(&func_val, &arg_vals);
+                        }
+                    }
+                }
+            }
+            
+            // Normal statement execution
             self.execute_statement(stmt)?;
             if self.return_values.is_some() {
                 break;
             }
+            i += 1;
         }
 
         let results = self.return_values.take()
@@ -1195,17 +1240,32 @@ impl Interpreter {
             }
 
             "rawget" => {
+                if args.len() < 2 {
+                    return Err("rawget requires 2 arguments (table, key)".to_string());
+                }
                 if let (Some(LuaValue::Table(t)), Some(key)) = (args.first(), args.get(1)) {
                     let key_str = key.to_lua_string();
                     Ok(t.get(&key_str).cloned().unwrap_or(LuaValue::Nil))
                 } else {
-                    Ok(LuaValue::Nil)
+                    Err(format!("rawget: first argument must be a table, got {}", 
+                        args.first().map(|v| v.type_name()).unwrap_or("nil")))
                 }
             }
 
             "rawset" => {
-                // Return the table
-                Ok(args.first().cloned().unwrap_or(LuaValue::Nil))
+                if args.len() < 3 {
+                    return Err("rawset requires 3 arguments (table, key, value)".to_string());
+                }
+                if let (Some(LuaValue::Table(t)), Some(key), Some(value)) = 
+                    (args.first(), args.get(1), args.get(2)) {
+                    let mut t = t.clone();
+                    let key_str = key.to_lua_string();
+                    t.set(key_str, value.clone());
+                    Ok(LuaValue::Table(t))  // Return the table (Lua standard)
+                } else {
+                    Err(format!("rawset: first argument must be a table, got {}", 
+                        args.first().map(|v| v.type_name()).unwrap_or("nil")))
+                }
             }
 
             "rawequal" => {
@@ -1225,11 +1285,96 @@ impl Interpreter {
                 }
             }
 
+            "load" => {
+                if args.is_empty() {
+                    return Err("load requires at least 1 argument (chunk)".to_string());
+                }
+                
+                let chunk = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
+                let chunkname = args.get(1)
+                    .map(|v| v.to_lua_string())
+                    .unwrap_or_else(|| "=(load)".to_string());
+                let mode = args.get(2).map(|v| v.to_lua_string());
+                
+                // Mode check (currently only "t" is supported)
+                if let Some(ref m) = mode {
+                    if m != "t" {
+                        return Err(format!("load: unsupported mode '{}' (only 't' supported)", m));
+                    }
+                }
+                
+                // Tokenize and parse
+                match lexer::tokenize(&chunk) {
+                    Ok(tokens) => {
+                        match parser::parse(&tokens) {
+                            Ok(program) => {
+                                // Convert program to closure
+                                let closure = Rc::new(Closure::new(
+                                    Some(chunkname),
+                                    vec![],
+                                    false,
+                                    program.statements,
+                                    HashMap::new(),
+                                ));
+                                Ok(LuaValue::Closure(closure))
+                            }
+                            Err(e) => {
+                                // Return error (Lua's load returns error)
+                                let mut result = LuaTable::new();
+                                result.set("1".to_string(), LuaValue::Nil);
+                                result.set("2".to_string(), LuaValue::String(e));
+                                Ok(LuaValue::Table(result))
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        let mut result = LuaTable::new();
+                        result.set("1".to_string(), LuaValue::Nil);
+                        result.set("2".to_string(), LuaValue::String(e));
+                        Ok(LuaValue::Table(result))
+                    }
+                }
+            }
+
+            "require" => {
+                if args.is_empty() {
+                    return Err("require requires 1 argument (modname)".to_string());
+                }
+                
+                let modname = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
+                
+                // Search in module table
+                if let Some(module) = self.modules.get(&modname) {
+                    Ok(module.clone())
+                } else {
+                    Err(format!("module '{}' not found", modname))
+                }
+            }
+
+            "newuserdata" => {
+                // Create a userdata (implemented as table with special metatable)
+                // newuserdata([data]) - creates a userdata with optional initial data
+                let mut table = LuaTable::new();
+                
+                // Set initial data if provided
+                if let Some(data) = args.first() {
+                    table.set("_data".to_string(), data.clone());
+                }
+                
+                // Set special metatable to mark as userdata
+                // Userdata is implemented as a table with a special metatable
+                // The metatable can be used to store type information and methods
+                let mt = Metatable::default();
+                table.metatable = Some(Box::new(mt));
+                
+                Ok(LuaValue::Table(table))
+            }
+
             _ => Err(format!("Unknown function: {}", name)),
         }
     }
 
-    fn call_string_method(&self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
+    fn call_string_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
         match method {
             "len" => {
                 let s = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
@@ -1401,11 +1546,38 @@ impl Interpreter {
                 Ok(LuaValue::Table(table))
             }
 
+            "pack" => {
+                self.string_pack(args)
+            }
+
+            "unpack" => {
+                self.string_unpack(args)
+            }
+
+            "dump" => {
+                if args.is_empty() {
+                    return Err("string.dump requires 1 argument (function)".to_string());
+                }
+                
+                if let Some(LuaValue::Closure(closure)) = args.first() {
+                    if let Some(name) = &closure.name {
+                        Ok(LuaValue::String(format!("function:{}", name)))
+                    } else {
+                        Ok(LuaValue::String("function:anonymous".to_string()))
+                    }
+                } else if let Some(LuaValue::Function(name)) = args.first() {
+                    Ok(LuaValue::String(format!("function:{}", name)))
+                } else {
+                    Err(format!("string.dump: argument must be a function, got {}", 
+                        args.first().map(|v| v.type_name()).unwrap_or("nil")))
+                }
+            }
+
             _ => Err(format!("Unknown string method: {}", method)),
         }
     }
 
-    fn call_math_method(&self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
+    fn call_math_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
         let get_num = |idx: usize| args.get(idx).and_then(|v| v.to_number());
         
         match method {
@@ -1439,13 +1611,20 @@ impl Interpreter {
                 Ok(LuaValue::Number(min))
             }
             "random" => {
-                // Simple pseudo-random (not cryptographically secure)
-                use std::time::{SystemTime, UNIX_EPOCH};
-                let seed = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                let val = ((seed % 1000000) as f64) / 1000000.0;
+                // Linear congruential generator (LCG)
+                // X_{n+1} = (a * X_n + c) mod m
+                // a = 1664525, c = 1013904223, m = 2^32
+                if self.random_state == 0 {
+                    // Initialize with current time if not seeded
+                    use std::time::{SystemTime, UNIX_EPOCH};
+                    self.random_state = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .map(|d| d.as_nanos() as u64)
+                        .unwrap_or(12345);
+                }
+                self.random_state = self.random_state.wrapping_mul(1664525)
+                    .wrapping_add(1013904223);
+                let val = (self.random_state as f64) / (u32::MAX as f64);
                 
                 match (get_num(0), get_num(1)) {
                     (None, None) => Ok(LuaValue::Number(val)),
@@ -1454,7 +1633,21 @@ impl Interpreter {
                     (None, Some(n)) => Ok(LuaValue::Number((val * n).floor() + 1.0)),
                 }
             }
-            "randomseed" => Ok(LuaValue::Nil),
+            "randomseed" => {
+                let seed = args.first()
+                    .and_then(|v| v.to_number())
+                    .map(|n| n as u64)
+                    .unwrap_or_else(|| {
+                        // Default: use current time
+                        use std::time::{SystemTime, UNIX_EPOCH};
+                        SystemTime::now()
+                            .duration_since(UNIX_EPOCH)
+                            .map(|d| d.as_nanos() as u64)
+                            .unwrap_or(12345)
+                    });
+                self.random_state = seed;
+                Ok(LuaValue::Nil)
+            }
             "deg" => Ok(LuaValue::Number(get_num(0).unwrap_or(0.0).to_degrees())),
             "rad" => Ok(LuaValue::Number(get_num(0).unwrap_or(0.0).to_radians())),
             "modf" => {
@@ -2151,5 +2344,336 @@ impl Interpreter {
             _ => Err(format!("Unknown utf8 method: {}", method)),
         }
     }
+
+    /// string.pack implementation
+    fn string_pack(&self, args: &[LuaValue]) -> Result<LuaValue, String> {
+        if args.len() < 2 {
+            return Err("string.pack requires at least 2 arguments (fmt, ...)".to_string());
+        }
+
+        let fmt = args[0].to_lua_string();
+        let values = &args[1..];
+        let mut result = Vec::<u8>::new();
+        let mut value_idx = 0;
+        let mut endian = Endian::Native;
+
+        let chars: Vec<char> = fmt.chars().collect();
+        let mut i = 0;
+        while i < chars.len() {
+            match chars[i] {
+                '>' => {
+                    endian = Endian::Big;
+                    i += 1;
+                    continue;
+                }
+                '<' => {
+                    endian = Endian::Little;
+                    i += 1;
+                    continue;
+                }
+                '=' => {
+                    endian = Endian::Native;
+                    i += 1;
+                    continue;
+                }
+                'b' => {
+                    if value_idx >= values.len() {
+                        return Err("string.pack: not enough values".to_string());
+                    }
+                    let val = values[value_idx].to_number()
+                        .ok_or_else(|| format!("string.pack: value {} must be a number", value_idx + 1))?;
+                    result.push(val as i8 as u8);
+                    value_idx += 1;
+                }
+                'B' => {
+                    if value_idx >= values.len() {
+                        return Err("string.pack: not enough values".to_string());
+                    }
+                    let val = values[value_idx].to_number()
+                        .ok_or_else(|| format!("string.pack: value {} must be a number", value_idx + 1))?;
+                    result.push(val as u8);
+                    value_idx += 1;
+                }
+                'h' | 'H' => {
+                    if value_idx >= values.len() {
+                        return Err("string.pack: not enough values".to_string());
+                    }
+                    let val = values[value_idx].to_number()
+                        .ok_or_else(|| format!("string.pack: value {} must be a number", value_idx + 1))? as u16;
+                    let bytes = match endian {
+                        Endian::Big => val.to_be_bytes(),
+                        Endian::Little | Endian::Native => val.to_le_bytes(),
+                    };
+                    result.extend_from_slice(&bytes);
+                    value_idx += 1;
+                }
+                'i' | 'I' => {
+                    if value_idx >= values.len() {
+                        return Err("string.pack: not enough values".to_string());
+                    }
+                    let val = values[value_idx].to_number()
+                        .ok_or_else(|| format!("string.pack: value {} must be a number", value_idx + 1))? as u32;
+                    let bytes = match endian {
+                        Endian::Big => val.to_be_bytes(),
+                        Endian::Little | Endian::Native => val.to_le_bytes(),
+                    };
+                    result.extend_from_slice(&bytes);
+                    value_idx += 1;
+                }
+                'l' | 'L' => {
+                    if value_idx >= values.len() {
+                        return Err("string.pack: not enough values".to_string());
+                    }
+                    let val = values[value_idx].to_number()
+                        .ok_or_else(|| format!("string.pack: value {} must be a number", value_idx + 1))? as u64;
+                    let bytes = match endian {
+                        Endian::Big => val.to_be_bytes(),
+                        Endian::Little | Endian::Native => val.to_le_bytes(),
+                    };
+                    result.extend_from_slice(&bytes);
+                    value_idx += 1;
+                }
+                'f' => {
+                    if value_idx >= values.len() {
+                        return Err("string.pack: not enough values".to_string());
+                    }
+                    let val = values[value_idx].to_number()
+                        .ok_or_else(|| format!("string.pack: value {} must be a number", value_idx + 1))? as f32;
+                    let bytes = match endian {
+                        Endian::Big => val.to_be_bytes(),
+                        Endian::Little | Endian::Native => val.to_le_bytes(),
+                    };
+                    result.extend_from_slice(&bytes);
+                    value_idx += 1;
+                }
+                'd' => {
+                    if value_idx >= values.len() {
+                        return Err("string.pack: not enough values".to_string());
+                    }
+                    let val = values[value_idx].to_number()
+                        .ok_or_else(|| format!("string.pack: value {} must be a number", value_idx + 1))?;
+                    let bytes = match endian {
+                        Endian::Big => val.to_be_bytes(),
+                        Endian::Little | Endian::Native => val.to_le_bytes(),
+                    };
+                    result.extend_from_slice(&bytes);
+                    value_idx += 1;
+                }
+                's' | 'z' => {
+                    if value_idx >= values.len() {
+                        return Err("string.pack: not enough values".to_string());
+                    }
+                    let s = values[value_idx].to_lua_string();
+                    result.extend_from_slice(s.as_bytes());
+                    if chars[i] == 'z' {
+                        result.push(0);
+                    }
+                    value_idx += 1;
+                }
+                'c' => {
+                    i += 1;
+                    let mut n = 0;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        n = n * 10 + chars[i].to_digit(10).unwrap_or(0) as usize;
+                        i += 1;
+                    }
+                    i -= 1;
+                    if value_idx >= values.len() {
+                        return Err("string.pack: not enough values".to_string());
+                    }
+                    let s = values[value_idx].to_lua_string();
+                    let bytes = s.as_bytes();
+                    let len = n.min(bytes.len());
+                    result.extend_from_slice(&bytes[..len]);
+                    if len < n {
+                        result.extend(vec![0; n - len]);
+                    }
+                    value_idx += 1;
+                }
+                'x' => {
+                    result.push(0);
+                }
+                _ => {
+                    return Err(format!("string.pack: unknown format specifier '{}'", chars[i]));
+                }
+            }
+            i += 1;
+        }
+
+        Ok(LuaValue::String(String::from_utf8_lossy(&result).to_string()))
+    }
+
+    /// string.unpack implementation
+    fn string_unpack(&self, args: &[LuaValue]) -> Result<LuaValue, String> {
+        if args.len() < 2 {
+            return Err("string.unpack requires at least 2 arguments (fmt, data)".to_string());
+        }
+
+        let fmt = args[0].to_lua_string();
+        let data = args[1].to_lua_string();
+        let start_pos = args.get(2)
+            .and_then(|v| v.to_number())
+            .map(|n| (n as usize).saturating_sub(1))
+            .unwrap_or(0);
+
+        let bytes = data.as_bytes();
+        if start_pos >= bytes.len() {
+            return Err(format!("string.unpack: start position {} out of range", start_pos + 1));
+        }
+
+        let mut result = Vec::<LuaValue>::new();
+        let mut pos = start_pos;
+        let mut endian = Endian::Native;
+
+        let chars: Vec<char> = fmt.chars().collect();
+        let mut i = 0;
+        while i < chars.len() && pos < bytes.len() {
+            match chars[i] {
+                '>' => {
+                    endian = Endian::Big;
+                    i += 1;
+                    continue;
+                }
+                '<' => {
+                    endian = Endian::Little;
+                    i += 1;
+                    continue;
+                }
+                '=' => {
+                    endian = Endian::Native;
+                    i += 1;
+                    continue;
+                }
+                'b' => {
+                    if pos >= bytes.len() {
+                        break;
+                    }
+                    result.push(LuaValue::Number(bytes[pos] as i8 as f64));
+                    pos += 1;
+                }
+                'B' => {
+                    if pos >= bytes.len() {
+                        break;
+                    }
+                    result.push(LuaValue::Number(bytes[pos] as f64));
+                    pos += 1;
+                }
+                'h' | 'H' => {
+                    if pos + 1 >= bytes.len() {
+                        break;
+                    }
+                    let val = match endian {
+                        Endian::Big => u16::from_be_bytes([bytes[pos], bytes[pos + 1]]),
+                        Endian::Little | Endian::Native => u16::from_le_bytes([bytes[pos], bytes[pos + 1]]),
+                    };
+                    result.push(LuaValue::Number(if chars[i] == 'h' { val as i16 as f64 } else { val as f64 }));
+                    pos += 2;
+                }
+                'i' | 'I' => {
+                    if pos + 3 >= bytes.len() {
+                        break;
+                    }
+                    let val = match endian {
+                        Endian::Big => u32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]),
+                        Endian::Little | Endian::Native => u32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]),
+                    };
+                    result.push(LuaValue::Number(if chars[i] == 'i' { val as i32 as f64 } else { val as f64 }));
+                    pos += 4;
+                }
+                'l' | 'L' => {
+                    if pos + 7 >= bytes.len() {
+                        break;
+                    }
+                    let val = match endian {
+                        Endian::Big => u64::from_be_bytes([
+                            bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
+                            bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7],
+                        ]),
+                        Endian::Little | Endian::Native => u64::from_le_bytes([
+                            bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
+                            bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7],
+                        ]),
+                    };
+                    result.push(LuaValue::Number(if chars[i] == 'l' { val as i64 as f64 } else { val as f64 }));
+                    pos += 8;
+                }
+                'f' => {
+                    if pos + 3 >= bytes.len() {
+                        break;
+                    }
+                    let val = match endian {
+                        Endian::Big => f32::from_be_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]),
+                        Endian::Little | Endian::Native => f32::from_le_bytes([bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3]]),
+                    };
+                    result.push(LuaValue::Number(val as f64));
+                    pos += 4;
+                }
+                'd' => {
+                    if pos + 7 >= bytes.len() {
+                        break;
+                    }
+                    let val = match endian {
+                        Endian::Big => f64::from_be_bytes([
+                            bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
+                            bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7],
+                        ]),
+                        Endian::Little | Endian::Native => f64::from_le_bytes([
+                            bytes[pos], bytes[pos + 1], bytes[pos + 2], bytes[pos + 3],
+                            bytes[pos + 4], bytes[pos + 5], bytes[pos + 6], bytes[pos + 7],
+                        ]),
+                    };
+                    result.push(LuaValue::Number(val));
+                    pos += 8;
+                }
+                's' | 'z' => {
+                    let start = pos;
+                    while pos < bytes.len() && (chars[i] == 's' || bytes[pos] != 0) {
+                        pos += 1;
+                    }
+                    if chars[i] == 'z' && pos < bytes.len() {
+                        pos += 1;
+                    }
+                    let s = String::from_utf8_lossy(&bytes[start..pos.min(bytes.len())]);
+                    result.push(LuaValue::String(s.to_string()));
+                }
+                'c' => {
+                    i += 1;
+                    let mut n = 0;
+                    while i < chars.len() && chars[i].is_ascii_digit() {
+                        n = n * 10 + chars[i].to_digit(10).unwrap_or(0) as usize;
+                        i += 1;
+                    }
+                    i -= 1;
+                    if pos + n > bytes.len() {
+                        n = bytes.len() - pos;
+                    }
+                    let s = String::from_utf8_lossy(&bytes[pos..pos + n]);
+                    result.push(LuaValue::String(s.to_string()));
+                    pos += n;
+                }
+                'x' => {
+                    pos += 1;
+                }
+                _ => {
+                    return Err(format!("string.unpack: unknown format specifier '{}'", chars[i]));
+                }
+            }
+            i += 1;
+        }
+
+        let mut table = LuaTable::new();
+        for (idx, val) in result.iter().enumerate() {
+            table.set((idx + 1).to_string(), val.clone());
+        }
+        table.set("n".to_string(), LuaValue::Number(result.len() as f64));
+        table.set("pos".to_string(), LuaValue::Number((pos + 1) as f64));
+        Ok(LuaValue::Table(table))
+    }
+}
+
+enum Endian {
+    Little,
+    Big,
+    Native,
 }
 
