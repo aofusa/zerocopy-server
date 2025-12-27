@@ -403,19 +403,21 @@ impl RuleEngine {
 
         for (target_name, target_value) in targets {
             let decoded = self.url_decode(target_value);
-
+            
+            // デコード前の文字列をチェック（エンコードされた攻撃パターン）
+            let mut matched_in_encoded = false;
             for rule in &self.rules {
                 // Check if rule applies to this target
                 if !rule.matches_target(target_name) {
                     continue;
                 }
                 
-                if rule.regex.is_match(&decoded) {
+                if rule.regex.is_match(target_value) {
                     let violation = Violation {
                         rule_id: rule.id.clone(),
                         category: rule.category.clone(),
                         target: target_name.clone(),
-                        matched_value: decoded.clone(),
+                        matched_value: target_value.clone(),
                         action: rule.action.clone(),
                         severity: rule.severity,
                     };
@@ -432,6 +434,43 @@ impl RuleEngine {
                     } else {
                         // Immediate mode: return first match
                         return Some(violation);
+                    }
+                    matched_in_encoded = true;
+                }
+            }
+            
+            // デコード後の文字列をチェック（デコード後の攻撃パターン）
+            // デコード前でマッチした場合はスキップ（immediate modeの場合）
+            if !matched_in_encoded || self.anomaly_scoring {
+                for rule in &self.rules {
+                    // Check if rule applies to this target
+                    if !rule.matches_target(target_name) {
+                        continue;
+                    }
+                    
+                    if rule.regex.is_match(&decoded) {
+                        let violation = Violation {
+                            rule_id: rule.id.clone(),
+                            category: rule.category.clone(),
+                            target: target_name.clone(),
+                            matched_value: decoded.clone(),
+                            action: rule.action.clone(),
+                            severity: rule.severity,
+                        };
+
+                        if self.anomaly_scoring {
+                            total_score += rule.severity.score();
+                            violations.push(violation);
+
+                            if total_score >= self.anomaly_threshold {
+                                // Return the most severe violation
+                                return violations.into_iter()
+                                    .max_by_key(|v| v.severity.score());
+                            }
+                        } else {
+                            // Immediate mode: return first match
+                            return Some(violation);
+                        }
                     }
                 }
             }
@@ -563,7 +602,8 @@ mod tests {
         };
         let engine = RuleEngine::with_config(&config);
         let mut targets = HashMap::new();
-        targets.insert("cmd".to_string(), "; cat /etc/passwd".to_string());
+        // Path Traversalルールにマッチしないように、/etc/passwdを削除
+        targets.insert("cmd".to_string(), "; cat file.txt".to_string());
 
         let result = engine.inspect(&targets);
         assert!(result.is_some(), "Command injection should be detected");
