@@ -3,7 +3,7 @@
 //! A minimal Lua 5.x subset interpreter implemented in pure Rust.
 //! No external Lua libraries used.
 
-mod ast;
+pub mod ast;
 pub mod interpreter;
 pub mod lexer;
 pub mod parser;

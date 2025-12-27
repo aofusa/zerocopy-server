@@ -369,3 +369,304 @@ fn test_closure_upvalue() {
     assert_eq!(result.to_number(), Some(30.0));
 }
 
+// 制御フローのエッジケース
+#[test]
+fn test_while_empty_loop() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize("local x = 0; while false do x = x + 1 end; return x").unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(0.0));
+}
+
+#[test]
+fn test_for_negative_step() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize("local sum = 0; for i = 10, 1, -1 do sum = sum + i end; return sum").unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(55.0));
+}
+
+#[test]
+fn test_nested_break() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local x = 0; while true do \
+         while true do \
+         x = x + 1; \
+         if x >= 5 then break end \
+         end; \
+         break \
+         end; \
+         return x"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(5.0));
+}
+
+#[test]
+fn test_loop_with_return() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local x = 0; while x < 10 do \
+         x = x + 1; \
+         if x >= 5 then return x end \
+         end; \
+         return 0"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(5.0));
+}
+
+#[test]
+fn test_repeat_until() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local x = 0; repeat x = x + 1 until x >= 5; return x"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(5.0));
+}
+
+// エラーハンドリング
+#[test]
+fn test_error_invalid_argument_type() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize("return math.abs('string')").unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    // 現在の実装では0.0を返す（エラーを返すべきか検討が必要）
+    assert_eq!(result.to_number(), Some(0.0));
+}
+
+#[test]
+fn test_table_out_of_bounds() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize("local t = {1, 2, 3}; return t[10]").unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert!(result.is_nil());
+}
+
+#[test]
+fn test_undefined_variable() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize("return undefined_var").unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert!(result.is_nil());
+}
+
+#[test]
+fn test_function_call_insufficient_args() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "function f(a, b) if b == nil then return a else return a + b end end; return f(1)"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    // 不足している引数はnilとして扱われる
+    assert_eq!(result.to_number(), Some(1.0));
+}
+
+// メタメソッドの追加テスト
+#[test]
+fn test_metatable_sub() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; \
+         local mt = {__sub = function(a, b) return 42 end}; \
+         t1 = setmetatable(t1, mt); \
+         return t1 - t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_metatable_mul() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; \
+         local mt = {__mul = function(a, b) return 42 end}; \
+         t1 = setmetatable(t1, mt); \
+         return t1 * t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_metatable_div() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; \
+         local mt = {__div = function(a, b) return 42 end}; \
+         t1 = setmetatable(t1, mt); \
+         return t1 / t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_metatable_mod() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; \
+         local mt = {__mod = function(a, b) return 42 end}; \
+         t1 = setmetatable(t1, mt); \
+         return t1 % t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_metatable_pow() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; \
+         local mt = {__pow = function(a, b) return 42 end}; \
+         t1 = setmetatable(t1, mt); \
+         return t1 ^ t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_metatable_unm() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t = {}; \
+         local mt = {__unm = function(a) return 42 end}; \
+         t = setmetatable(t, mt); \
+         return -t"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_number(), Some(42.0));
+}
+
+#[test]
+fn test_metatable_concat() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; \
+         local mt = {__concat = function(a, b) return 'concatenated' end}; \
+         t1 = setmetatable(t1, mt); \
+         return t1 .. t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.to_lua_string(), "concatenated");
+}
+
+#[test]
+fn test_metatable_lt() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; \
+         local mt = {__lt = function(a, b) return true end}; \
+         t1 = setmetatable(t1, mt); \
+         return t1 < t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.is_truthy(), true);
+}
+
+#[test]
+fn test_metatable_le() {
+    let mut interpreter = create_interpreter();
+    let tokens = lexer::tokenize(
+        "local t1 = {}; local t2 = {}; \
+         local mt = {__le = function(a, b) return true end}; \
+         t1 = setmetatable(t1, mt); \
+         return t1 <= t2"
+    ).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let result = interpreter.execute(&program).unwrap();
+    assert_eq!(result.is_truthy(), true);
+}
+
+// パフォーマンステスト
+#[test]
+fn test_performance_large_table() {
+    let mut interpreter = create_interpreter();
+    let code = "local t = {}; for i = 1, 1000 do t[i] = i end; return #t";
+    let tokens = lexer::tokenize(code).unwrap();
+    let program = parser::parse(&tokens).unwrap();
+    let start = std::time::Instant::now();
+    let result = interpreter.execute(&program).unwrap();
+    let duration = start.elapsed();
+    assert_eq!(result.to_number(), Some(1000.0));
+    assert!(duration.as_millis() < 1000); // 1秒以内に完了
+}
+
+// パーサーのエラーケース
+#[test]
+fn test_parser_error_missing_condition() {
+    let tokens = lexer::tokenize("if then return 1 end").unwrap();
+    let result = parser::parse(&tokens);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_parser_error_unexpected_token() {
+    let tokens = lexer::tokenize("return +").unwrap();
+    let result = parser::parse(&tokens);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_parser_error_unclosed_paren() {
+    let tokens = lexer::tokenize("return (1 + 2").unwrap();
+    let result = parser::parse(&tokens);
+    assert!(result.is_err());
+}
+
+#[test]
+fn test_parser_error_unclosed_brace() {
+    let tokens = lexer::tokenize("local t = {1, 2").unwrap();
+    let result = parser::parse(&tokens);
+    assert!(result.is_err());
+}
+
+// 字句解析器のエッジケース
+#[test]
+fn test_lexer_special_characters() {
+    let tokens = lexer::tokenize(r#"local s = "hello\nworld\twith\ttabs""#).unwrap();
+    assert!(tokens.len() >= 5);
+}
+
+#[test]
+fn test_lexer_long_string() {
+    let long_string = "a".repeat(1000);
+    let code = format!(r#"local s = "{}""#, long_string);
+    let tokens = lexer::tokenize(&code).unwrap();
+    assert!(tokens.len() >= 5);
+}
+
+#[test]
+fn test_lexer_exponential_notation() {
+    let tokens = lexer::tokenize("return 1e10").unwrap();
+    assert!(tokens.len() >= 3);
+}
+
+#[test]
+fn test_lexer_hex_number() {
+    let tokens = lexer::tokenize("return 0xFF").unwrap();
+    assert!(tokens.len() >= 3);
+}
+

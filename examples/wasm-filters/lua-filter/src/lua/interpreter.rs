@@ -254,9 +254,10 @@ impl Interpreter {
     ///
     /// # Examples
     /// ```
-    /// use lua::parser::parse;
-    /// use lua::lexer::tokenize;
-    /// use lua::interpreter::Interpreter;
+    /// use lua_filter::lua::parser::parse;
+    /// use lua_filter::lua::lexer::tokenize;
+    /// use lua_filter::lua::interpreter::Interpreter;
+    /// use lua_filter::lua::LuaValue;
     ///
     /// let source = "return 42";
     /// let tokens = tokenize(source)?;
@@ -264,6 +265,7 @@ impl Interpreter {
     /// let mut interpreter = Interpreter::new();
     /// let result = interpreter.execute(&program)?;
     /// assert_eq!(result, LuaValue::Number(42.0));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// # Performance
@@ -313,19 +315,24 @@ impl Interpreter {
     ///
     /// # Examples
     /// ```
+    /// use lua_filter::lua::ast::{Stmt, Expr, AssignTarget};
+    /// use lua_filter::lua::interpreter::Interpreter;
+    ///
     /// // Execute an assignment statement
+    /// let mut interpreter = Interpreter::new();
     /// let stmt = Stmt::Assign {
     ///     targets: vec![AssignTarget::Name("x".to_string())],
     ///     values: vec![Expr::LiteralNumber(42.0)],
     ///     local: false,
     /// };
     /// interpreter.execute_statement(&stmt)?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// # Performance
     /// - Time complexity: O(1) for simple statements, O(n) for loops where n is iterations
     /// - Space complexity: O(1) for most statements, O(d) for nested scopes
-    fn execute_statement(&mut self, stmt: &Stmt) -> Result<(), String> {
+    pub fn execute_statement(&mut self, stmt: &Stmt) -> Result<(), String> {
         match stmt {
             Stmt::Assign { targets, values, local } => {
                 // Evaluate all expressions, expanding function call results
@@ -715,6 +722,12 @@ impl Interpreter {
     ///
     /// # Examples
     /// ```
+    /// use lua_filter::lua::ast::{Expr, BinaryOperator};
+    /// use lua_filter::lua::interpreter::Interpreter;
+    /// use lua_filter::lua::LuaValue;
+    ///
+    /// let mut interpreter = Interpreter::new();
+    ///
     /// // Evaluate a simple literal
     /// let result = interpreter.evaluate(&Expr::LiteralNumber(42.0))?;
     /// assert_eq!(result, LuaValue::Number(42.0));
@@ -732,16 +745,20 @@ impl Interpreter {
     /// let expr = Expr::BinaryOp {
     ///     left: Box::new(Expr::LiteralBool(false)),
     ///     op: BinaryOperator::And,
-    ///     right: Box::new(Expr::Call { /* ... */ }), // Not evaluated
+    ///     right: Box::new(Expr::Call {
+    ///         func: Box::new(Expr::Variable("never_called".to_string())),
+    ///         args: vec![],
+    ///     }), // Not evaluated
     /// };
     /// let result = interpreter.evaluate(&expr)?;
     /// assert_eq!(result, LuaValue::Boolean(false));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// # Performance
     /// - Time complexity: O(n) where n is the depth of the expression tree
     /// - Space complexity: O(n) for recursive calls on the call stack
-    fn evaluate(&mut self, expr: &Expr) -> Result<LuaValue, String> {
+    pub fn evaluate(&mut self, expr: &Expr) -> Result<LuaValue, String> {
         match expr {
             Expr::LiteralNil => Ok(LuaValue::Nil),
             Expr::LiteralBool(b) => Ok(LuaValue::Boolean(*b)),
@@ -1091,6 +1108,14 @@ impl Interpreter {
     ///
     /// # Examples
     /// ```
+    /// use std::rc::Rc;
+    /// use std::collections::HashMap;
+    /// use lua_filter::lua::value::{Closure, LuaValue};
+    /// use lua_filter::lua::ast::{Stmt, Expr, BinaryOperator};
+    /// use lua_filter::lua::interpreter::Interpreter;
+    ///
+    /// let mut interpreter = Interpreter::new();
+    ///
     /// // Create a simple closure
     /// let closure = Rc::new(Closure::new(
     ///     Some("add".to_string()),
@@ -1108,13 +1133,14 @@ impl Interpreter {
     /// let args = vec![LuaValue::Number(10.0), LuaValue::Number(20.0)];
     /// let results = interpreter.call_closure(&closure, &args)?;
     /// assert_eq!(results[0], LuaValue::Number(30.0));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// # Performance
     /// - Time complexity: O(n) where n is the number of statements in the function body
     /// - Space complexity: O(1) for tail calls (due to TCO), O(d) for non-tail calls where d is call depth
     /// - Tail call optimization prevents stack overflow for recursive functions
-    fn call_closure(&mut self, closure: &Rc<Closure>, args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
+    pub fn call_closure(&mut self, closure: &Rc<Closure>, args: &[LuaValue]) -> Result<Vec<LuaValue>, String> {
         // Special handling for iterator functions
         if let Some(name) = &closure.name {
             if name == "utf8.codes_iter" {
@@ -2174,6 +2200,11 @@ impl Interpreter {
     ///
     /// # Examples
     /// ```
+    /// use lua_filter::lua::interpreter::Interpreter;
+    /// use lua_filter::lua::LuaValue;
+    ///
+    /// let mut interpreter = Interpreter::new();
+    ///
     /// // Get string length
     /// let result = interpreter.call_string_method("len", &[LuaValue::String("hello".to_string())])?;
     /// assert_eq!(result, LuaValue::Number(5.0));
@@ -2185,12 +2216,13 @@ impl Interpreter {
     ///     LuaValue::Number(3.0),
     /// ])?;
     /// assert_eq!(result, LuaValue::String("hel".to_string()));
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// # Performance
     /// - Time complexity: Varies by method (O(1) for len, O(n) for pattern matching where n is string length)
     /// - Space complexity: O(n) for methods that create new strings
-    fn call_string_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
+    pub fn call_string_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
         match method {
             "len" => {
                 let s = args.first().map(|v| v.to_lua_string()).unwrap_or_default();
@@ -2438,6 +2470,11 @@ impl Interpreter {
     ///
     /// # Examples
     /// ```
+    /// use lua_filter::lua::interpreter::Interpreter;
+    /// use lua_filter::lua::LuaValue;
+    ///
+    /// let mut interpreter = Interpreter::new();
+    ///
     /// // Calculate sine
     /// let result = interpreter.call_math_method("sin", &[LuaValue::Number(0.0)])?;
     /// assert_eq!(result, LuaValue::Number(0.0));
@@ -2453,12 +2490,13 @@ impl Interpreter {
     /// // Generate random number
     /// let result = interpreter.call_math_method("random", &[])?;
     /// // Returns a number between 0 and 1
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// # Performance
     /// - Time complexity: O(1) for most operations, O(n) for max/min where n is number of arguments
     /// - Space complexity: O(1)
-    fn call_math_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
+    pub fn call_math_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
         let get_num = |idx: usize| args.get(idx).and_then(|v| v.to_number());
         
         match method {
@@ -2585,6 +2623,11 @@ impl Interpreter {
     ///
     /// # Examples
     /// ```
+    /// use lua_filter::lua::interpreter::Interpreter;
+    /// use lua_filter::lua::value::{LuaTable, LuaValue};
+    ///
+    /// let mut interpreter = Interpreter::new();
+    ///
     /// // Insert value at end
     /// let mut table = LuaTable::new();
     /// table.set("1".to_string(), LuaValue::Number(10.0));
@@ -2598,12 +2641,13 @@ impl Interpreter {
     ///     LuaValue::Table(table),
     ///     LuaValue::Number(1.0),
     /// ])?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
     /// # Performance
     /// - Time complexity: O(1) for insert/remove at end, O(n) for insert/remove at position or sort where n is table length
     /// - Space complexity: O(1) for most operations, O(n) for sort
-    fn call_table_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
+    pub fn call_table_method(&mut self, method: &str, args: &[LuaValue]) -> Result<LuaValue, String> {
         match method {
             "insert" => {
                 // table.insert(t, value) - insert at end
@@ -2883,16 +2927,88 @@ impl Interpreter {
                 Ok(LuaValue::Number(l + r))
             }
             BinaryOperator::Sub => {
+                // Check for __sub metamethod (Lua checks left operand first, then right)
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(sub) = &mt.sub {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(sub, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to try right operand or default behavior
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(sub) = &mt.sub {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(sub, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to default behavior
+                            }
+                        }
+                    }
+                }
+                // Default behavior: try to subtract as numbers
                 let l = left.to_number().ok_or("cannot subtract non-numbers")?;
                 let r = right.to_number().ok_or("cannot subtract non-numbers")?;
                 Ok(LuaValue::Number(l - r))
             }
             BinaryOperator::Mul => {
+                // Check for __mul metamethod (Lua checks left operand first, then right)
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(mul) = &mt.mul {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(mul, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to try right operand or default behavior
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(mul) = &mt.mul {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(mul, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to default behavior
+                            }
+                        }
+                    }
+                }
+                // Default behavior: try to multiply as numbers
                 let l = left.to_number().ok_or("cannot multiply non-numbers")?;
                 let r = right.to_number().ok_or("cannot multiply non-numbers")?;
                 Ok(LuaValue::Number(l * r))
             }
             BinaryOperator::Div => {
+                // Check for __div metamethod (Lua checks left operand first, then right)
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(div) = &mt.div {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(div, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to try right operand or default behavior
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(div) = &mt.div {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(div, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to default behavior
+                            }
+                        }
+                    }
+                }
+                // Default behavior: try to divide as numbers
                 let l = left.to_number().ok_or("cannot divide non-numbers")?;
                 let r = right.to_number().ok_or("cannot divide non-numbers")?;
                 Ok(LuaValue::Number(l / r))
@@ -2903,11 +3019,59 @@ impl Interpreter {
                 Ok(LuaValue::Number((l / r).floor()))
             }
             BinaryOperator::Mod => {
+                // Check for __mod metamethod (Lua checks left operand first, then right)
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(mod_) = &mt.mod_ {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(mod_, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to try right operand or default behavior
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(mod_) = &mt.mod_ {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(mod_, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to default behavior
+                            }
+                        }
+                    }
+                }
+                // Default behavior: try to mod as numbers
                 let l = left.to_number().ok_or("cannot mod non-numbers")?;
                 let r = right.to_number().ok_or("cannot mod non-numbers")?;
                 Ok(LuaValue::Number(l % r))
             }
             BinaryOperator::Pow => {
+                // Check for __pow metamethod (Lua checks left operand first, then right)
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(pow) = &mt.pow {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(pow, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to try right operand or default behavior
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(pow) = &mt.pow {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(pow, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to default behavior
+                            }
+                        }
+                    }
+                }
+                // Default behavior: try to pow as numbers
                 let l = left.to_number().ok_or("cannot pow non-numbers")?;
                 let r = right.to_number().ok_or("cannot pow non-numbers")?;
                 Ok(LuaValue::Number(l.powf(r)))
@@ -2938,6 +3102,28 @@ impl Interpreter {
             },
             BinaryOperator::NotEq => Ok(LuaValue::Boolean(left != right)),
             BinaryOperator::Lt => {
+                // Check for __lt metamethod (Lua checks left operand first, then right)
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(lt) = &mt.lt {
+                            let args = vec![left.clone(), right.clone()];
+                            if let Ok(results) = self.call_function(lt, &args) {
+                                return Ok(results.first().cloned().unwrap_or(LuaValue::Boolean(false)));
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(lt) = &mt.lt {
+                            let args = vec![left.clone(), right.clone()];
+                            if let Ok(results) = self.call_function(lt, &args) {
+                                return Ok(results.first().cloned().unwrap_or(LuaValue::Boolean(false)));
+                            }
+                        }
+                    }
+                }
+                // Default behavior: try to compare as numbers
                 let l = left.to_number().ok_or("cannot compare non-numbers")?;
                 let r = right.to_number().ok_or("cannot compare non-numbers")?;
                 Ok(LuaValue::Boolean(l < r))
@@ -2948,6 +3134,28 @@ impl Interpreter {
                 Ok(LuaValue::Boolean(l > r))
             }
             BinaryOperator::Le => {
+                // Check for __le metamethod (Lua checks left operand first, then right)
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(le) = &mt.le {
+                            let args = vec![left.clone(), right.clone()];
+                            if let Ok(results) = self.call_function(le, &args) {
+                                return Ok(results.first().cloned().unwrap_or(LuaValue::Boolean(false)));
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(le) = &mt.le {
+                            let args = vec![left.clone(), right.clone()];
+                            if let Ok(results) = self.call_function(le, &args) {
+                                return Ok(results.first().cloned().unwrap_or(LuaValue::Boolean(false)));
+                            }
+                        }
+                    }
+                }
+                // Default behavior: try to compare as numbers
                 let l = left.to_number().ok_or("cannot compare non-numbers")?;
                 let r = right.to_number().ok_or("cannot compare non-numbers")?;
                 Ok(LuaValue::Boolean(l <= r))
@@ -2958,6 +3166,30 @@ impl Interpreter {
                 Ok(LuaValue::Boolean(l >= r))
             }
             BinaryOperator::Concat => {
+                // Check for __concat metamethod (Lua checks left operand first, then right)
+                if let LuaValue::Table(t) = left {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(concat) = &mt.concat {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(concat, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to try right operand or default behavior
+                            }
+                        }
+                    }
+                }
+                if let LuaValue::Table(t) = right {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(concat) = &mt.concat {
+                            let args = vec![left.clone(), right.clone()];
+                            match self.call_function(concat, &args) {
+                                Ok(results) => return Ok(results.first().cloned().unwrap_or(LuaValue::Nil)),
+                                Err(_) => {} // Fall through to default behavior
+                            }
+                        }
+                    }
+                }
+                // Default behavior: convert to strings and concatenate
                 let l = left.to_lua_string();
                 let r = right.to_lua_string();
                 Ok(LuaValue::String(format!("{}{}", l, r)))
@@ -2994,6 +3226,18 @@ impl Interpreter {
     fn apply_unary_op(&mut self, op: &UnaryOperator, val: &LuaValue) -> Result<LuaValue, String> {
         match op {
             UnaryOperator::Neg => {
+                // Check for __unm metamethod
+                if let LuaValue::Table(t) = val {
+                    if let Some(mt) = &t.metatable {
+                        if let Some(unm) = &mt.unm {
+                            let args = vec![val.clone()];
+                            if let Ok(results) = self.call_function(unm, &args) {
+                                return Ok(results.first().cloned().unwrap_or(LuaValue::Nil));
+                            }
+                        }
+                    }
+                }
+                // Default behavior: try to negate as number
                 let n = val.to_number().ok_or("cannot negate non-number")?;
                 Ok(LuaValue::Number(-n))
             }
