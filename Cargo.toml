@@ -40,7 +40,7 @@ wasm = ["wasmtime", "wasmtime-wasi"]
 all-protocols = ["http2", "http3"]
 
 [dependencies]
-monoio = { version = "0.2.2", features = ["poll-io"] }
+monoio = { version = "0.2.2" }
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）
 rustls = { version = "0.23", features = ["tls12", "ring"] }
 webpki-roots = "0.26"

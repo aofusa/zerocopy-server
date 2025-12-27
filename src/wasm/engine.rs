@@ -337,6 +337,62 @@ impl FilterEngine {
         }
     }
 
+    /// Execute on_response_headers for specified modules
+    pub fn on_response_headers_with_modules(
+        &self,
+        module_names: &[String],
+        status: u16,
+        headers: &[(String, String)],
+        end_of_stream: bool,
+    ) -> FilterResult {
+        // 指定されたモジュール名からLoadedModuleを取得
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+        
+        if modules.is_empty() {
+            return FilterResult::Continue {
+                headers: headers.to_vec(),
+                body: None,
+            };
+        }
+        
+        let mut current_headers = headers.to_vec();
+        
+        // Execute in reverse order for response
+        for module in modules.iter().rev() {
+            let result =
+                self.execute_on_response_headers(module, status, &current_headers, end_of_stream);
+            
+            match result {
+                Ok(ModuleResult::Continue { modified_headers }) => {
+                    if let Some(h) = modified_headers {
+                        current_headers = h;
+                    }
+                }
+                Ok(ModuleResult::Pause) => {
+                    return FilterResult::Pause;
+                }
+                Ok(ModuleResult::LocalResponse(resp)) => {
+                    return FilterResult::LocalResponse(resp);
+                }
+                Err(e) => {
+                    ftlog::error!(
+                        "[wasm:{}] on_response_headers error: {}",
+                        module.name,
+                        e
+                    );
+                }
+            }
+        }
+        
+        FilterResult::Continue {
+            headers: current_headers,
+            body: None,
+        }
+    }
+
     /// Execute on_response_headers for a single module
     fn execute_on_response_headers(
         &self,

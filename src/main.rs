@@ -2687,6 +2687,40 @@ thread_local! {
 }
 
 // ====================
+// WASM Response Filter Context
+// ====================
+// Thread-local storage for WASM modules to apply to response headers.
+// Set during request processing, used during response processing.
+// ====================
+
+#[cfg(feature = "wasm")]
+thread_local! {
+    /// WASM modules to apply for the current request/response
+    static WASM_RESPONSE_MODULES: std::cell::RefCell<Vec<String>> = std::cell::RefCell::new(Vec::new());
+}
+
+#[cfg(feature = "wasm")]
+fn set_wasm_response_modules(modules: Vec<String>) {
+    WASM_RESPONSE_MODULES.with(|m| {
+        *m.borrow_mut() = modules;
+    });
+}
+
+#[cfg(feature = "wasm")]
+fn get_wasm_response_modules() -> Vec<String> {
+    WASM_RESPONSE_MODULES.with(|m| {
+        m.borrow().clone()
+    })
+}
+
+#[cfg(feature = "wasm")]
+fn clear_wasm_response_modules() {
+    WASM_RESPONSE_MODULES.with(|m| {
+        m.borrow_mut().clear();
+    });
+}
+
+// ====================
 // バックエンドコネクションプール
 // ====================
 //
@@ -8921,6 +8955,9 @@ async fn handle_requests(
                                 .collect()
                         };
                         
+                        // レスポンス処理用にモジュールリストを保存
+                        set_wasm_response_modules(modules_to_apply.clone());
+                        
                         // ヘッダーをString形式に変換
                         let headers_vec: Vec<(String, String)> = headers_for_proxy.iter()
                             .map(|(k, v)| (
@@ -9304,6 +9341,74 @@ async fn handle_backend(
                 header.extend_from_slice(b"\r\n");
             }
             
+            // WASMレスポンスヘッダーフィルタを適用
+            #[cfg(feature = "wasm")]
+            let header = {
+                let wasm_modules = get_wasm_response_modules();
+                ftlog::debug!("[WASM Response] MemoryFile: wasm_modules count = {}", wasm_modules.len());
+                if !wasm_modules.is_empty() {
+                    let config = CURRENT_CONFIG.load();
+                    if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                        // 現在のヘッダーをVec<(String, String)>形式に変換
+                        // ヘッダーラインを解析してヘッダーリストを作成
+                        let header_str = String::from_utf8_lossy(&header);
+                        let current_headers: Vec<(String, String)> = header_str.lines()
+                            .skip(1) // ステータス行をスキップ
+                            .filter_map(|line| {
+                                let line_trimmed = line.trim_end_matches("\r\n").trim_end_matches("\r");
+                                if line_trimmed.is_empty() {
+                                    return None;
+                                }
+                                let colon_pos = line_trimmed.find(':')?;
+                                let name = line_trimmed[..colon_pos].to_string();
+                                let value = line_trimmed[colon_pos+1..].trim_start().to_string();
+                                Some((name, value))
+                            })
+                            .collect();
+                        
+                        // WASMフィルタを実行（レスポンスヘッダー処理）
+                        let wasm_result = wasm_engine.on_response_headers_with_modules(
+                            &wasm_modules,
+                            200,
+                            &current_headers,
+                            true, // end_of_stream
+                        );
+                        
+                        match wasm_result {
+                            crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
+                                // WASMから修正されたヘッダーで再構築
+                                let mut new_header = Vec::with_capacity(HEADER_BUF_CAPACITY);
+                                new_header.extend_from_slice(HTTP_200_PREFIX);
+                                new_header.extend_from_slice(mime_type.as_bytes());
+                                new_header.extend_from_slice(CONTENT_LENGTH_HEADER);
+                                let mut num_buf = itoa::Buffer::new();
+                                new_header.extend_from_slice(num_buf.format(data.len()).as_bytes());
+                                new_header.extend_from_slice(b"\r\n");
+                                
+                                // WASMから返されたヘッダーを追加
+                                for (name, value) in modified_headers {
+                                    new_header.extend_from_slice(name.as_bytes());
+                                    new_header.extend_from_slice(b": ");
+                                    new_header.extend_from_slice(value.as_bytes());
+                                    new_header.extend_from_slice(b"\r\n");
+                                }
+                                new_header
+                            }
+                            _ => header,
+                        }
+                    } else {
+                        header
+                    }
+                } else {
+                    header
+                }
+            };
+            // モジュールリストをクリア
+            #[cfg(feature = "wasm")]
+            clear_wasm_response_modules();
+            
+            // Connection header を追加（headerをmutableにする）
+            let mut header = header;
             if client_wants_close {
                 header.extend_from_slice(b"Connection: close\r\n\r\n");
             } else {
@@ -12054,6 +12159,67 @@ async fn transfer_response_with_compression(
                         new_header_lines.push(format!("{}: {}\r\n", header_name, header_value).into_bytes());
                     }
                     
+                    // WASMレスポンスヘッダーフィルタを適用
+                    #[cfg(feature = "wasm")]
+                    {
+                        let wasm_modules = get_wasm_response_modules();
+                        if !wasm_modules.is_empty() {
+                            let config = CURRENT_CONFIG.load();
+                            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                                // 現在のヘッダーをVec<(String, String)>形式に変換
+                                let current_headers: Vec<(String, String)> = new_header_lines.iter()
+                                    .skip(1) // ステータス行をスキップ
+                                    .filter_map(|line| {
+                                        let line_str = std::str::from_utf8(line).ok()?;
+                                        let line_trimmed = line_str.trim_end_matches("\r\n");
+                                        if line_trimmed.is_empty() {
+                                            return None;
+                                        }
+                                        let colon_pos = line_trimmed.find(':')?;
+                                        let name = line_trimmed[..colon_pos].to_string();
+                                        let value = line_trimmed[colon_pos+1..].trim_start().to_string();
+                                        Some((name, value))
+                                    })
+                                    .collect();
+                                
+                                // WASMフィルタを実行（レスポンスヘッダー処理）
+                                let wasm_result = wasm_engine.on_response_headers_with_modules(
+                                    &wasm_modules,
+                                    status_code,
+                                    &current_headers,
+                                    true, // end_of_stream
+                                );
+                                
+                                match wasm_result {
+                                    crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
+                                        // WASMから修正されたヘッダーで置き換え
+                                        new_header_lines.clear();
+                                        
+                                        // ステータス行を再追加
+                                        let status_line = format!("HTTP/1.1 {} {}\r\n", 
+                                            status_code, 
+                                            status_code_to_reason(status_code));
+                                        new_header_lines.push(status_line.into_bytes());
+                                        
+                                        // WASMから返されたヘッダーを追加
+                                        for (name, value) in modified_headers {
+                                            new_header_lines.push(format!("{}: {}\r\n", name, value).into_bytes());
+                                        }
+                                    }
+                                    crate::wasm::FilterResult::LocalResponse(_) => {
+                                        // レスポンスヘッダー処理ではLocalResponseは無視
+                                        // （すでにバックエンドレスポンスを受信しているため）
+                                    }
+                                    crate::wasm::FilterResult::Pause => {
+                                        // 非同期処理待ち（現在は未実装）
+                                    }
+                                }
+                            }
+                        }
+                        // モジュールリストをクリア
+                        clear_wasm_response_modules();
+                    }
+                    
                     // ヘッダー終了マーカーを追加
                     new_header_lines.push(b"\r\n".to_vec());
                     
@@ -13836,6 +14002,73 @@ async fn handle_sendfile(
         header_buf.extend_from_slice(b"\r\n");
     }
     
+    // WASMレスポンスヘッダーフィルタを適用
+    #[cfg(feature = "wasm")]
+    let header_buf = {
+        let wasm_modules = get_wasm_response_modules();
+        ftlog::info!("[WASM Response] SendFile: wasm_modules count = {}", wasm_modules.len());
+        if !wasm_modules.is_empty() {
+            let config = CURRENT_CONFIG.load();
+            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                // 現在のヘッダーをVec<(String, String)>形式に変換
+                let header_str = String::from_utf8_lossy(&header_buf);
+                let current_headers: Vec<(String, String)> = header_str.lines()
+                    .skip(1) // ステータス行をスキップ
+                    .filter_map(|line| {
+                        let line_trimmed = line.trim_end_matches("\r\n").trim_end_matches("\r");
+                        if line_trimmed.is_empty() {
+                            return None;
+                        }
+                        let colon_pos = line_trimmed.find(':')?;
+                        let name = line_trimmed[..colon_pos].to_string();
+                        let value = line_trimmed[colon_pos+1..].trim_start().to_string();
+                        Some((name, value))
+                    })
+                    .collect();
+                
+                // WASMフィルタを実行（レスポンスヘッダー処理）
+                let wasm_result = wasm_engine.on_response_headers_with_modules(
+                    &wasm_modules,
+                    200,
+                    &current_headers,
+                    true, // end_of_stream
+                );
+                
+                match wasm_result {
+                    crate::wasm::FilterResult::Continue { headers: modified_headers, .. } => {
+                        // WASMから修正されたヘッダーで再構築
+                        let mut new_header = Vec::with_capacity(HEADER_BUF_CAPACITY);
+                        new_header.extend_from_slice(HTTP_200_PREFIX);
+                        new_header.extend_from_slice(mime_type.as_ref().as_bytes());
+                        new_header.extend_from_slice(CONTENT_LENGTH_HEADER);
+                        let mut num_buf = itoa::Buffer::new();
+                        new_header.extend_from_slice(num_buf.format(file_size).as_bytes());
+                        new_header.extend_from_slice(b"\r\n");
+                        
+                        // WASMから返されたヘッダーを追加
+                        for (name, value) in modified_headers {
+                            new_header.extend_from_slice(name.as_bytes());
+                            new_header.extend_from_slice(b": ");
+                            new_header.extend_from_slice(value.as_bytes());
+                            new_header.extend_from_slice(b"\r\n");
+                        }
+                        new_header
+                    }
+                    _ => header_buf,
+                }
+            } else {
+                header_buf
+            }
+        } else {
+            header_buf
+        }
+    };
+    // モジュールリストをクリア
+    #[cfg(feature = "wasm")]
+    clear_wasm_response_modules();
+    
+    // Connection ヘッダーを追加（headerをmutableにする）
+    let mut header_buf = header_buf;
     if client_wants_close {
         header_buf.extend_from_slice(b"Connection: close\r\n\r\n");
     } else {
