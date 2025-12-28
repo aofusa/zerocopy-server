@@ -1522,6 +1522,23 @@ initial_max_streams_bidi = 100
 
 # Initial maximum unidirectional streams
 initial_max_streams_uni = 100
+
+# GSO/GRO optimization (UDP performance optimization)
+# GSO (Generic Segmentation Offload) / GRO (Generic Receive Offload) are
+# kernel-level features that optimize UDP packet transmission and reception.
+#
+# Effects:
+#   - Send/receive multiple small UDP packets at once
+#   - Reduce system call overhead
+#   - Lower CPU usage
+#
+# Notes:
+#   - Supported on Linux 5.0+
+#   - May not work as expected in some virtual environments or Docker
+#   - Set to false if issues occur
+#
+# Default: false
+gso_gro_enabled = false
 ```
 
 ### Notes
@@ -2656,6 +2673,20 @@ cargo build --release --features wasm
 [wasm]
 enabled = true
 
+# Default settings (optional)
+[wasm.defaults]
+# Maximum execution time (milliseconds, default: 100)
+max_execution_time_ms = 100
+
+  # Pooling allocator settings
+  [wasm.defaults.pooling]
+  # Total number of memory pools (default: 128)
+  total_memories = 128
+  # Total number of table pools (default: 128)
+  total_tables = 128
+  # Maximum memory size per instance (default: 10MB)
+  max_memory_size = 10485760
+
 # Module definition
 [[wasm.modules]]
 name = "my_filter"
@@ -2675,6 +2706,24 @@ allowed_upstreams = ["webdis"]  # Allowed HTTP call destinations
 [wasm.routes."/api/"]
 modules = ["my_filter"]
 ```
+
+### Default Settings
+
+The `[wasm.defaults]` section allows you to configure global WASM runtime settings:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `max_execution_time_ms` | Maximum execution time per WASM call (milliseconds) | 100 |
+
+#### Pooling Allocator Settings
+
+The `[wasm.defaults.pooling]` section configures the pooling allocator for high-speed instance creation:
+
+| Option | Description | Default |
+|--------|-------------|---------|
+| `total_memories` | Total number of memory pools | 128 |
+| `total_tables` | Total number of table pools | 128 |
+| `max_memory_size` | Maximum memory size per instance (bytes) | 10MB (10485760) |
 
 ### Capability List
 

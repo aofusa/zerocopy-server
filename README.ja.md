@@ -1523,6 +1523,23 @@ initial_max_streams_bidi = 100
 
 # 初期最大単方向ストリーム数
 initial_max_streams_uni = 100
+
+# GSO/GRO最適化（UDPパフォーマンス最適化）
+# GSO (Generic Segmentation Offload) / GRO (Generic Receive Offload) は
+# カーネルレベルでUDPパケットの送受信を効率化する機能です。
+#
+# 効果:
+#   - 複数の小さなUDPパケットを一度に送受信
+#   - システムコール回数の削減
+#   - CPU使用率の低減
+#
+# 注意:
+#   - Linux 5.0+ でサポート
+#   - 一部の仮想環境やDockerでは期待通りに動作しない場合あり
+#   - 問題が発生した場合は false に設定してください
+#
+# デフォルト: false
+gso_gro_enabled = false
 ```
 
 ### 注意事項
@@ -2657,6 +2674,20 @@ cargo build --release --features wasm
 [wasm]
 enabled = true
 
+# デフォルト設定（オプション）
+[wasm.defaults]
+# 最大実行時間（ミリ秒、デフォルト: 100）
+max_execution_time_ms = 100
+
+  # Poolingアロケータ設定
+  [wasm.defaults.pooling]
+  # メモリプール総数（デフォルト: 128）
+  total_memories = 128
+  # テーブルプール総数（デフォルト: 128）
+  total_tables = 128
+  # インスタンスごとの最大メモリサイズ（デフォルト: 10MB）
+  max_memory_size = 10485760
+
 # モジュール定義
 [[wasm.modules]]
 name = "my_filter"
@@ -2676,6 +2707,24 @@ allowed_upstreams = ["webdis"]  # HTTP呼び出し許可先
 [wasm.routes."/api/"]
 modules = ["my_filter"]
 ```
+
+### デフォルト設定
+
+`[wasm.defaults]` セクションでは、WASMランタイムのグローバル設定を行えます：
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `max_execution_time_ms` | WASM呼び出しごとの最大実行時間（ミリ秒） | 100 |
+
+#### Poolingアロケータ設定
+
+`[wasm.defaults.pooling]` セクションでは、高速インスタンス化のためのPoolingアロケータを設定します：
+
+| オプション | 説明 | デフォルト |
+|-----------|------|-----------|
+| `total_memories` | メモリプール総数 | 128 |
+| `total_tables` | テーブルプール総数 | 128 |
+| `max_memory_size` | インスタンスごとの最大メモリサイズ（バイト） | 10MB (10485760) |
 
 ### Capability一覧
 
