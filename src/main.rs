@@ -3155,6 +3155,31 @@ impl Default for BufferPoolConfig {
     }
 }
 
+// ====================
+// グローバルバッファプール設定
+// ====================
+//
+// 設定ファイルから読み込んだバッファプール設定を保持し、
+// 各バッファ取得関数から参照します。
+
+/// グローバルバッファプール設定（起動時に一度だけ設定）
+static BUFFER_POOL_CONFIG: std::sync::OnceLock<BufferPoolConfig> = std::sync::OnceLock::new();
+
+/// バッファプール設定を初期化
+#[inline]
+fn init_buffer_pool_config(config: BufferPoolConfig) {
+    let _ = BUFFER_POOL_CONFIG.set(config);
+}
+
+/// バッファプール設定を取得（未初期化時はデフォルト値）
+#[inline]
+fn get_buffer_pool_config() -> &'static BufferPoolConfig {
+    static DEFAULT_CONFIG: std::sync::OnceLock<BufferPoolConfig> = std::sync::OnceLock::new();
+    BUFFER_POOL_CONFIG.get().unwrap_or_else(|| {
+        DEFAULT_CONFIG.get_or_init(BufferPoolConfig::default)
+    })
+}
+
 thread_local! {
     /// リクエスト構築用バッファプール（1KB × 16）
     static REQUEST_BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(
@@ -3180,13 +3205,14 @@ thread_local! {
 /// リクエスト構築用バッファを取得
 #[inline]
 fn request_buf_get(size_hint: usize) -> Vec<u8> {
-    if size_hint <= REQUEST_BUF_SIZE {
+    let config = get_buffer_pool_config();
+    if size_hint <= config.request_buffer_size {
         REQUEST_BUF_POOL.with(|p| {
-            p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(REQUEST_BUF_SIZE))
+            p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(config.request_buffer_size))
         })
     } else {
         LARGE_REQUEST_BUF_POOL.with(|p| {
-            p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(LARGE_REQUEST_BUF_SIZE))
+            p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(config.large_request_buffer_size))
         })
     }
 }
@@ -3195,13 +3221,14 @@ fn request_buf_get(size_hint: usize) -> Vec<u8> {
 #[inline]
 fn request_buf_put(mut buf: Vec<u8>) {
     buf.clear();
+    let config = get_buffer_pool_config();
     let capacity = buf.capacity();
-    if capacity == REQUEST_BUF_SIZE {
+    if capacity == config.request_buffer_size {
         REQUEST_BUF_POOL.with(|p| {
             let mut pool = p.borrow_mut();
             if pool.len() < 32 { pool.push(buf); }
         });
-    } else if capacity == LARGE_REQUEST_BUF_SIZE {
+    } else if capacity == config.large_request_buffer_size {
         LARGE_REQUEST_BUF_POOL.with(|p| {
             let mut pool = p.borrow_mut();
             if pool.len() < 8 { pool.push(buf); }
@@ -3213,8 +3240,9 @@ fn request_buf_put(mut buf: Vec<u8>) {
 #[inline]
 #[allow(dead_code)]
 fn path_string_get() -> String {
+    let config = get_buffer_pool_config();
     PATH_STRING_POOL.with(|p| {
-        p.borrow_mut().pop().unwrap_or_else(|| String::with_capacity(PATH_STRING_SIZE))
+        p.borrow_mut().pop().unwrap_or_else(|| String::with_capacity(config.path_string_size))
     })
 }
 
@@ -3223,7 +3251,8 @@ fn path_string_get() -> String {
 #[allow(dead_code)]
 fn path_string_put(mut s: String) {
     s.clear();
-    if s.capacity() == PATH_STRING_SIZE {
+    let config = get_buffer_pool_config();
+    if s.capacity() == config.path_string_size {
         PATH_STRING_POOL.with(|p| {
             let mut pool = p.borrow_mut();
             if pool.len() < 32 { pool.push(s); }
@@ -3235,8 +3264,9 @@ fn path_string_put(mut s: String) {
 #[inline]
 #[allow(dead_code)]
 fn response_header_buf_get() -> Vec<u8> {
+    let config = get_buffer_pool_config();
     RESPONSE_HEADER_BUF_POOL.with(|p| {
-        p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(512))
+        p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(config.response_header_buffer_size))
     })
 }
 
@@ -3245,7 +3275,9 @@ fn response_header_buf_get() -> Vec<u8> {
 #[allow(dead_code)]
 fn response_header_buf_put(mut buf: Vec<u8>) {
     buf.clear();
-    if buf.capacity() >= 512 && buf.capacity() <= 2048 {
+    let config = get_buffer_pool_config();
+    let min_size = config.response_header_buffer_size;
+    if buf.capacity() >= min_size && buf.capacity() <= min_size * 4 {
         RESPONSE_HEADER_BUF_POOL.with(|p| {
             let mut pool = p.borrow_mut();
             if pool.len() < 32 { pool.push(buf); }
@@ -3490,7 +3522,6 @@ struct Config {
     prometheus: PrometheusConfig,
     /// バッファプール設定（メモリ最適化）
     #[serde(default)]
-    #[allow(dead_code)]
     buffer_pool: BufferPoolConfig,
     /// HTTP/2 設定セクション
     #[serde(default)]
@@ -5531,6 +5562,9 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         config.server.server_header_enabled,
         &config.server.server_header_value,
     );
+    
+    // バッファプール設定を初期化
+    init_buffer_pool_config(config.buffer_pool.clone());
     
     // TLS設定（kTLS有効時はシークレット抽出を有効化、HTTP/2有効時はALPN設定）
     #[cfg(feature = "http2")]
