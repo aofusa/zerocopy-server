@@ -305,6 +305,7 @@ cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
 ktls_enabled = true         # Enable kTLS (Linux 5.15+, requires feature flag)
 ktls_fallback_enabled = true # Fallback to rustls on kTLS failure (default: true)
+tcp_cork_enabled = true     # Use TCP_CORK during kTLS setup (default: true)
 
 # Host-based routing
 [host_routes."example.com"]

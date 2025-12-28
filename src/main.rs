@@ -237,6 +237,9 @@ pub struct KtlsConfig {
     /// false: kTLS必須（失敗時は接続拒否）
     /// true: kTLS失敗時はrustlsで継続（デフォルト）
     pub fallback_enabled: bool,
+    /// TCP_CORKを使用するかどうか
+    /// kTLS設定中のパケット結合最適化を有効化
+    pub tcp_cork_enabled: bool,
 }
 
 // ====================
@@ -2649,12 +2652,15 @@ fn check_rate_limit(client_ip: &str, limit: u64) -> bool {
 thread_local! {
     static TLS_CONNECTOR: RustlsConnector = {
         // kTLSフィーチャーが有効な場合はシークレット抽出を有効化
-        // 設定ファイルの ktls_fallback_enabled を読み込み
-        let fallback_enabled = CURRENT_CONFIG.load().ktls_config.fallback_enabled;
+        // 設定ファイルの ktls_fallback_enabled, tcp_cork_enabled を読み込み
+        let config_guard = CURRENT_CONFIG.load();
+        let fallback_enabled = config_guard.ktls_config.fallback_enabled;
+        let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
         let config = ktls_rustls::client_config(true);
         RustlsConnector::new(config)
             .with_ktls(true)        // kTLSを有効化
             .with_fallback(fallback_enabled)    // kTLS失敗時のフォールバック設定
+            .with_tcp_cork(tcp_cork_enabled)    // TCP_CORK設定
     };
 }
 
@@ -2663,12 +2669,15 @@ thread_local! {
 thread_local! {
     static TLS_CONNECTOR_INSECURE: RustlsConnector = {
         // 証明書検証をスキップするクライアント設定
-        // 設定ファイルの ktls_fallback_enabled を読み込み
-        let fallback_enabled = CURRENT_CONFIG.load().ktls_config.fallback_enabled;
+        // 設定ファイルの ktls_fallback_enabled, tcp_cork_enabled を読み込み
+        let config_guard = CURRENT_CONFIG.load();
+        let fallback_enabled = config_guard.ktls_config.fallback_enabled;
+        let tcp_cork_enabled = config_guard.ktls_config.tcp_cork_enabled;
         let config = ktls_rustls::insecure_client_config();
         RustlsConnector::new(config)
             .with_ktls(true)
             .with_fallback(fallback_enabled)
+            .with_tcp_cork(tcp_cork_enabled)
     };
 }
 
@@ -3202,6 +3211,7 @@ fn request_buf_put(mut buf: Vec<u8>) {
 
 /// パス文字列用Stringを取得
 #[inline]
+#[allow(dead_code)]
 fn path_string_get() -> String {
     PATH_STRING_POOL.with(|p| {
         p.borrow_mut().pop().unwrap_or_else(|| String::with_capacity(PATH_STRING_SIZE))
@@ -3210,6 +3220,7 @@ fn path_string_get() -> String {
 
 /// パス文字列用Stringを返却
 #[inline]
+#[allow(dead_code)]
 fn path_string_put(mut s: String) {
     s.clear();
     if s.capacity() == PATH_STRING_SIZE {
@@ -3222,6 +3233,7 @@ fn path_string_put(mut s: String) {
 
 /// レスポンスヘッダー構築用バッファを取得
 #[inline]
+#[allow(dead_code)]
 fn response_header_buf_get() -> Vec<u8> {
     RESPONSE_HEADER_BUF_POOL.with(|p| {
         p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(512))
@@ -3230,6 +3242,7 @@ fn response_header_buf_get() -> Vec<u8> {
 
 /// レスポンスヘッダー構築用バッファを返却
 #[inline]
+#[allow(dead_code)]
 fn response_header_buf_put(mut buf: Vec<u8>) {
     buf.clear();
     if buf.capacity() >= 512 && buf.capacity() <= 2048 {
@@ -3477,6 +3490,7 @@ struct Config {
     prometheus: PrometheusConfig,
     /// バッファプール設定（メモリ最適化）
     #[serde(default)]
+    #[allow(dead_code)]
     buffer_pool: BufferPoolConfig,
     /// HTTP/2 設定セクション
     #[serde(default)]
@@ -3862,10 +3876,24 @@ struct TlsConfigSection {
     /// - 環境問題の早期発見
     #[serde(default = "default_ktls_fallback")]
     ktls_fallback_enabled: bool,
+    /// kTLS有効時にTCP_CORKを使用するかどうか
+    /// 
+    /// TCP_CORKはkTLS設定中に小さなTCPパケットの送信を遅延し、
+    /// パケット結合により効率的なネットワーク転送を実現します。
+    /// 
+    /// - true: TCP_CORK有効（デフォルト、推奨）
+    /// - false: TCP_CORK無効（特定の低遅延要件がある場合）
+    #[serde(default = "default_tcp_cork")]
+    tcp_cork_enabled: bool,
 }
 
 /// kTLSフォールバックのデフォルト値（true = フォールバック有効）
 fn default_ktls_fallback() -> bool {
+    true
+}
+
+/// TCP_CORKのデフォルト値（true = 有効）
+fn default_tcp_cork() -> bool {
     true
 }
 
@@ -5110,10 +5138,38 @@ fn load_tls_config(
 
     // kTLS 有効時のみ config を変更するため、条件付きで mut を使用
     #[allow(unused_mut)]
-    let mut config = ServerConfig::builder()
-        .with_no_client_auth()
-        .with_single_cert(cert_chain, keys)
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    let mut config = {
+        #[cfg(feature = "ktls")]
+        if ktls_enabled {
+            // kTLS 有効時は互換暗号スイートのみを使用
+            // TODO: CryptoProviderに暗号スイートを設定（将来的な拡張）
+            let _cipher_suites = crate::ktls::ktls_compatible_cipher_suites();
+            info!("kTLS enabled: using only compatible cipher suites (AES-GCM)");
+            
+            ServerConfig::builder_with_provider(
+                rustls::crypto::ring::default_provider().into()
+            )
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, format!("TLS version error: {}", e)))?
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, keys)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        } else {
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, keys)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        }
+        
+        #[cfg(not(feature = "ktls"))]
+        {
+            let _ = ktls_enabled;
+            ServerConfig::builder()
+                .with_no_client_auth()
+                .with_single_cert(cert_chain, keys)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?
+        }
+    };
 
     // kTLS が有効な場合のみシークレット抽出を有効化
     // これにより dangerous_extract_secrets() が使用可能になる
@@ -5122,10 +5178,6 @@ fn load_tls_config(
         config.enable_secret_extraction = true;
         info!("TLS secret extraction enabled for kTLS support");
     }
-
-    // kTLS 無効時は警告を抑制
-    #[cfg(not(feature = "ktls"))]
-    let _ = ktls_enabled;
 
     // HTTP/2 有効時は ALPN を設定
     #[cfg(feature = "http2")]
@@ -5458,6 +5510,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         enable_tx: config.tls.ktls_enabled,
         enable_rx: config.tls.ktls_enabled,
         fallback_enabled: config.tls.ktls_fallback_enabled,
+        tcp_cork_enabled: config.tls.tcp_cork_enabled,
     };
 
     // HTTP/2・HTTP/3 設定を読み込み
@@ -6249,7 +6302,8 @@ fn main() {
     #[cfg(feature = "ktls")]
     let acceptor = RustlsAcceptor::new(loaded_config.tls_config.clone())
         .with_ktls(loaded_config.ktls_config.enabled)
-        .with_fallback(loaded_config.ktls_config.fallback_enabled);
+        .with_fallback(loaded_config.ktls_config.fallback_enabled)
+        .with_tcp_cork(loaded_config.ktls_config.tcp_cork_enabled);
     
     #[cfg(not(feature = "ktls"))]
     let acceptor = simple_tls::SimpleTlsAcceptor::new(loaded_config.tls_config.clone())
@@ -8245,7 +8299,8 @@ where
     };
     
     // リクエスト送信
-    let (write_res, _) = backend.write_all(request).await;
+    let (write_res, returned_request) = backend.write_all(request).await;
+    request_buf_put(returned_request);
     if write_res.is_err() {
         let server_guard = get_server_header_guard();
         let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
@@ -8533,7 +8588,8 @@ where
     };
     
     // リクエスト送信
-    let (write_res, _) = backend.write_all(request).await;
+    let (write_res, returned_request) = backend.write_all(request).await;
+    request_buf_put(returned_request);
     if write_res.is_err() {
         let server_guard = get_server_header_guard();
         let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(2);
@@ -10397,7 +10453,8 @@ async fn handle_websocket_proxy_http(
     };
     
     // アップグレードリクエストを送信
-    let (write_res, _) = backend_stream.write_all(request).await;
+    let (write_res, returned_request) = backend_stream.write_all(request).await;
+    request_buf_put(returned_request);
     if write_res.is_err() {
         let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
         let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;
@@ -10513,7 +10570,8 @@ async fn handle_websocket_proxy_https(
     };
     
     // アップグレードリクエストを送信
-    let (write_res, _) = backend_stream.write_all(request).await;
+    let (write_res, returned_request) = backend_stream.write_all(request).await;
+    request_buf_put(returned_request);
     if write_res.is_err() {
         let err_buf = ERR_MSG_BAD_GATEWAY.to_vec();
         let _ = timeout(WRITE_TIMEOUT, client_stream.write_all(err_buf)).await;

@@ -403,6 +403,7 @@ pub enum KtlsEnableResult<C> {
 fn try_enable_ktls_server(
     stream: &TcpStream,
     mut conn: ServerConnection,
+    tcp_cork_enabled: bool,
 ) -> KtlsEnableResult<ServerConnection> {
     use crate::ktls::drain_rustls_plaintext;
     
@@ -446,7 +447,7 @@ fn try_enable_ktls_server(
     // Step 4: rustls::Connection に変換してシークレット抽出とkTLS設定
     // この時点で conn は消費される
     let rustls_conn = rustls::Connection::Server(conn);
-    match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite) {
+    match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite, tcp_cork_enabled) {
         Ok(()) => KtlsEnableResult::Enabled(TlsMode::KtlsFull, drained),
         Err(e) => {
             // シークレット抽出後の失敗は致命的（connは既に消費済み）
@@ -462,6 +463,7 @@ fn try_enable_ktls_server(
 fn try_enable_ktls_client(
     stream: &TcpStream,
     mut conn: ClientConnection,
+    tcp_cork_enabled: bool,
 ) -> KtlsEnableResult<ClientConnection> {
     use crate::ktls::drain_rustls_plaintext;
     
@@ -501,7 +503,7 @@ fn try_enable_ktls_client(
     
     // Step 4: rustls::Connection に変換してシークレット抽出とkTLS設定
     let rustls_conn = rustls::Connection::Client(conn);
-    match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite) {
+    match setup_ktls_after_ulp(fd, rustls_conn, cipher_suite, tcp_cork_enabled) {
         Ok(()) => KtlsEnableResult::Enabled(TlsMode::KtlsFull, drained),
         Err(e) => KtlsEnableResult::Fatal(e),
     }
@@ -510,17 +512,27 @@ fn try_enable_ktls_client(
 /// ULP設定後のkTLS設定（シークレット抽出とTX/RX設定）
 /// 
 /// 自前実装の ktls モジュールを使用して以下を行います：
-/// 1. rustls からシークレットを抽出
-/// 2. TX/RX 用の CryptoInfo を構築
-/// 3. setsockopt でカーネルに設定
-/// 4. 鍵情報をセキュアにゼロ化
+/// 1. TCP_CORK を有効化（パケット結合最適化）
+/// 2. rustls からシークレットを抽出
+/// 3. TX/RX 用の CryptoInfo を構築
+/// 4. setsockopt でカーネルに設定
+/// 5. 鍵情報をセキュアにゼロ化
+/// 6. TCP_CORK を無効化
 #[cfg(feature = "ktls")]
 fn setup_ktls_after_ulp(
     fd: RawFd,
     conn: rustls::Connection,
     _cipher_suite: rustls::SupportedCipherSuite,
+    tcp_cork_enabled: bool,
 ) -> io::Result<()> {
-    use crate::ktls::{extract_tx_rx, setup_tls_info, TLS_TX, TLS_RX};
+    use crate::ktls::{extract_tx_rx, setup_tls_info, set_tcp_cork, TLS_TX, TLS_RX};
+    
+    // TCP_CORK を有効化（パケット結合最適化）
+    if tcp_cork_enabled {
+        if let Err(e) = set_tcp_cork(fd, true) {
+            ftlog::debug!("TCP_CORK enable failed (non-fatal): {}", e);
+        }
+    }
     
     // プロトコルバージョンを取得
     let protocol_version = conn.protocol_version();
@@ -540,6 +552,13 @@ fn setup_ktls_after_ulp(
     // RX 設定
     setup_tls_info(fd, TLS_RX, &rx)?;
     rx.secure_clear();  // 鍵をセキュアにゼロ化
+    
+    // TCP_CORK を無効化（バッファリングされたデータを送信）
+    if tcp_cork_enabled {
+        if let Err(e) = set_tcp_cork(fd, false) {
+            ftlog::debug!("TCP_CORK disable failed (non-fatal): {}", e);
+        }
+    }
     
     Ok(())
 }
@@ -569,6 +588,7 @@ pub async fn accept(
     config: Arc<ServerConfig>,
     enable_ktls: bool,
     allow_fallback: bool,
+    tcp_cork_enabled: bool,
 ) -> io::Result<KtlsServerStream> {
     let mut conn = ServerConnection::new(config)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -582,7 +602,7 @@ pub async fn accept(
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
     let (mode, conn_option, drained_buffer) = if enable_ktls {
-        match try_enable_ktls_server(&stream, conn) {
+        match try_enable_ktls_server(&stream, conn, tcp_cork_enabled) {
             KtlsEnableResult::Enabled(mode, drained) => {
                 // kTLS 有効化成功 + ドレイン済みバッファ
                 (mode, None, drained)
@@ -644,6 +664,7 @@ pub async fn connect(
     server_name: ServerName<'static>,
     enable_ktls: bool,
     allow_fallback: bool,
+    tcp_cork_enabled: bool,
 ) -> io::Result<KtlsClientStream> {
     let mut conn = ClientConnection::new(config, server_name)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -654,7 +675,7 @@ pub async fn connect(
     // kTLS の有効化を試みる
     #[cfg(feature = "ktls")]
     let (mode, conn_option, drained_buffer) = if enable_ktls {
-        match try_enable_ktls_client(&stream, conn) {
+        match try_enable_ktls_client(&stream, conn, tcp_cork_enabled) {
             KtlsEnableResult::Enabled(mode, drained) => {
                 // kTLS 有効化成功 + ドレイン済みバッファ
                 (mode, None, drained)
@@ -1255,6 +1276,8 @@ pub struct RustlsAcceptor {
     enable_ktls: bool,
     /// kTLS 有効化失敗時に rustls へフォールバックを許可するかどうか
     allow_fallback: bool,
+    /// TCP_CORK を使用するかどうか
+    tcp_cork_enabled: bool,
 }
 
 impl RustlsAcceptor {
@@ -1264,6 +1287,7 @@ impl RustlsAcceptor {
             config,
             enable_ktls: false,
             allow_fallback: true,  // デフォルトはフォールバック有効
+            tcp_cork_enabled: true, // デフォルトはTCP_CORK有効
         }
     }
 
@@ -1282,9 +1306,18 @@ impl RustlsAcceptor {
         self
     }
 
+    /// TCP_CORK を設定
+    /// 
+    /// - true: TCP_CORK有効（デフォルト、パケット結合最適化）
+    /// - false: TCP_CORK無効
+    pub fn with_tcp_cork(mut self, enable: bool) -> Self {
+        self.tcp_cork_enabled = enable;
+        self
+    }
+
     /// TLS ハンドシェイクを実行
     pub async fn accept(&self, stream: TcpStream) -> io::Result<KtlsServerStream> {
-        accept(stream, self.config.clone(), self.enable_ktls, self.allow_fallback).await
+        accept(stream, self.config.clone(), self.enable_ktls, self.allow_fallback, self.tcp_cork_enabled).await
     }
 }
 
@@ -1296,6 +1329,8 @@ pub struct RustlsConnector {
     enable_ktls: bool,
     /// kTLS 有効化失敗時に rustls へフォールバックを許可するかどうか
     allow_fallback: bool,
+    /// TCP_CORK を使用するかどうか
+    tcp_cork_enabled: bool,
 }
 
 impl RustlsConnector {
@@ -1305,6 +1340,7 @@ impl RustlsConnector {
             config,
             enable_ktls: false,
             allow_fallback: true,  // デフォルトはフォールバック有効
+            tcp_cork_enabled: true, // デフォルトはTCP_CORK有効
         }
     }
 
@@ -1323,6 +1359,15 @@ impl RustlsConnector {
         self
     }
 
+    /// TCP_CORK を設定
+    /// 
+    /// - true: TCP_CORK有効（デフォルト、パケット結合最適化）
+    /// - false: TCP_CORK無効
+    pub fn with_tcp_cork(mut self, enable: bool) -> Self {
+        self.tcp_cork_enabled = enable;
+        self
+    }
+
     /// TLS ハンドシェイクを実行
     pub async fn connect(
         &self,
@@ -1331,7 +1376,7 @@ impl RustlsConnector {
     ) -> io::Result<KtlsClientStream> {
         let server_name = ServerName::try_from(server_name.to_string())
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
-        connect(stream, self.config.clone(), server_name, self.enable_ktls, self.allow_fallback).await
+        connect(stream, self.config.clone(), server_name, self.enable_ktls, self.allow_fallback, self.tcp_cork_enabled).await
     }
 }
 
