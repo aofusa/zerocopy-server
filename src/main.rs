@@ -3760,6 +3760,25 @@ pub struct Http3ConfigSection {
     /// 未設定のフィールドはパスごとの設定を継承します。
     #[serde(default)]
     pub compression: Http3CompressionConfig,
+    
+    /// GSO/GRO を有効化するかどうか
+    /// 
+    /// GSO (Generic Segmentation Offload) / GRO (Generic Receive Offload) は
+    /// カーネルレベルでUDPパケットの送受信を効率化する機能です。
+    /// 
+    /// 効果:
+    /// - 複数の小さなUDPパケットを一度に送受信
+    /// - システムコール回数の削減
+    /// - CPU使用率の低減
+    /// 
+    /// 注意:
+    /// - Linux 5.0+ でサポート
+    /// - 一部の仮想環境やDockerでは期待通りに動作しない場合あり
+    /// - 問題が発生した場合は false に設定してください
+    /// 
+    /// デフォルト: false
+    #[serde(default)]
+    pub gso_gro_enabled: bool,
 }
 
 fn default_h3_max_idle_timeout() -> u64 { 30000 }
@@ -3782,6 +3801,7 @@ impl Default for Http3ConfigSection {
             initial_max_streams_uni: default_h3_max_streams(),
             compression_enabled: false,
             compression: Http3CompressionConfig::default(),
+            gso_gro_enabled: false,
         }
     }
 }
@@ -3803,6 +3823,7 @@ impl Http3ConfigSection {
             initial_max_stream_data_uni: self.initial_max_stream_data_uni,
             initial_max_streams_bidi: self.initial_max_streams_bidi,
             initial_max_streams_uni: self.initial_max_streams_uni,
+            gso_gro_enabled: self.gso_gro_enabled,
         }
     }
 }

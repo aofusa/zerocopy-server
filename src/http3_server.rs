@@ -203,6 +203,8 @@ pub struct Http3ServerConfig {
     pub initial_max_streams_bidi: u64,
     /// 初期最大単方向ストリーム数
     pub initial_max_streams_uni: u64,
+    /// GSO/GRO を有効化するかどうか（デフォルト: false）
+    pub gso_gro_enabled: bool,
 }
 
 impl Default for Http3ServerConfig {
@@ -220,6 +222,7 @@ impl Default for Http3ServerConfig {
             initial_max_stream_data_uni: 1_000_000,
             initial_max_streams_bidi: 100,
             initial_max_streams_uni: 100,
+            gso_gro_enabled: false,
         }
     }
 }
@@ -1718,9 +1721,10 @@ pub async fn run_http3_server_async(
 
     // UDP ソケットを作成（monoio io_uring ベース）
     // SO_REUSEPORT を設定して複数ワーカーで並列処理を可能に
-    // QuicUdpSocket は GSO/GRO も自動設定
-    let socket = QuicUdpSocket::bind_reuseport(bind_addr)?;
-    info!("[HTTP/3] GSO enabled: {}, GRO enabled: {}", socket.gso_enabled(), socket.gro_enabled());
+    // GSO/GRO は config.gso_gro_enabled に基づいて設定
+    let socket = QuicUdpSocket::bind_reuseport_with_gso(bind_addr, config.gso_gro_enabled)?;
+    info!("[HTTP/3] GSO enabled: {}, GRO enabled: {} (config gso_gro_enabled: {})", 
+        socket.gso_enabled(), socket.gro_enabled(), config.gso_gro_enabled);
     let socket = Rc::new(socket);
     let local_addr = bind_addr;
 

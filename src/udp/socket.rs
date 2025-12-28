@@ -192,6 +192,122 @@ impl QuicUdpSocket {
         Ok(instance)
     }
 
+    /// SO_REUSEPORT を設定してバインド（GSO/GRO の有効化オプション付き）
+    /// 
+    /// `enable_gso_gro` が false の場合、GSO/GRO は無効化されますが、
+    /// ソケットバッファサイズの増加は適用されます。
+    #[cfg(target_os = "linux")]
+    pub fn bind_reuseport_with_gso(addr: SocketAddr, enable_gso_gro: bool) -> io::Result<Self> {
+        use std::os::unix::io::FromRawFd;
+        
+        // ソケットを作成
+        let domain = if addr.is_ipv4() {
+            libc::AF_INET
+        } else {
+            libc::AF_INET6
+        };
+        
+        let fd = unsafe { 
+            libc::socket(domain, libc::SOCK_DGRAM | libc::SOCK_NONBLOCK | libc::SOCK_CLOEXEC, 0) 
+        };
+        if fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        
+        // SO_REUSEADDR を設定
+        let reuseaddr: libc::c_int = 1;
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEADDR,
+                &reuseaddr as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+        
+        // SO_REUSEPORT を設定
+        let reuseport: libc::c_int = 1;
+        let ret = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_REUSEPORT,
+                &reuseport as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        if ret < 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+        
+        // バインド
+        let ret = match addr {
+            SocketAddr::V4(v4) => {
+                let sin = libc::sockaddr_in {
+                    sin_family: libc::AF_INET as libc::sa_family_t,
+                    sin_port: v4.port().to_be(),
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                    },
+                    sin_zero: [0; 8],
+                };
+                unsafe {
+                    libc::bind(
+                        fd,
+                        &sin as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t,
+                    )
+                }
+            }
+            SocketAddr::V6(v6) => {
+                let sin6 = libc::sockaddr_in6 {
+                    sin6_family: libc::AF_INET6 as libc::sa_family_t,
+                    sin6_port: v6.port().to_be(),
+                    sin6_flowinfo: v6.flowinfo(),
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.ip().octets(),
+                    },
+                    sin6_scope_id: v6.scope_id(),
+                };
+                unsafe {
+                    libc::bind(
+                        fd,
+                        &sin6 as *const _ as *const libc::sockaddr,
+                        std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+                    )
+                }
+            }
+        };
+        if ret < 0 {
+            unsafe { libc::close(fd) };
+            return Err(io::Error::last_os_error());
+        }
+        
+        // std::net::UdpSocket を作成し、monoio の UdpSocket に変換
+        let std_socket = unsafe { std::net::UdpSocket::from_raw_fd(fd) };
+        let socket = UdpSocket::from_std(std_socket)?;
+        let local_addr = socket.local_addr()?;
+        
+        let mut instance = Self {
+            socket,
+            gso_enabled: false,
+            gro_enabled: false,
+            local_addr,
+        };
+        
+        // GSO/GRO を条件付きで設定
+        if enable_gso_gro {
+            instance.configure_gso_gro()?;
+        } else {
+            // GSO/GRO は無効だが、バッファサイズは増加させる
+            instance.configure_buffer_sizes()?;
+        }
+        
+        Ok(instance)
+    }
+
     /// GSO/GRO を設定
     fn configure_gso_gro(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
@@ -249,6 +365,38 @@ impl QuicUdpSocket {
                     std::mem::size_of::<libc::c_int>() as libc::socklen_t,
                 );
             }
+        }
+
+        Ok(())
+    }
+
+    /// バッファサイズのみを設定（GSO/GRO無効時用）
+    #[cfg(target_os = "linux")]
+    fn configure_buffer_sizes(&mut self) -> io::Result<()> {
+        let fd = self.socket.as_raw_fd();
+
+        // 受信バッファサイズを増加
+        let recv_buf_size: libc::c_int = 2 * 1024 * 1024; // 2MB
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &recv_buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
+        }
+
+        // 送信バッファサイズを増加
+        let send_buf_size: libc::c_int = 2 * 1024 * 1024; // 2MB
+        unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &send_buf_size as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+            );
         }
 
         Ok(())
