@@ -36,7 +36,7 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 ### HTTP処理
 - **Keep-Alive**: HTTP/1.1 Keep-Alive完全サポート
 - **Chunked転送**: RFC 7230準拠のChunkedデコーダ（ステートマシンベース）
-- **バッファプール**: メモリアロケーションの削減
+- **バッファプール**: スレッドローカルバッファプール（サイズ設定可能、メモリアロケーションオーバーヘッド削減）
 - **レスポンス圧縮**: Gzip/Brotli/Zstdによる動的圧縮（Accept-Encodingネゴシエーション対応）
 
 ### パフォーマンス
@@ -259,6 +259,13 @@ threads = 4
 http2_enabled = true
 # HTTP/3を有効化（--features http3 でビルド時のみ）
 http3_enabled = true
+# Serverヘッダー設定（オプション）
+# セキュリティ考慮事項: Serverヘッダーはサーバーソフトウェア情報を公開します
+# 本番環境では無効化を推奨
+# server_header_enabled = false
+# カスタムServerヘッダー値（server_header_enabled = true時のみ有効）
+# デフォルト: "veil"（プロトコル固有の値: "veil/http1.1", "veil/http2", "veil/http3"）
+# server_header_value = "MyServer/1.0"
 
 [logging]
 # ログレベル: "trace", "debug", "info", "warn", "error", "off"
@@ -906,6 +913,48 @@ url = "http://localhost:8080"
   # クライアントに返送前に削除
   remove_response_headers = ["X-Powered-By"]
 ```
+
+## Serverヘッダー設定
+
+クライアントに送信する`Server` HTTPレスポンスヘッダーを制御します。
+
+### セキュリティ考慮事項
+
+Serverヘッダーはサーバーソフトウェア情報を公開するため、攻撃者が脆弱性を特定する手がかりになり得ます。**本番環境では無効化を推奨**します（デフォルト: 無効）。
+
+### 設定
+
+`[server]`セクションで設定します：
+
+```toml
+[server]
+# Serverヘッダーを有効化（デフォルト: false）
+# セキュリティ考慮事項: サーバーソフトウェア情報を公開
+# 本番環境では無効化を推奨
+server_header_enabled = false
+
+# カスタムServerヘッダー値（server_header_enabled = true時のみ有効）
+# デフォルト: "veil"
+# 未指定の場合、プロトコルごとに自動設定:
+#   - HTTP/1.1: "veil/http1.1"
+#   - HTTP/2: "veil/http2"
+#   - HTTP/3: "veil/http3"
+server_header_value = "MyServer/1.0"
+```
+
+### 動作
+
+| 設定 | 動作 |
+|------|------|
+| `server_header_enabled = false` | Serverヘッダーを送信しない（デフォルト、本番環境推奨） |
+| `server_header_enabled = true`、`server_header_value`未指定 | プロトコル固有の値: `veil/http1.1`、`veil/http2`、または`veil/http3` |
+| `server_header_enabled = true`、`server_header_value = "Custom"` | すべてのプロトコルでカスタム値を使用: `Server: Custom` |
+
+### 用途
+
+- **開発/テスト**: どのサーバーが応答しているかを識別するために有効化
+- **本番環境**: サーバー情報を隠すために無効化（セキュリティベストプラクティス）
+- **カスタムブランディング**: Serverヘッダーが必要な場合にカスタム値を設定
 
 ## リダイレクト
 
@@ -1706,6 +1755,47 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);   // Keep-Aliveアイド
 ```
 
 > **注意**: ルートごとのセキュリティ設定で `client_header_timeout_secs` や `backend_connect_timeout_secs` を設定することで、一部のタイムアウトはconfig.tomlから個別に調整可能です。
+
+### バッファプール設定
+
+バッファプールは起動時にバッファを事前確保することで、メモリアロケーションのオーバーヘッドを削減します。`[buffer_pool]`セクションで設定できます：
+
+```toml
+[buffer_pool]
+# 読み込みバッファサイズ（バイト）
+# デフォルト: 65536 (64KB)
+read_buffer_size = 65536
+
+# 読み込みバッファ初期プール数
+# デフォルト: 32
+initial_read_buffers = 32
+
+# 読み込みバッファ最大プール数
+# デフォルト: 128
+max_read_buffers = 128
+
+# リクエスト構築バッファサイズ（バイト）
+# デフォルト: 1024 (1KB)
+request_buffer_size = 1024
+
+# リクエスト構築バッファ初期プール数
+# デフォルト: 16
+initial_request_buffers = 16
+
+# 大容量リクエストバッファサイズ（バイト）
+# デフォルト: 4096 (4KB)
+large_request_buffer_size = 4096
+
+# パス文字列バッファサイズ（バイト）
+# デフォルト: 256
+path_string_size = 256
+
+# レスポンスヘッダーバッファサイズ（バイト）
+# デフォルト: 512
+response_header_buffer_size = 512
+```
+
+**注意**: バッファプール設定はオプションです。デフォルト値はほとんどの用途に最適化されています。特定のメモリ制約やパフォーマンス要件がある場合のみ調整してください。
 
 ## ベンチマーク
 

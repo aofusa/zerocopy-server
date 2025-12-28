@@ -36,7 +36,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 ### HTTP Processing
 - **Keep-Alive**: Full HTTP/1.1 Keep-Alive support
 - **Chunked Transfer**: RFC 7230 compliant chunked decoder (state machine based)
-- **Buffer Pool**: Reduced memory allocation
+- **Buffer Pool**: Thread-local buffer pool with configurable sizes (reduces memory allocation overhead)
 - **Response Compression**: Dynamic Gzip/Brotli/Zstd compression with Accept-Encoding negotiation
 
 ### Performance
@@ -258,6 +258,13 @@ threads = 4
 http2_enabled = true
 # Enable HTTP/3 (only when built with --features http3)
 http3_enabled = true
+# Server header configuration (optional)
+# Security consideration: Server header reveals server software information
+# Recommended to disable in production environments
+# server_header_enabled = false
+# Custom Server header value (only effective when server_header_enabled = true)
+# Default: "veil" (protocol-specific values: "veil/http1.1", "veil/http2", "veil/http3")
+# server_header_value = "MyServer/1.0"
 
 [logging]
 # Log level: "trace", "debug", "info", "warn", "error", "off"
@@ -905,6 +912,48 @@ url = "http://localhost:8080"
   # Remove before sending to client
   remove_response_headers = ["X-Powered-By"]
 ```
+
+## Server Header Configuration
+
+Control the `Server` HTTP response header sent to clients.
+
+### Security Considerations
+
+The Server header reveals server software information, which can help attackers identify vulnerabilities. It is **recommended to disable in production environments** (default: disabled).
+
+### Configuration
+
+Configure in the `[server]` section:
+
+```toml
+[server]
+# Enable Server header (default: false)
+# Security consideration: Reveals server software information
+# Recommended to disable in production
+server_header_enabled = false
+
+# Custom Server header value (only effective when server_header_enabled = true)
+# Default: "veil"
+# When not specified, protocol-specific values are used:
+#   - HTTP/1.1: "veil/http1.1"
+#   - HTTP/2: "veil/http2"
+#   - HTTP/3: "veil/http3"
+server_header_value = "MyServer/1.0"
+```
+
+### Behavior
+
+| Setting | Behavior |
+|---------|----------|
+| `server_header_enabled = false` | No Server header is sent (default, recommended for production) |
+| `server_header_enabled = true`, `server_header_value` not specified | Protocol-specific values: `veil/http1.1`, `veil/http2`, or `veil/http3` |
+| `server_header_enabled = true`, `server_header_value = "Custom"` | All protocols use the custom value: `Server: Custom` |
+
+### Use Cases
+
+- **Development/Testing**: Enable to identify which server is responding
+- **Production**: Disable to hide server information (security best practice)
+- **Custom Branding**: Set a custom value when Server header is required
 
 ## Redirect
 
@@ -1705,6 +1754,47 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(60);   // Keep-Alive idle tim
 ```
 
 > **Note**: Some timeouts can be individually adjusted from config.toml via per-route security settings using `client_header_timeout_secs` and `backend_connect_timeout_secs`.
+
+### Buffer Pool Configuration
+
+The buffer pool reduces memory allocation overhead by pre-allocating buffers at startup. Configure in the `[buffer_pool]` section:
+
+```toml
+[buffer_pool]
+# Read buffer size (bytes)
+# Default: 65536 (64KB)
+read_buffer_size = 65536
+
+# Initial number of read buffers in pool
+# Default: 32
+initial_read_buffers = 32
+
+# Maximum number of read buffers in pool
+# Default: 128
+max_read_buffers = 128
+
+# Request construction buffer size (bytes)
+# Default: 1024 (1KB)
+request_buffer_size = 1024
+
+# Initial number of request buffers in pool
+# Default: 16
+initial_request_buffers = 16
+
+# Large request buffer size (bytes)
+# Default: 4096 (4KB)
+large_request_buffer_size = 4096
+
+# Path string buffer size (bytes)
+# Default: 256
+path_string_size = 256
+
+# Response header buffer size (bytes)
+# Default: 512
+response_header_buffer_size = 512
+```
+
+**Note**: Buffer pool configuration is optional. Default values are optimized for most use cases. Adjust only if you have specific memory constraints or performance requirements.
 
 ## Benchmarking
 

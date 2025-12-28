@@ -56,6 +56,28 @@ threads = 4
 #
 # http3_enabled = true
 
+# ====================
+# Serverヘッダー設定
+# ====================
+#
+# Serverヘッダーを有効化/無効化し、カスタム値を設定できます。
+#
+# セキュリティ考慮事項:
+# - Serverヘッダーはサーバーソフトウェア情報を公開します
+# - 攻撃者がバージョン別の脆弱性を狙う手がかりになり得ます
+# - 本番環境では無効化を推奨（デフォルト: false）
+#
+# Serverヘッダーを有効化
+# server_header_enabled = false
+#
+# カスタムServerヘッダー値（server_header_enabled = true時のみ有効）
+# デフォルト: "veil"
+# 未指定の場合、プロトコルごとに自動設定:
+#   - HTTP/1.1: "veil/http1.1"
+#   - HTTP/2: "veil/http2"
+#   - HTTP/3: "veil/http3"
+# server_header_value = "veil/1.0"
+
 
 # ====================
 # ログ設定（非同期ログの最適化）
