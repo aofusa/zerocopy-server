@@ -1259,6 +1259,217 @@ impl Http3Handler {
     }
 }
 
+// ====================
+// 非同期バックエンドプロキシ（monoio TcpStream 使用）
+// ====================
+
+/// バックエンドプロキシ結果
+pub struct BackendProxyResult {
+    /// HTTPステータスコード
+    pub status_code: u16,
+    /// レスポンスボディ
+    pub body: Vec<u8>,
+    /// レスポンスヘッダー（(name, value) のペア）
+    pub headers: Vec<(Vec<u8>, Vec<u8>)>,
+}
+
+/// バックエンドへの非同期プロキシ処理
+/// 
+/// monoio::net::TcpStream を使用して非同期にバックエンドへ接続します。
+/// HTTP/3 コネクションをブロックせずにバックエンド通信を行えます。
+pub async fn proxy_to_backend_async(
+    target: &ProxyTarget,
+    request: Vec<u8>,
+    timeout_secs: u64,
+) -> io::Result<BackendProxyResult> {
+    use monoio::net::TcpStream;
+    use std::os::unix::io::AsRawFd;
+    
+    let addr = format!("{}:{}", target.host, target.port);
+    debug!("[HTTP/3] Async connecting to backend {}", addr);
+    
+    // 非同期TCP接続（タイムアウト付き）
+    let connect_future = TcpStream::connect(&addr);
+    let backend = match monoio::time::timeout(
+        Duration::from_secs(timeout_secs),
+        connect_future
+    ).await {
+        Ok(Ok(stream)) => stream,
+        Ok(Err(e)) => {
+            warn!("[HTTP/3] Async backend connect error: {}", e);
+            return Err(e);
+        }
+        Err(_) => {
+            warn!("[HTTP/3] Async backend connect timeout");
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "Backend connect timeout"));
+        }
+    };
+    
+    debug!("[HTTP/3] Async connected to backend {}", addr);
+    let _ = backend.set_nodelay(true);
+    
+    // TLSバックエンドの場合
+    if target.use_tls {
+        return proxy_to_tls_backend_async(target, request, backend, timeout_secs).await;
+    }
+    
+    let fd = backend.as_raw_fd();
+    
+    // リクエスト送信（非同期）
+    let mut written = 0;
+    while written < request.len() {
+        match write_nonblocking(fd, &request[written..]) {
+            Ok(n) if n > 0 => written += n,
+            Ok(_) => {
+                backend.writable(false).await?;
+            }
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                backend.writable(false).await?;
+            }
+            Err(e) => return Err(e),
+        }
+    }
+    
+    debug!("[HTTP/3] Async request sent: {} bytes", written);
+    
+    // レスポンス受信（非同期）
+    let mut response = Vec::with_capacity(16384);
+    let mut buf = vec![0u8; 8192];
+    let read_timeout = Duration::from_secs(timeout_secs);
+    let start_time = std::time::Instant::now();
+    
+    loop {
+        if start_time.elapsed() > read_timeout {
+            break;
+        }
+        
+        match read_nonblocking(fd, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = read_timeout.saturating_sub(start_time.elapsed());
+                if remaining.is_zero() { break; }
+                match monoio::time::timeout(remaining, backend.readable(false)).await {
+                    Ok(Ok(())) => continue,
+                    Ok(Err(e)) if response.is_empty() => return Err(e),
+                    _ => break,
+                }
+            }
+            Err(e) if response.is_empty() => return Err(e),
+            Err(_) => break,
+        }
+    }
+    
+    debug!("[HTTP/3] Async response received: {} bytes", response.len());
+    parse_http_response(&response)
+}
+
+/// TLSバックエンドへの非同期プロキシ処理
+async fn proxy_to_tls_backend_async(
+    target: &ProxyTarget,
+    request: Vec<u8>,
+    tcp_stream: monoio::net::TcpStream,
+    timeout_secs: u64,
+) -> io::Result<BackendProxyResult> {
+    use rustls::ClientConfig;
+    use std::sync::Arc;
+    
+    let root_store = rustls::RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.to_vec(),
+    };
+    
+    let config = Arc::new(ClientConfig::builder()
+        .with_root_certificates(root_store)
+        .with_no_client_auth());
+    
+    let sni_name = target.sni_name.as_deref().unwrap_or(&target.host);
+    let server_name = match rustls::pki_types::ServerName::try_from(sni_name.to_string()) {
+        Ok(name) => name,
+        Err(e) => {
+            warn!("[HTTP/3] Invalid SNI name: {}", e);
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid SNI name"));
+        }
+    };
+    
+    let tls_stream = crate::simple_tls::connect(tcp_stream, config, server_name).await?;
+    let fd = tls_stream.as_raw_fd();
+    
+    let mut written = 0;
+    while written < request.len() {
+        match write_nonblocking(fd, &request[written..]) {
+            Ok(n) if n > 0 => written += n,
+            Ok(_) | Err(_) => {
+                tls_stream.get_ref().writable(false).await?;
+            }
+        }
+    }
+    
+    let mut response = Vec::with_capacity(16384);
+    let mut buf = vec![0u8; 8192];
+    let read_timeout = Duration::from_secs(timeout_secs);
+    let start_time = std::time::Instant::now();
+    
+    loop {
+        if start_time.elapsed() > read_timeout { break; }
+        match read_nonblocking(fd, &mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                let remaining = read_timeout.saturating_sub(start_time.elapsed());
+                if remaining.is_zero() { break; }
+                match monoio::time::timeout(remaining, tls_stream.get_ref().readable(false)).await {
+                    Ok(Ok(())) => continue,
+                    _ => break,
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    
+    parse_http_response(&response)
+}
+
+#[inline]
+fn read_nonblocking(fd: i32, buf: &mut [u8]) -> io::Result<usize> {
+    let result = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
+    if result < 0 { Err(io::Error::last_os_error()) } else { Ok(result as usize) }
+}
+
+#[inline]
+fn write_nonblocking(fd: i32, buf: &[u8]) -> io::Result<usize> {
+    let result = unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) };
+    if result < 0 { Err(io::Error::last_os_error()) } else { Ok(result as usize) }
+}
+
+fn parse_http_response(response: &[u8]) -> io::Result<BackendProxyResult> {
+    let header_end = find_header_end(response).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "Invalid HTTP response")
+    })?;
+    
+    let header_bytes = &response[..header_end];
+    let body = response[header_end + 4..].to_vec();
+    let status_code = parse_status_code(header_bytes).unwrap_or(502);
+    
+    let mut headers = Vec::new();
+    if let Some(first_crlf) = memchr::memchr(b'\n', header_bytes) {
+        for line in header_bytes[first_crlf + 1..].split(|&b| b == b'\n') {
+            let line = line.strip_suffix(&[b'\r']).unwrap_or(line);
+            if line.is_empty() { continue; }
+            if let Some(colon_pos) = memchr::memchr(b':', line) {
+                let name = &line[..colon_pos];
+                let value = line[colon_pos + 1..].strip_prefix(&[b' ']).unwrap_or(&line[colon_pos + 1..]);
+                if !name.eq_ignore_ascii_case(b"connection")
+                    && !name.eq_ignore_ascii_case(b"transfer-encoding")
+                    && !name.eq_ignore_ascii_case(b"keep-alive") {
+                    headers.push((name.to_vec(), value.to_vec()));
+                }
+            }
+        }
+    }
+    
+    Ok(BackendProxyResult { status_code, body, headers })
+}
+
 /// コネクション管理（Rc<RefCell> で共有）
 type ConnectionMap = Rc<RefCell<HashMap<ConnectionId<'static>, Http3Handler>>>;
 
@@ -1606,7 +1817,17 @@ pub async fn run_http3_server_async(
                             // エラー時も送信処理は続行
                         }
                     }
-
+                }
+            }
+            
+            // ハンドシェイクパケット送信（H3初期化前に送信することでCryptoFail回避）
+            // recv()後、is_established()がtrueになる前にServer Helloを送信する必要がある
+            send_pending_packets(&connections, &socket, local_addr).await;
+            
+            // H3初期化とイベント処理（ハンドシェイクパケット送信後）
+            {
+                let mut conns = connections.borrow_mut();
+                for (_, handler) in conns.iter_mut() {
                     // HTTP/3 初期化
                     if handler.h3_conn.is_none() && handler.conn.is_established() {
                         debug!("[HTTP/3] Connection established, initializing H3");
@@ -1648,6 +1869,12 @@ async fn send_pending_packets(
             let (write, send_info) = match handler.conn.send(&mut send_buf) {
                 Ok(v) => v,
                 Err(quiche::Error::Done) => break,
+                Err(quiche::Error::CryptoFail) => {
+                    // ハンドシェイク途中のため暗号化パケット生成に失敗
+                    // 次のイテレーションで再試行される（コネクションは閉じない）
+                    debug!("[HTTP/3] CryptoFail (handshake in progress), will retry");
+                    break;
+                }
                 Err(e) => {
                     error!("[HTTP/3] send error: {}", e);
                     handler.conn.close(false, 0x1, b"send error").ok();

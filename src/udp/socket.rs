@@ -2,6 +2,12 @@
 //!
 //! monoio と統合した UDP ソケット実装。
 //! Linux GSO/GRO をサポートして高スループットを実現。
+//!
+//! ## 改善点 (v2)
+//! - sendmsg/recvmsg を使用した正しい GSO/GRO 実装
+//! - UDP_SEGMENT CMSG によるカーネルレベル GSO
+//! - UDP_GRO CMSG によるカーネルレベル GRO
+//! - 非ブロッキング I/O 統合
 
 #![allow(unused_imports)]
 
@@ -11,11 +17,34 @@ use std::os::unix::io::AsRawFd;
 
 use monoio::net::udp::UdpSocket;
 
-/// GSO セグメントサイズ
+/// GSO セグメントサイズ（QUIC パケットの典型的なサイズ）
 const GSO_SEGMENT_SIZE: usize = 1200;
 
 /// 受信バッファサイズ
 const RECV_BUFFER_SIZE: usize = 65536;
+
+/// CMSG バッファサイズ（UDP_SEGMENT + UDP_GRO 用）
+const CMSG_BUFFER_SIZE: usize = 128;
+
+/// GSO 送信結果
+#[derive(Debug)]
+pub struct GsoSendResult {
+    /// 送信されたバイト数
+    pub bytes_sent: usize,
+    /// GSO が使用されたかどうか
+    pub gso_used: bool,
+}
+
+/// GRO 受信結果
+#[derive(Debug)]
+pub struct GroRecvResult {
+    /// 受信したバイト数
+    pub bytes_received: usize,
+    /// 送信元アドレス
+    pub from: SocketAddr,
+    /// GRO セグメントサイズ（GRO 使用時）
+    pub gro_segment_size: Option<u16>,
+}
 
 /// QUIC 用 UDP ソケット
 pub struct QuicUdpSocket {
@@ -52,11 +81,11 @@ impl QuicUdpSocket {
     fn configure_gso_gro(&mut self) -> io::Result<()> {
         #[cfg(target_os = "linux")]
         {
-            use std::os::unix::io::AsRawFd;
-
             let fd = self.socket.as_raw_fd();
 
             // UDP_SEGMENT (GSO) を有効化
+            // 注意: setsockopt での設定はデフォルト値。実際の GSO は
+            // sendmsg の CMSG で指定する必要がある
             let gso_size: libc::c_int = GSO_SEGMENT_SIZE as libc::c_int;
             let result = unsafe {
                 libc::setsockopt(
@@ -110,17 +139,167 @@ impl QuicUdpSocket {
         Ok(())
     }
 
-    /// パケットを受信
+    /// パケットを受信（基本版）
     pub async fn recv_from(&self, buf: Vec<u8>) -> (io::Result<(usize, SocketAddr)>, Vec<u8>) {
         self.socket.recv_from(buf).await
     }
 
-    /// パケットを送信
+    /// パケットを送信（基本版）
     pub async fn send_to(&self, buf: Vec<u8>, target: SocketAddr) -> (io::Result<usize>, Vec<u8>) {
         self.socket.send_to(buf, target).await
     }
 
-    /// 複数パケットを GSO で送信 (Linux のみ)
+    /// GSO を使用して複数パケットを効率的に送信
+    /// 
+    /// この関数は sendmsg(2) と UDP_SEGMENT CMSG を使用して、
+    /// カーネルレベルでパケットをセグメント化します。
+    /// 
+    /// # 引数
+    /// - `data`: 送信するデータ（複数パケットを結合済み）
+    /// - `segment_size`: 各パケットのセグメントサイズ
+    /// - `target`: 送信先アドレス
+    /// 
+    /// # 戻り値
+    /// - 送信されたバイト数と GSO 使用有無
+    #[cfg(target_os = "linux")]
+    pub fn send_with_gso_sync(
+        &self,
+        data: &[u8],
+        segment_size: u16,
+        target: SocketAddr,
+    ) -> io::Result<GsoSendResult> {
+        use std::mem::MaybeUninit;
+
+        if !self.gso_enabled || data.len() <= segment_size as usize {
+            // GSO 無効または単一パケットの場合は通常送信
+            return self.send_single_sync(data, target).map(|bytes| GsoSendResult {
+                bytes_sent: bytes,
+                gso_used: false,
+            });
+        }
+
+        let fd = self.socket.as_raw_fd();
+
+        // sockaddr を構築
+        let (sockaddr, sockaddr_len) = socket_addr_to_raw(target);
+
+        // iovec を構築
+        let iov = libc::iovec {
+            iov_base: data.as_ptr() as *mut libc::c_void,
+            iov_len: data.len(),
+        };
+
+        // CMSG バッファを構築（UDP_SEGMENT 用）
+        let mut cmsg_buf = [0u8; CMSG_BUFFER_SIZE];
+        let cmsg_len = build_gso_cmsg(&mut cmsg_buf, segment_size)?;
+
+        // msghdr を構築
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = &sockaddr as *const _ as *mut libc::c_void;
+        msg.msg_namelen = sockaddr_len;
+        msg.msg_iov = &iov as *const _ as *mut libc::iovec;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_len;
+        msg.msg_flags = 0;
+
+        // sendmsg を呼び出し
+        let result = unsafe { libc::sendmsg(fd, &msg, 0) };
+
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(GsoSendResult {
+            bytes_sent: result as usize,
+            gso_used: true,
+        })
+    }
+
+    /// 単一パケットを送信（同期版）
+    #[cfg(target_os = "linux")]
+    fn send_single_sync(&self, data: &[u8], target: SocketAddr) -> io::Result<usize> {
+        let fd = self.socket.as_raw_fd();
+        let (sockaddr, sockaddr_len) = socket_addr_to_raw(target);
+
+        let result = unsafe {
+            libc::sendto(
+                fd,
+                data.as_ptr() as *const libc::c_void,
+                data.len(),
+                0,
+                &sockaddr as *const _ as *const libc::sockaddr,
+                sockaddr_len,
+            )
+        };
+
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        Ok(result as usize)
+    }
+
+    /// GRO を使用してパケットを受信
+    /// 
+    /// この関数は recvmsg(2) と UDP_GRO CMSG を使用して、
+    /// カーネルレベルで結合されたパケットを受信します。
+    /// 
+    /// # 引数
+    /// - `buf`: 受信バッファ
+    /// 
+    /// # 戻り値
+    /// - 受信結果（バイト数、送信元アドレス、GRO セグメントサイズ）
+    #[cfg(target_os = "linux")]
+    pub fn recv_with_gro_sync(&self, buf: &mut [u8]) -> io::Result<GroRecvResult> {
+        let fd = self.socket.as_raw_fd();
+
+        // sockaddr バッファ
+        let mut sockaddr_storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+
+        // iovec を構築
+        let mut iov = libc::iovec {
+            iov_base: buf.as_mut_ptr() as *mut libc::c_void,
+            iov_len: buf.len(),
+        };
+
+        // CMSG バッファ
+        let mut cmsg_buf = [0u8; CMSG_BUFFER_SIZE];
+
+        // msghdr を構築
+        let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
+        msg.msg_name = &mut sockaddr_storage as *mut _ as *mut libc::c_void;
+        msg.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as libc::socklen_t;
+        msg.msg_iov = &mut iov;
+        msg.msg_iovlen = 1;
+        msg.msg_control = cmsg_buf.as_mut_ptr() as *mut libc::c_void;
+        msg.msg_controllen = cmsg_buf.len();
+        msg.msg_flags = 0;
+
+        // recvmsg を呼び出し
+        let result = unsafe { libc::recvmsg(fd, &mut msg, 0) };
+
+        if result < 0 {
+            return Err(io::Error::last_os_error());
+        }
+
+        // 送信元アドレスを解析
+        let from = raw_to_socket_addr(&sockaddr_storage)?;
+
+        // GRO セグメントサイズを解析
+        let gro_segment_size = parse_gro_cmsg(&msg);
+
+        Ok(GroRecvResult {
+            bytes_received: result as usize,
+            from,
+            gro_segment_size,
+        })
+    }
+
+    /// 複数パケットを GSO で送信（非同期ラッパー）
+    /// 
+    /// monoio は sendmsg を直接サポートしていないため、
+    /// 非ブロッキングソケットで同期 API を使用します。
     #[cfg(target_os = "linux")]
     pub async fn send_gso(&self, packets: &[&[u8]], target: SocketAddr) -> io::Result<usize> {
         if !self.gso_enabled || packets.is_empty() {
@@ -135,13 +314,15 @@ impl QuicUdpSocket {
         }
 
         // パケットを結合
+        let segment_size = packets.first().map(|p| p.len()).unwrap_or(GSO_SEGMENT_SIZE) as u16;
         let mut combined = Vec::with_capacity(packets.iter().map(|p| p.len()).sum());
         for packet in packets {
             combined.extend_from_slice(packet);
         }
 
-        let (result, _) = self.socket.send_to(combined, target).await;
-        result
+        // GSO 付き送信
+        let result = self.send_with_gso_sync(&combined, segment_size, target)?;
+        Ok(result.bytes_sent)
     }
 
     /// GSO が有効かどうか
@@ -162,6 +343,132 @@ impl QuicUdpSocket {
     /// 内部ソケットへの参照を取得
     pub fn inner(&self) -> &UdpSocket {
         &self.socket
+    }
+    
+    /// 内部ソケットの raw fd を取得
+    pub fn as_raw_fd(&self) -> i32 {
+        self.socket.as_raw_fd()
+    }
+}
+
+// ====================
+// GSO/GRO CMSG ヘルパー関数
+// ====================
+
+/// UDP_SEGMENT 用の CMSG を構築
+/// 
+/// sendmsg(2) で使用する制御メッセージを構築します。
+/// カーネルはこのセグメントサイズでデータを分割して送信します。
+#[cfg(target_os = "linux")]
+fn build_gso_cmsg(buf: &mut [u8], segment_size: u16) -> io::Result<usize> {
+    // CMSG ヘッダサイズの計算
+    let cmsg_space = unsafe { libc::CMSG_SPACE(std::mem::size_of::<u16>() as u32) as usize };
+    
+    if buf.len() < cmsg_space {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "CMSG buffer too small",
+        ));
+    }
+
+    // cmsghdr を構築
+    let cmsg = buf.as_mut_ptr() as *mut libc::cmsghdr;
+    unsafe {
+        (*cmsg).cmsg_len = libc::CMSG_LEN(std::mem::size_of::<u16>() as u32) as usize;
+        (*cmsg).cmsg_level = libc::SOL_UDP;
+        (*cmsg).cmsg_type = libc::UDP_SEGMENT;
+
+        // セグメントサイズをデータ領域に書き込み
+        let data_ptr = libc::CMSG_DATA(cmsg) as *mut u16;
+        *data_ptr = segment_size;
+    }
+
+    Ok(cmsg_space)
+}
+
+/// recvmsg から UDP_GRO セグメントサイズを解析
+/// 
+/// カーネルが GRO で結合したパケットの元のセグメントサイズを取得します。
+#[cfg(target_os = "linux")]
+fn parse_gro_cmsg(msg: &libc::msghdr) -> Option<u16> {
+    // CMSG を走査
+    let mut cmsg = unsafe { libc::CMSG_FIRSTHDR(msg) };
+    
+    while !cmsg.is_null() {
+        let cmsg_ref = unsafe { &*cmsg };
+        
+        if cmsg_ref.cmsg_level == libc::SOL_UDP && cmsg_ref.cmsg_type == libc::UDP_GRO {
+            // GRO セグメントサイズを読み取り
+            let data_ptr = unsafe { libc::CMSG_DATA(cmsg) as *const u16 };
+            return Some(unsafe { *data_ptr });
+        }
+        
+        cmsg = unsafe { libc::CMSG_NXTHDR(msg, cmsg) };
+    }
+    
+    None
+}
+
+// ====================
+// SocketAddr 変換ヘルパー
+// ====================
+
+/// SocketAddr を libc sockaddr に変換
+#[cfg(target_os = "linux")]
+fn socket_addr_to_raw(addr: SocketAddr) -> (libc::sockaddr_storage, libc::socklen_t) {
+    let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
+    
+    match addr {
+        SocketAddr::V4(v4) => {
+            let sin = &mut storage as *mut _ as *mut libc::sockaddr_in;
+            unsafe {
+                (*sin).sin_family = libc::AF_INET as libc::sa_family_t;
+                (*sin).sin_port = v4.port().to_be();
+                (*sin).sin_addr.s_addr = u32::from_ne_bytes(v4.ip().octets());
+            }
+            (storage, std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t)
+        }
+        SocketAddr::V6(v6) => {
+            let sin6 = &mut storage as *mut _ as *mut libc::sockaddr_in6;
+            unsafe {
+                (*sin6).sin6_family = libc::AF_INET6 as libc::sa_family_t;
+                (*sin6).sin6_port = v6.port().to_be();
+                (*sin6).sin6_flowinfo = v6.flowinfo();
+                (*sin6).sin6_addr.s6_addr = v6.ip().octets();
+                (*sin6).sin6_scope_id = v6.scope_id();
+            }
+            (storage, std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t)
+        }
+    }
+}
+
+/// libc sockaddr_storage を SocketAddr に変換
+#[cfg(target_os = "linux")]
+fn raw_to_socket_addr(storage: &libc::sockaddr_storage) -> io::Result<SocketAddr> {
+    match storage.ss_family as libc::c_int {
+        libc::AF_INET => {
+            let sin = storage as *const _ as *const libc::sockaddr_in;
+            let sin_ref = unsafe { &*sin };
+            let ip = std::net::Ipv4Addr::from(sin_ref.sin_addr.s_addr.to_ne_bytes());
+            let port = u16::from_be(sin_ref.sin_port);
+            Ok(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
+        }
+        libc::AF_INET6 => {
+            let sin6 = storage as *const _ as *const libc::sockaddr_in6;
+            let sin6_ref = unsafe { &*sin6 };
+            let ip = std::net::Ipv6Addr::from(sin6_ref.sin6_addr.s6_addr);
+            let port = u16::from_be(sin6_ref.sin6_port);
+            Ok(SocketAddr::V6(std::net::SocketAddrV6::new(
+                ip,
+                port,
+                sin6_ref.sin6_flowinfo,
+                sin6_ref.sin6_scope_id,
+            )))
+        }
+        _ => Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Unknown address family",
+        )),
     }
 }
 
@@ -235,6 +542,45 @@ mod tests {
         let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0);
         
         assert_eq!(addr.ip(), IpAddr::V4(Ipv4Addr::new(0, 0, 0, 0)));
+    }
+
+    // ====================
+    // CMSG テスト
+    // ====================
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_build_gso_cmsg() {
+        let mut buf = [0u8; CMSG_BUFFER_SIZE];
+        let segment_size: u16 = 1200;
+        
+        let result = build_gso_cmsg(&mut buf, segment_size);
+        assert!(result.is_ok());
+        
+        let cmsg_len = result.unwrap();
+        assert!(cmsg_len > 0);
+        assert!(cmsg_len <= CMSG_BUFFER_SIZE);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_socket_addr_conversion_v4() {
+        let original = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 1)), 12345);
+        let (storage, _) = socket_addr_to_raw(original);
+        let recovered = raw_to_socket_addr(&storage).unwrap();
+        
+        assert_eq!(original, recovered);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn test_socket_addr_conversion_v6() {
+        use std::net::Ipv6Addr;
+        let original = SocketAddr::new(IpAddr::V6(Ipv6Addr::LOCALHOST), 54321);
+        let (storage, _) = socket_addr_to_raw(original);
+        let recovered = raw_to_socket_addr(&storage).unwrap();
+        
+        assert_eq!(original, recovered);
     }
 
     // 注: 実際のソケット操作（bind, recv, send）はmonoioランタイムが必要
