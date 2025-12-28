@@ -614,8 +614,10 @@ impl Http3Handler {
             }
         };
         
-        // ステータスを含むヘッダーを構築
-        let status_str = status.to_string();
+        
+        // ステータスを含むヘッダーを構築（itoa::Buffer使用でヒープ割り当て削減）
+        let mut status_buf = itoa::Buffer::new();
+        let status_str = status_buf.format(status);
         let mut h3_headers = vec![h3::Header::new(b":status", status_str.as_bytes())];
         
         for (name, value) in headers {
@@ -624,9 +626,10 @@ impl Http3Handler {
             }
         }
         
-        // Content-Length を追加
+        // Content-Length を追加（itoa::Buffer使用）
         if let Some(body_data) = body {
-            let len_str = body_data.len().to_string();
+            let mut len_buf = itoa::Buffer::new();
+            let len_str = len_buf.format(body_data.len());
             h3_headers.push(h3::Header::new(b"content-length", len_str.as_bytes()));
         }
         

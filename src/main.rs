@@ -3073,8 +3073,118 @@ fn buf_put_vec(mut buf: Vec<u8>) {
 }
 
 // ====================
+// リクエスト構築用バッファプール（メモリ割り当て最適化）
+// ====================
+//
+// リクエスト構築時の動的メモリ割り当てを削減するため、
+// スレッドローカルなバッファプールを使用します。
+// ====================
+
+/// リクエスト構築用バッファサイズ
+const REQUEST_BUF_SIZE: usize = 1024;
+/// 大容量リクエスト用バッファサイズ
+const LARGE_REQUEST_BUF_SIZE: usize = 4096;
+/// パス文字列用バッファサイズ
+const PATH_STRING_SIZE: usize = 256;
+
+thread_local! {
+    /// リクエスト構築用バッファプール（1KB × 16）
+    static REQUEST_BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(
+        (0..16).map(|_| Vec::with_capacity(REQUEST_BUF_SIZE)).collect()
+    );
+    
+    /// 大容量リクエスト用バッファプール（4KB × 4）
+    static LARGE_REQUEST_BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(
+        (0..4).map(|_| Vec::with_capacity(LARGE_REQUEST_BUF_SIZE)).collect()
+    );
+    
+    /// パス構築用Stringプール（256B × 16）
+    static PATH_STRING_POOL: RefCell<Vec<String>> = RefCell::new(
+        (0..16).map(|_| String::with_capacity(PATH_STRING_SIZE)).collect()
+    );
+    
+    /// レスポンスヘッダー構築用バッファプール（512B × 16）
+    static RESPONSE_HEADER_BUF_POOL: RefCell<Vec<Vec<u8>>> = RefCell::new(
+        (0..16).map(|_| Vec::with_capacity(512)).collect()
+    );
+}
+
+/// リクエスト構築用バッファを取得
+#[inline]
+fn request_buf_get(size_hint: usize) -> Vec<u8> {
+    if size_hint <= REQUEST_BUF_SIZE {
+        REQUEST_BUF_POOL.with(|p| {
+            p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(REQUEST_BUF_SIZE))
+        })
+    } else {
+        LARGE_REQUEST_BUF_POOL.with(|p| {
+            p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(LARGE_REQUEST_BUF_SIZE))
+        })
+    }
+}
+
+/// リクエスト構築用バッファを返却
+#[inline]
+fn request_buf_put(mut buf: Vec<u8>) {
+    buf.clear();
+    let capacity = buf.capacity();
+    if capacity == REQUEST_BUF_SIZE {
+        REQUEST_BUF_POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.len() < 32 { pool.push(buf); }
+        });
+    } else if capacity == LARGE_REQUEST_BUF_SIZE {
+        LARGE_REQUEST_BUF_POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.len() < 8 { pool.push(buf); }
+        });
+    }
+}
+
+/// パス文字列用Stringを取得
+#[inline]
+fn path_string_get() -> String {
+    PATH_STRING_POOL.with(|p| {
+        p.borrow_mut().pop().unwrap_or_else(|| String::with_capacity(PATH_STRING_SIZE))
+    })
+}
+
+/// パス文字列用Stringを返却
+#[inline]
+fn path_string_put(mut s: String) {
+    s.clear();
+    if s.capacity() == PATH_STRING_SIZE {
+        PATH_STRING_POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.len() < 32 { pool.push(s); }
+        });
+    }
+}
+
+/// レスポンスヘッダー構築用バッファを取得
+#[inline]
+fn response_header_buf_get() -> Vec<u8> {
+    RESPONSE_HEADER_BUF_POOL.with(|p| {
+        p.borrow_mut().pop().unwrap_or_else(|| Vec::with_capacity(512))
+    })
+}
+
+/// レスポンスヘッダー構築用バッファを返却
+#[inline]
+fn response_header_buf_put(mut buf: Vec<u8>) {
+    buf.clear();
+    if buf.capacity() >= 512 && buf.capacity() <= 2048 {
+        RESPONSE_HEADER_BUF_POOL.with(|p| {
+            let mut pool = p.borrow_mut();
+            if pool.len() < 32 { pool.push(buf); }
+        });
+    }
+}
+
+// ====================
 // 設定構造体
 // ====================
+
 
 /// Upstream サーバーエントリ（文字列または構造体）
 /// 
@@ -7830,8 +7940,8 @@ where
         Vec::new()
     };
     
-    // HTTP/1.1 リクエスト構築
-    let mut request = Vec::with_capacity(1024);
+    // HTTP/1.1 リクエスト構築（プール使用）
+    let mut request = request_buf_get(1024);
     request.extend_from_slice(method);
     request.extend_from_slice(b" ");
     request.extend_from_slice(final_path.as_bytes());
@@ -9923,9 +10033,9 @@ async fn handle_websocket_proxy(
     
     let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
     
-    // WebSocket アップグレードリクエスト構築
+    // WebSocket アップグレードリクエスト構築（プール使用）
     // Connection: Upgrade と Upgrade: websocket を維持
-    let mut request = Vec::with_capacity(1024);
+    let mut request = request_buf_get(1024);
     request.extend_from_slice(method);
     request.extend_from_slice(HEADER_SPACE);
     request.extend_from_slice(final_path.as_bytes());
@@ -10668,9 +10778,9 @@ async fn handle_proxy(
     
     let final_path = if sub_path.is_empty() { "/" } else { &sub_path };
 
-    // HTTPリクエスト構築（Connection: keep-alive を使用）
+    // HTTPリクエスト構築（プール使用）
     // 定数バイト列を使用してアロケーションを削減
-    let mut request = Vec::with_capacity(1024);
+    let mut request = request_buf_get(1024);
     request.extend_from_slice(method);
     request.extend_from_slice(HEADER_SPACE);
     request.extend_from_slice(final_path.as_bytes());
