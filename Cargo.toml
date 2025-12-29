@@ -29,7 +29,7 @@ http2 = []
 # UDP/QUIC を使用した HTTP/3 プロトコル
 # 注意: HTTP/3 は UDP ベースのため kTLS は使用不可
 # GSO/GRO による高パフォーマンス UDP 処理
-http3 = ["quiche", "ring"]
+http3 = ["quiche"]
 
 # WASM Extension サポート (Proxy-Wasm v0.2.1)
 # Wasmtime ランタイムによる WebAssembly フィルタ
@@ -43,6 +43,7 @@ all-protocols = ["http2", "http3"]
 monoio = { version = "0.2.4" }
 # rustls を直接使用（ハンドシェイク後に kTLS へオフロード）
 rustls = { version = "0.23.35", features = ["tls12", "aws_lc_rs"] }
+aws-lc-rs = "1.15.2"
 webpki-roots = "1.0.4"
 rustls-pki-types = "1.13.2"
 libc = "0.2.178"
@@ -95,10 +96,6 @@ quiche = { version = "0.24.6", optional = true }
 # - cranelift: AOT コンパイル
 # - component-model: WASI対応
 wasmtime = { version = "40.0.0", optional = true, features = ["pooling-allocator", "cranelift"] }
-
-# ring依存をaws-lc-rsに移行完了
-# http3 featureでのみquiche経由で使用される（許容）
-ring = { version = "0.17.14", optional = true }
 
 # nix: Unix システムコール用のRustラッパー
 # - uname() でカーネルバージョン取得

@@ -33,7 +33,7 @@ use monoio::net::udp::UdpSocket;
 use crate::udp::QuicUdpSocket;
 use quiche::{h3, Config, ConnectionId};
 use quiche::h3::NameValue;
-use ring::rand::*;
+use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
 use ftlog::{info, warn, error, debug};
 
