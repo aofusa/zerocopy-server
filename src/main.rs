@@ -5529,6 +5529,8 @@ struct LoadedConfig {
     /// WASM Filter Engine（WASM機能が有効な場合）
     #[cfg(feature = "wasm")]
     wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
+    /// パフォーマンス設定
+    performance: PerformanceConfigSection,
 }
 
 // ====================
@@ -5586,6 +5588,8 @@ struct RuntimeConfig {
     /// WASM Filter Engine（WASM機能が有効な場合）
     #[cfg(feature = "wasm")]
     wasm_filter_engine: Option<Arc<crate::wasm::FilterEngine>>,
+    /// パフォーマンス設定（Via header, chunk size等）
+    performance: PerformanceConfigSection,
 }
 
 impl Default for RuntimeConfig {
@@ -5606,6 +5610,7 @@ impl Default for RuntimeConfig {
             http3_config: Http3ConfigSection::default(),
             #[cfg(feature = "wasm")]
             wasm_filter_engine: None,
+            performance: PerformanceConfigSection::default(),
         }
     }
 }
@@ -5666,6 +5671,7 @@ fn reload_config(path: &Path) -> io::Result<()> {
         http3_config: loaded.http3_config,
         #[cfg(feature = "wasm")]
         wasm_filter_engine: current.wasm_filter_engine.clone(),
+        performance: loaded.performance.clone(),
     };
     
     // アトミックに設定を入れ替え
@@ -5691,6 +5697,7 @@ struct LoadedConfigWithoutTls {
     http2_config: Http2ConfigSection,
     #[cfg(feature = "http3")]
     http3_config: Http3ConfigSection,
+    performance: PerformanceConfigSection,
 }
 
 /// TLS証明書を除いた設定をロード（ホットリロード用）
@@ -5775,6 +5782,7 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         http2_config,
         #[cfg(feature = "http3")]
         http3_config,
+        performance: config.performance.clone(),
     })
 }
 
@@ -5976,6 +5984,7 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
         http3_config,
         #[cfg(feature = "wasm")]
         wasm_filter_engine,
+        performance: config.performance.clone(),
     })
 }
 
@@ -6620,6 +6629,7 @@ fn main() {
         http3_config: loaded_config.http3_config.clone(),
         #[cfg(feature = "wasm")]
         wasm_filter_engine: loaded_config.wasm_filter_engine.clone(),
+        performance: loaded_config.performance.clone(),
     };
     CURRENT_CONFIG.store(Arc::new(runtime_config));
     info!("Runtime configuration initialized (hot reload enabled via SIGHUP)");
@@ -9570,6 +9580,17 @@ async fn handle_requests(
                 
                 drop(req);
                 
+                // HTTP/1.1 100 Continue レスポンス (RFC 7231 Section 5.1.1)
+                // Expect: 100-continue ヘッダーがある場合、ボディ送信前に 100 Continue を返す
+                if content_length > 0 && check_expect_continue(&headers_for_proxy) {
+                    // ボディサイズが制限内であることを確認済みなので 100 Continue を送信
+                    let write_result = timeout(WRITE_TIMEOUT, tls_stream.write_all(HTTP_100_CONTINUE.to_vec())).await;
+                    if let Err(_) | Ok((Err(_), _)) = write_result {
+                        // 100 Continue 送信に失敗した場合は接続を閉じる
+                        return;
+                    }
+                }
+                
                 // メトリクスエンドポイントの処理（設定可能なパス）
                 // Prometheusスクレイピング用の特別なパス
                 {
@@ -11480,6 +11501,21 @@ async fn handle_proxy(
         request.extend_from_slice(HEADER_COLON);
         request.extend_from_slice(value_replaced.as_bytes());
         request.extend_from_slice(HEADER_CRLF);
+    }
+    
+    // Via ヘッダー追加 (RFC 7230 Section 5.7.1)
+    // プロキシ経由のリクエストに Via ヘッダーを追加
+    {
+        let config = CURRENT_CONFIG.load();
+        if config.performance.via_header_enabled {
+            let hostname = config.performance.via_header_hostname
+                .as_deref()
+                .unwrap_or("veil");
+            // Via: 1.1 <hostname>
+            request.extend_from_slice(b"Via: 1.1 ");
+            request.extend_from_slice(hostname.as_bytes());
+            request.extend_from_slice(HEADER_CRLF);
+        }
     }
     
     // バックエンドにはKeep-Aliveを要求
@@ -13553,10 +13589,17 @@ async fn splice_body_transfer(
     let dst_fd = dst_stream.as_raw_fd();
     let mut total = 0u64;
     
-    const SPLICE_CHUNK_SIZE: usize = 65536;
+    // 設定に基づいてチャンクサイズを決定
+    let chunk_size_config = {
+        let config = CURRENT_CONFIG.load();
+        match config.performance.chunk_size_mode {
+            ChunkSizeMode::Dynamic => calculate_optimal_chunk_size(remaining as u64),
+            ChunkSizeMode::Manual => config.performance.manual_chunk_size,
+        }
+    };
     
     while remaining > 0 {
-        let chunk_size = remaining.min(SPLICE_CHUNK_SIZE);
+        let chunk_size = remaining.min(chunk_size_config);
         
         match pipe.transfer(src_fd, dst_fd, chunk_size) {
             Ok(0) => break,
@@ -13610,13 +13653,52 @@ async fn proxy_http_request_splice(
     is_chunked: bool,
     initial_body: &[u8],
 ) -> Option<(u16, u64, bool)> {
-    // splice パイプを取得
-    let pipe_ref = get_splice_pipe();
-    let pipe = match pipe_ref.as_ref() {
-        Some(p) => p,
-        None => {
-            warn!("splice pipe not available, falling back to normal transfer");
-            return None;
+    // 設定に基づいてパイプを取得または作成
+    let per_stream_pipe_enabled = {
+        let config = CURRENT_CONFIG.load();
+        config.performance.per_stream_pipe_enabled
+    };
+    
+    // パイプ取得: ストリーム毎の新規パイプ or スレッドローカル再利用
+    // 所有権とライフタイムを統一するため、Option<SplicePipe> と Ref を別々に扱う
+    // 注: 変数への代入は所有権保持のため必須（パイプへの参照が有効な間は保持が必要）
+    #[allow(unused_assignments)]
+    let mut per_stream_pipe: Option<ktls_rustls::SplicePipe> = None;
+    #[allow(unused_assignments)]
+    let mut thread_local_pipe_ref = None;
+    
+    let pipe: &ktls_rustls::SplicePipe = if per_stream_pipe_enabled {
+        // ストリーム毎に新規パイプを作成（高並行性環境向け）
+        match ktls_rustls::SplicePipe::new() {
+            Ok(p) => {
+                per_stream_pipe = Some(p);
+                thread_local_pipe_ref = None;
+                per_stream_pipe.as_ref().unwrap()
+            }
+            Err(e) => {
+                warn!("Failed to create per-stream splice pipe: {}, falling back to thread-local", e);
+                // フォールバック: スレッドローカルパイプを使用
+                thread_local_pipe_ref = Some(get_splice_pipe());
+                per_stream_pipe = None;
+                match thread_local_pipe_ref.as_ref().and_then(|r| r.as_ref()) {
+                    Some(p) => p,
+                    None => {
+                        warn!("splice pipe not available, falling back to normal transfer");
+                        return None;
+                    }
+                }
+            }
+        }
+    } else {
+        // スレッドローカルパイプを再利用（メモリ効率重視）
+        per_stream_pipe = None;
+        thread_local_pipe_ref = Some(get_splice_pipe());
+        match thread_local_pipe_ref.as_ref().and_then(|r| r.as_ref()) {
+            Some(p) => p,
+            None => {
+                warn!("splice pipe not available, falling back to normal transfer");
+                return None;
+            }
         }
     };
     
@@ -14852,12 +14934,18 @@ async fn handle_sendfile_zerocopy(
     let mut total_sent = 0u64;
     
     // sendfile を使用してファイルをゼロコピー送信
-    // sendfile はブロッキング呼び出しのため、大きなファイルはチャンク分割して送信
-    const SENDFILE_CHUNK_SIZE: usize = 1024 * 1024; // 1MB チャンク
+    // 設定に基づいてチャンクサイズを決定
+    let chunk_size_config = {
+        let config = CURRENT_CONFIG.load();
+        match config.performance.chunk_size_mode {
+            ChunkSizeMode::Dynamic => calculate_optimal_chunk_size(file_size),
+            ChunkSizeMode::Manual => config.performance.manual_chunk_size,
+        }
+    };
     
     while (offset as u64) < file_size {
         let remaining = file_size - (offset as u64);
-        let chunk_size = (remaining as usize).min(SENDFILE_CHUNK_SIZE);
+        let chunk_size = (remaining as usize).min(chunk_size_config);
         
         // sendfile 実行
         match tls_stream.sendfile(file_fd, &mut offset, chunk_size) {
