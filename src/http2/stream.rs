@@ -385,7 +385,10 @@ impl StreamManager {
     pub fn get_or_create_client_stream(&mut self, id: u32) -> Result<&mut Stream, Http2Error> {
         // クライアントストリームは奇数
         if id % 2 == 0 {
-            return Err(Http2Error::protocol_error("Client stream ID must be odd"));
+            return Err(Http2Error::connection_error(
+                Http2ErrorCode::ProtocolError,
+                "Client stream ID must be odd",
+            ));
         }
 
         // GOAWAY 受信後のストリーム ID 制限チェック
@@ -398,20 +401,33 @@ impl StreamManager {
             }
         }
 
-        // ストリーム ID は単調増加
-        if id > self.max_client_stream_id {
-            // 同時ストリーム数チェック
-            let active_count = self.active_stream_count();
-            if active_count >= self.max_concurrent_streams as usize {
-                return Err(Http2Error::connection_error(
-                    Http2ErrorCode::RefusedStream,
-                    "Too many concurrent streams",
-                ));
-            }
-
-            self.max_client_stream_id = id;
-            self.streams.insert(id, Stream::new(id, self.initial_window_size));
+        // 既存ストリームの取得
+        if self.streams.contains_key(&id) {
+            return self.streams.get_mut(&id).ok_or_else(|| {
+                Http2Error::stream_error(id, Http2ErrorCode::StreamClosed, "Stream not found")
+            });
         }
+
+        // RFC 7540 Section 5.1.1: ストリーム ID は単調増加でなければならない
+        if id <= self.max_client_stream_id {
+            return Err(Http2Error::connection_error(
+                Http2ErrorCode::ProtocolError,
+                format!("Stream ID {} not greater than last opened stream {}", id, self.max_client_stream_id),
+            ));
+        }
+
+        // 同時ストリーム数チェック
+        let active_count = self.active_stream_count();
+        if active_count >= self.max_concurrent_streams as usize {
+            return Err(Http2Error::stream_error(
+                id,
+                Http2ErrorCode::RefusedStream,
+                "Too many concurrent streams",
+            ));
+        }
+
+        self.max_client_stream_id = id;
+        self.streams.insert(id, Stream::new(id, self.initial_window_size));
 
         self.streams.get_mut(&id).ok_or_else(|| {
             Http2Error::stream_error(id, Http2ErrorCode::StreamClosed, "Stream not found")

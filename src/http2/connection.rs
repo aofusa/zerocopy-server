@@ -181,9 +181,19 @@ where
             self.read_more().await?;
         }
 
-        // フレームをデコード
+        // フレームをデコード (安全なスライスアクセス)
         let payload_start = self.buf_start + FrameHeader::SIZE;
-        let payload = &self.read_buf[payload_start..self.buf_start + total_len];
+        let payload_end = self.buf_start + total_len;
+        
+        // バッファ境界チェック
+        if payload_end > self.buf_end || payload_end > self.read_buf.len() {
+            return Err(Http2Error::InvalidFrame(format!(
+                "Buffer underflow: expected {} bytes, available {}",
+                total_len, self.buf_end - self.buf_start
+            )));
+        }
+        
+        let payload = &self.read_buf[payload_start..payload_end];
         let frame = self.frame_decoder.decode(&header, payload)?;
 
         self.buf_start += total_len;
@@ -259,18 +269,49 @@ where
     /// 
     /// 受信したフレームを処理し、リクエストが完了した場合は ProcessedRequest を返します。
     pub async fn process_frame(&mut self, frame: Frame) -> Http2Result<Option<ProcessedRequest>> {
+        // RFC 7540 Section 4.3: ヘッダーブロック受信中は CONTINUATION のみ許可
+        if let Some(pending_stream_id) = self.streams.receiving_headers_stream() {
+            match &frame {
+                Frame::Continuation { stream_id, .. } if *stream_id == pending_stream_id => {
+                    // 正しい CONTINUATION - 処理を続行
+                }
+                _ => {
+                    return Err(Http2Error::connection_error(
+                        Http2ErrorCode::ProtocolError,
+                        "Expected CONTINUATION frame during header block",
+                    ));
+                }
+            }
+        }
+
         match frame {
             Frame::Settings { ack, settings } => {
                 self.handle_settings(ack, &settings).await?;
                 Ok(None)
             }
             Frame::Headers { stream_id, end_stream, end_headers, priority, header_block } => {
+                // RFC 7540 Section 5.3.1: 自己依存チェック
+                if let Some(ref p) = priority {
+                    if p.dependency == stream_id {
+                        return Err(Http2Error::stream_error(
+                            stream_id,
+                            Http2ErrorCode::ProtocolError,
+                            "Stream cannot depend on itself",
+                        ));
+                    }
+                }
                 self.handle_headers(stream_id, end_stream, end_headers, priority, &header_block).await
             }
             Frame::Data { stream_id, end_stream, data } => {
+                // RFC 7540 Section 5.1: DATA on idle stream = connection error
+                self.validate_stream_not_idle(stream_id, "DATA")?;
                 self.handle_data(stream_id, end_stream, &data).await
             }
             Frame::WindowUpdate { stream_id, increment } => {
+                // RFC 7540 Section 5.1: WINDOW_UPDATE on idle stream = connection error
+                if stream_id != 0 {
+                    self.validate_stream_not_idle(stream_id, "WINDOW_UPDATE")?;
+                }
                 self.handle_window_update(stream_id, increment)?;
                 Ok(None)
             }
@@ -283,10 +324,20 @@ where
                 Ok(None)
             }
             Frame::RstStream { stream_id, error_code } => {
+                // RFC 7540 Section 5.1: RST_STREAM on idle stream = connection error
+                self.validate_stream_not_idle(stream_id, "RST_STREAM")?;
                 self.handle_rst_stream(stream_id, error_code)?;
                 Ok(None)
             }
             Frame::Priority { stream_id, priority } => {
+                // RFC 7540 Section 5.3.1: 自己依存チェック
+                if priority.dependency == stream_id {
+                    return Err(Http2Error::stream_error(
+                        stream_id,
+                        Http2ErrorCode::ProtocolError,
+                        "Stream cannot depend on itself",
+                    ));
+                }
                 self.handle_priority(stream_id, priority)?;
                 Ok(None)
             }
@@ -298,10 +349,22 @@ where
                 Err(Http2Error::protocol_error("Client sent PUSH_PROMISE"))
             }
             Frame::Unknown { .. } => {
-                // 未知のフレームは無視
+                // 未知のフレームは無視 (RFC 7540 Section 4.1)
                 Ok(None)
             }
         }
+    }
+
+    /// ストリームがアイドル状態でないことを検証 (RFC 7540 Section 5.1)
+    fn validate_stream_not_idle(&self, stream_id: u32, frame_type: &str) -> Http2Result<()> {
+        if self.streams.get_ref(stream_id).is_none() {
+            // ストリームが存在しない = idle 状態
+            return Err(Http2Error::connection_error(
+                Http2ErrorCode::ProtocolError,
+                format!("{} frame on idle stream {}", frame_type, stream_id),
+            ));
+        }
+        Ok(())
     }
 
     /// SETTINGS フレームを処理
@@ -320,7 +383,14 @@ where
                     self.hpack_encoder.set_max_table_size(value as usize);
                 }
                 0x2 => {
-                    // ENABLE_PUSH (サーバーは無視)
+                    // ENABLE_PUSH - RFC 7540 Section 6.5.2: 0 または 1 のみ有効
+                    if value > 1 {
+                        return Err(Http2Error::connection_error(
+                            Http2ErrorCode::ProtocolError,
+                            "ENABLE_PUSH must be 0 or 1",
+                        ));
+                    }
+                    // サーバーでは ENABLE_PUSH の値自体は使用しない
                 }
                 0x3 => {
                     // MAX_CONCURRENT_STREAMS
