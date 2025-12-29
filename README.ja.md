@@ -36,6 +36,8 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 ### HTTP処理
 - **Keep-Alive**: HTTP/1.1 Keep-Alive完全サポート
 - **Chunked転送**: RFC 7230準拠のChunkedデコーダ（ステートマシンベース）
+- **Viaヘッダー**: RFC 7230 Section 5.7.1準拠のViaヘッダー挿入（プロキシチェーン追跡）
+- **100 Continue**: RFC 7231 Section 5.1.1準拠のExpect: 100-continue対応
 - **バッファプール**: スレッドローカルバッファプール（サイズ設定可能、メモリアロケーションオーバーヘッド削減）
 - **レスポンス圧縮**: Gzip/Brotli/Zstdによる動的圧縮（Accept-Encodingネゴシエーション対応）
 
