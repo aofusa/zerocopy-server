@@ -542,6 +542,26 @@ impl Drop for ActiveConnectionMetric {
     }
 }
 
+/// 接続カウンターの自動管理（Dropトレイトで自動デクリメント）
+/// 
+/// パニック発生時もDropが呼ばれるため、接続カウンターの整合性が保証されます。
+/// これにより、`max_concurrent_connections`制限が正しく機能し続けます。
+struct ConnectionGuard;
+
+impl ConnectionGuard {
+    /// 新しいガードを作成し、接続カウンターをインクリメント
+    fn new() -> Self {
+        CURRENT_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
+        Self
+    }
+}
+
+impl Drop for ConnectionGuard {
+    fn drop(&mut self) {
+        CURRENT_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// アップストリーム健康状態ゲージ（upstream, server ラベル付き）
 /// 1 = healthy, 0 = unhealthy
 static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -6918,19 +6938,17 @@ fn main() {
                         }
                     }
                     
-                    // 接続カウンター増加
-                    CURRENT_CONNECTIONS.fetch_add(1, Ordering::Relaxed);
-                    
                     let _ = stream.set_nodelay(true);
                     
                     let acceptor = acceptor_clone.clone();
                     
                     monoio::spawn(async move {
+                        // ConnectionGuard がスコープ内で生存している間、接続がカウントされる
+                        // パニック時も Drop が呼ばれるため、カウンターの整合性が保証される
+                        let _guard = ConnectionGuard::new();
                         // handle_connection 内で CURRENT_CONFIG から最新の設定を取得
                         // これによりホットリロード時に新しい設定が即座に反映される
                         handle_connection(stream, acceptor, peer_addr).await;
-                        // 接続カウンター減少
-                        CURRENT_CONNECTIONS.fetch_sub(1, Ordering::Relaxed);
                     });
                 }
                 
@@ -7118,8 +7136,15 @@ fn main() {
         info!("[Security] Pre-loaded TLS credentials have been securely cleared from memory");
     }
 
-    for handle in handles {
-        let _ = handle.join();
+    for (index, handle) in handles.into_iter().enumerate() {
+        match handle.join() {
+            Ok(()) => {
+                debug!("Worker thread {} exited normally", index);
+            }
+            Err(e) => {
+                error!("Worker thread {} panicked: {:?}", index, e);
+            }
+        }
     }
     
     info!("Server shutdown complete");
