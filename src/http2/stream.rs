@@ -340,6 +340,11 @@ impl Stream {
         self.receiving_headers
     }
 
+    /// 保留中のヘッダーブロック長を取得
+    pub fn pending_header_len(&self) -> usize {
+        self.pending_headers.len()
+    }
+
     /// ストリームがアクティブかどうか
     pub fn is_active(&self) -> bool {
         !matches!(self.state, StreamState::Closed | StreamState::Idle)

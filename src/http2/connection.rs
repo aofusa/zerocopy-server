@@ -511,6 +511,7 @@ where
                 return Ok(Some(ProcessedRequest { stream_id }));
             }
         } else {
+            // CONTINUATION が続く場合、receiving_headers_stream を設定
             self.streams.set_receiving_headers(Some(stream_id));
         }
 
@@ -532,14 +533,18 @@ where
             return Err(Http2Error::protocol_error("CONTINUATION for wrong stream"));
         }
 
+        // ストリームを取得 - CONTINUATION中はストリームが必ず存在するはず
+        // RFC 7540: ストリームが見つからない場合は接続エラー
         let stream = self.streams.get(stream_id)
-            .ok_or_else(|| Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found"))?;
+            .ok_or_else(|| Http2Error::protocol_error("Stream not found during CONTINUATION"))?;
 
-        let end_stream = matches!(stream.state, StreamState::HalfClosedRemote);
+        // end_stream: HalfClosedRemote means END_STREAM was set on HEADERS
+        let end_stream = matches!(stream.state, StreamState::HalfClosedRemote | StreamState::Closed);
         
-        // Trailers: CONTINUATION for a stream that was already open (second HEADERS)
-        // If state is HalfClosedRemote, it means this was a trailer HEADERS with END_STREAM
-        let is_trailer = matches!(stream.state, StreamState::HalfClosedRemote);
+        // Trailers: A CONTINUATION is for trailers ONLY if we already have decoded request headers.
+        // Just being HalfClosedRemote is NOT sufficient - that could just mean HEADERS had END_STREAM
+        // but END_HEADERS will come in CONTINUATION (normal case for split headers).
+        let is_trailer = !stream.request_headers.is_empty();
 
         stream.append_header_fragment(header_block, end_headers);
 
