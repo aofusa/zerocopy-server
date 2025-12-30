@@ -85,7 +85,7 @@ where
             hpack_encoder,
             frame_encoder,
             frame_decoder,
-            conn_send_window: conn_window,
+            conn_send_window: 65535, // RFC 7540 initial window size
             conn_recv_window: conn_window,
             goaway_sent: false,
             goaway_received: false,
@@ -136,6 +136,7 @@ where
         // プリフェースを確認
         let received = &self.read_buf[self.buf_start..self.buf_start + preface_len];
         if received != CONNECTION_PREFACE {
+            ftlog::error!("Invalid preface received: {:?}", received);
             return Err(Http2Error::InvalidPreface);
         }
 
@@ -220,11 +221,24 @@ where
             }
         }
 
-
-        // 読み込み用のスライスを準備
-        let read_slice = std::mem::take(&mut self.read_buf);
-        let (result, returned_buf) = self.stream.read(read_slice).await;
-        self.read_buf = returned_buf;
+        // 読み込み用のスライスを準備 (バッファの末尾に追加)
+        // read_buf全体を渡すと0から上書きされてしまうため、split_offで後半を取り出す
+        // しかしVecの所有権を渡す必要があるため、一度takeして分割し、戻ってきたら結合する
+        
+        let mut full_buf = std::mem::take(&mut self.read_buf);
+        
+        // buf_end 以降の部分を切り出す
+        // 注: split_off は割り当てが発生する可能性があるが、safe rustで所有権を扱うために使用
+        // より効率的な方法は unsafe または monoio::buf::Slice を使うことだが、
+        // ここでは安全性を重視して Vec操作を行う
+        let tail_buf = full_buf.split_off(self.buf_end);
+        
+        // 読み込み実行
+        let (result, returned_tail) = self.stream.read(tail_buf).await;
+        
+        // バッファを結合
+        full_buf.extend_from_slice(&returned_tail);
+        self.read_buf = full_buf;
 
         match result {
             Ok(0) => Err(Http2Error::ConnectionClosed),
@@ -429,7 +443,10 @@ where
                         return Err(Http2Error::protocol_error("Invalid MAX_FRAME_SIZE"));
                     }
                     self.frame_encoder.set_max_frame_size(value);
-                    self.frame_decoder.set_max_frame_size(value);
+                    // RFC 7540 Section 6.5.2:
+                    // SETTINGS_MAX_FRAME_SIZE indicates the sender's maximum frame size.
+                    // It does NOT affect our receiving limit (which is local_settings.max_frame_size).
+                    // So we do NOT update frame_decoder.max_frame_size here.
                     self.remote_settings.max_frame_size = value;
                 }
                 0x6 => {

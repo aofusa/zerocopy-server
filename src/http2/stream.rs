@@ -108,12 +108,12 @@ pub struct Stream {
 
 impl Stream {
     /// 新しいストリームを作成
-    pub fn new(id: u32, initial_window_size: i32) -> Self {
+    pub fn new(id: u32, send_window_size: i32, recv_window_size: i32) -> Self {
         Self {
             id,
             state: StreamState::Idle,
-            send_window: initial_window_size,
-            recv_window: initial_window_size,
+            send_window: send_window_size,
+            recv_window: recv_window_size,
             request_headers: Vec::new(),
             request_body: Vec::new(),
             response_headers: Vec::new(),
@@ -393,8 +393,10 @@ pub struct StreamManager {
     max_client_stream_id: u32,
     /// 最大同時ストリーム数
     max_concurrent_streams: u32,
-    /// 初期ウィンドウサイズ
-    initial_window_size: i32,
+    /// ローカルの初期ウィンドウサイズ（受信ウィンドウ用）
+    local_initial_window_size: i32,
+    /// ピアの初期ウィンドウサイズ（送信ウィンドウ用）
+    peer_initial_window_size: i32,
     /// ヘッダー受信中のストリーム ID (CONTINUATION 用)
     receiving_headers_stream: Option<u32>,
     /// GOAWAY で受信した last_stream_id (RFC 7540 Section 6.8)
@@ -403,13 +405,14 @@ pub struct StreamManager {
 
 impl StreamManager {
     /// 新しいストリームマネージャーを作成
-    pub fn new(max_concurrent: u32, initial_window: i32) -> Self {
+    pub fn new(max_concurrent: u32, local_initial_window: i32) -> Self {
         Self {
             streams: HashMap::new(),
             next_server_stream_id: 2,
             max_client_stream_id: 0,
             max_concurrent_streams: max_concurrent,
-            initial_window_size: initial_window,
+            local_initial_window_size: local_initial_window,
+            peer_initial_window_size: 65535, // RFC 7540 initial window size
             receiving_headers_stream: None,
             goaway_last_stream_id: None,
         }
@@ -464,7 +467,7 @@ impl StreamManager {
         }
 
         self.max_client_stream_id = id;
-        self.streams.insert(id, Stream::new(id, self.initial_window_size));
+        self.streams.insert(id, Stream::new(id, self.peer_initial_window_size, self.local_initial_window_size));
 
         self.streams.get_mut(&id).ok_or_else(|| {
             Http2Error::stream_error(id, Http2ErrorCode::StreamClosed, "Stream not found")
@@ -494,10 +497,10 @@ impl StreamManager {
         self.streams.retain(|_, s| s.state != StreamState::Closed);
     }
 
-    /// 初期ウィンドウサイズを更新
+    /// ピアの初期ウィンドウサイズを更新（SETTINGS_INITIAL_WINDOW_SIZE受信時）
     pub fn update_initial_window_size(&mut self, new_size: i32) -> Result<(), Http2Error> {
-        let delta = new_size - self.initial_window_size;
-        self.initial_window_size = new_size;
+        let delta = new_size - self.peer_initial_window_size;
+        self.peer_initial_window_size = new_size;
 
         // 既存ストリームのウィンドウを更新
         for stream in self.streams.values_mut() {
@@ -618,7 +621,7 @@ mod tests {
 
     #[test]
     fn test_stream_state_transitions() {
-        let mut stream = Stream::new(1, 65535);
+        let mut stream = Stream::new(1, 65535, 65535);
         assert_eq!(stream.state, StreamState::Idle);
 
         // HEADERS 受信 (end_stream=false)
@@ -674,7 +677,7 @@ mod tests {
 
     #[test]
     fn test_flow_control() {
-        let mut stream = Stream::new(1, 100);
+        let mut stream = Stream::new(1, 100, 100);
         stream.recv_headers(false).unwrap();
 
         // ウィンドウ内のデータ
