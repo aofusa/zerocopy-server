@@ -487,7 +487,20 @@ where
         }
 
         // ストリームを取得または作成
-        let stream = self.streams.get_or_create_client_stream(stream_id)?;
+        // エラー発生時（例: 同時ストリーム数制限超過）はRST_STREAMを送信
+        let stream_result = self.streams.get_or_create_client_stream(stream_id);
+        
+        let stream = match stream_result {
+            Ok(s) => s,
+            Err(e) => {
+                // エラーが発生した場合、RST_STREAMを送信
+                // ストリームが作成されていない場合でも、ストリームIDは有効
+                if let Some(id) = e.rst_stream_id() {
+                    let _ = self.send_rst_stream(id, e.error_code()).await;
+                }
+                return Err(e);
+            }
+        };
 
         // 状態遷移
         stream.recv_headers(end_stream)?;
@@ -567,7 +580,11 @@ where
 
         let header_block = stream.take_header_block();
         let headers = self.hpack_decoder.decode(&header_block)
-            .map_err(|e| Http2Error::compression_error(e.to_string()))?;
+            .map_err(|e| {
+                // HPACKエラーを適切に処理
+                ftlog::warn!("[HTTP/2] HPACK decode error for stream {}: {}", stream_id, e);
+                Http2Error::compression_error(format!("HPACK decode error: {}", e))
+            })?;
 
         // ヘッダーを検証 (RFC 7540 Section 8.1.2)
         Self::validate_request_headers(&headers, stream_id, is_trailer)?;

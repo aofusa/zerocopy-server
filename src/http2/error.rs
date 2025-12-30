@@ -187,8 +187,13 @@ impl Http2Error {
     }
 
     /// GOAWAY を送信すべきかどうか
+    /// 
+    /// RFC 7540 Section 4.2: フレームサイズが大きすぎる場合は接続エラーとしてGOAWAYを送信すべき
     pub fn should_goaway(&self) -> bool {
-        matches!(self, Self::ConnectionError(_, _))
+        matches!(
+            self,
+            Self::ConnectionError(_, _) | Self::FrameTooLarge(_, _)
+        )
     }
 
     /// RST_STREAM を送信すべきストリームID
