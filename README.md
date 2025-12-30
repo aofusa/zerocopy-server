@@ -48,6 +48,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 ### Operations
 - **Graceful Shutdown**: Safe termination via SIGINT/SIGTERM
 - **Graceful Reload**: Hot reload configuration via SIGHUP (zero downtime)
+- **Panic Recovery**: Connection-level panic catching to recovery worker thread (only affected connection terminates)
 - **Async Logging**: High-performance async logging with ftlog
 - **Config Validation**: Detailed configuration file validation at startup
 - **Prometheus Metrics**: Export request counts, latency, active connections, upstream health, etc. via metrics endpoint (requires configuration, disabled by default)
@@ -2903,6 +2904,39 @@ fn on_http_call_response(&mut self, _: u32, _: usize, body_size: usize, _: usize
     </td>
   </tr>
 </table>
+
+## Panic Recovery
+
+Veil implements connection-level panic catching to ensure high availability.
+
+### Behavior
+
+When a panic occurs during request processing:
+
+| Scenario | Impact |
+|----------|--------|
+| **Without panic recovery** | Worker thread crashes, all connections on that worker are terminated |
+| **With Veil's panic recovery** | Only the affected connection terminates, other connections continue normally |
+
+### Implementation
+
+- Uses `std::panic::catch_unwind` to wrap each connection's async task
+- Panics are caught at the poll level and logged as errors
+- `ConnectionGuard` ensures the connection counter is correctly decremented even on panic
+- Worker threads remain alive and continue accepting new connections
+
+### Logged Output
+
+When a panic is caught:
+```
+[ERROR] Task panicked during poll: Any { .. }
+```
+
+### Notes
+
+- This feature is automatically enabled; no configuration required
+- Only protects against panics inside `monoio::spawn` tasks
+- Panics in the accept loop or runtime initialization still terminate the worker thread
 
 ## License
 
