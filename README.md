@@ -38,6 +38,10 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 - **Chunked Transfer**: RFC 7230 compliant chunked decoder (state machine based)
 - **Via Header**: RFC 7230 Section 5.7.1 compliant Via header insertion for proxy chain tracking
 - **100 Continue**: RFC 7231 Section 5.1.1 compliant Expect: 100-continue handling
+- **Host Validation**: RFC 7230 Section 5.4 compliant mandatory Host header check for HTTP/1.1
+- **Hop-by-hop Headers**: RFC 7230 Section 6.1 compliant header stripping (Connection, Keep-Alive, TE, etc.)
+- **Range Requests**: RFC 7233 compliant Range header parsing and 206 Partial Content support
+- **TE Header**: RFC 7230 Section 4.3 compliant TE header parsing (trailers support)
 - **Buffer Pool**: Thread-local buffer pool with configurable sizes (reduces memory allocation overhead)
 - **Response Compression**: Dynamic Gzip/Brotli/Zstd compression with Accept-Encoding negotiation
 

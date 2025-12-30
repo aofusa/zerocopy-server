@@ -4470,6 +4470,357 @@ fn check_header_count(current_count: usize, max_headers: usize) -> Result<usize,
     }
 }
 
+// ====================
+// RFC 7230-7233 準拠ヘルパー関数
+// ====================
+
+/// HTTP/1.1 Hostヘッダー必須チェック (RFC 7230 Section 5.4)
+/// 
+/// HTTP/1.1リクエストにはHostヘッダーが必須です。
+/// 存在しない場合は400 Bad Requestを返すべきです。
+/// 
+/// # Arguments
+/// * `headers` - ヘッダーのリスト
+/// * `http_minor_version` - HTTPマイナーバージョン（1.0=0, 1.1=1）
+/// 
+/// # Returns
+/// * `Ok(())` - Hostヘッダーが存在する、またはHTTP/1.0で任意
+/// * `Err(&'static str)` - HTTP/1.1でHostヘッダーが存在しない
+#[allow(dead_code)]
+fn validate_host_header(
+    headers: &[(impl AsRef<[u8]>, impl AsRef<[u8]>)], 
+    http_minor_version: u8
+) -> Result<(), &'static str> {
+    // HTTP/1.0ではHostヘッダーは任意
+    if http_minor_version < 1 {
+        return Ok(());
+    }
+    
+    let has_host = headers.iter()
+        .any(|(name, _)| name.as_ref().eq_ignore_ascii_case(b"host"));
+    
+    if !has_host {
+        return Err("Missing required Host header for HTTP/1.1");
+    }
+    
+    Ok(())
+}
+
+/// Hop-by-hopヘッダーリスト (RFC 7230 Section 6.1)
+/// 
+/// これらのヘッダーはプロキシで転送してはならない。
+const HOP_BY_HOP_HEADERS: &[&[u8]] = &[
+    b"connection",
+    b"keep-alive",
+    b"proxy-authenticate",
+    b"proxy-authorization",
+    b"proxy-connection",  // 非標準だが一般的
+    b"te",
+    b"trailer",
+    b"transfer-encoding",
+    b"upgrade",
+];
+
+/// 指定されたヘッダーがHop-by-hopヘッダーかチェック (RFC 7230 Section 6.1)
+/// 
+/// # Arguments
+/// * `name` - ヘッダー名
+/// 
+/// # Returns
+/// * `true` - Hop-by-hopヘッダー（転送不可）
+/// * `false` - End-to-endヘッダー（転送可）
+#[inline]
+fn is_hop_by_hop_header(name: &[u8]) -> bool {
+    HOP_BY_HOP_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Hop-by-hopヘッダーを削除 (RFC 7230 Section 6.1)
+/// 
+/// プロキシ転送前にHop-by-hopヘッダーを削除します。
+/// Connectionヘッダーで指定された追加ヘッダーも削除します。
+/// 
+/// # Arguments
+/// * `headers` - ヘッダーのリスト（変更される）
+#[allow(dead_code)]
+fn strip_hop_by_hop_headers(headers: &mut Vec<(Vec<u8>, Vec<u8>)>) {
+    // Connectionヘッダーで指定された追加ヘッダーを収集
+    let connection_headers: Vec<Vec<u8>> = headers.iter()
+        .filter(|(name, _)| name.eq_ignore_ascii_case(b"connection"))
+        .flat_map(|(_, value)| {
+            value.split(|&b| b == b',')
+                .map(|h| {
+                    // 前後の空白をトリム
+                    let mut start = 0;
+                    let mut end = h.len();
+                    while start < end && (h[start] == b' ' || h[start] == b'\t') {
+                        start += 1;
+                    }
+                    while end > start && (h[end - 1] == b' ' || h[end - 1] == b'\t') {
+                        end -= 1;
+                    }
+                    h[start..end].to_ascii_lowercase()
+                })
+                .filter(|h| !h.is_empty())
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    
+    headers.retain(|(name, _)| {
+        let lower_name = name.to_ascii_lowercase();
+        // 標準Hop-by-hopヘッダーをチェック
+        if is_hop_by_hop_header(&lower_name) {
+            return false;
+        }
+        // Connectionヘッダーで指定されたカスタムヘッダーもチェック
+        if connection_headers.iter().any(|h| lower_name == *h) {
+            return false;
+        }
+        true
+    });
+}
+
+/// Range指定 (RFC 7233 Section 2.1)
+#[derive(Debug, Clone, PartialEq)]
+pub enum RangeSpec {
+    /// bytes=start-end (両端含む)
+    Bytes { start: u64, end: Option<u64> },
+    /// bytes=-suffix (末尾からのバイト数)
+    Suffix { suffix_length: u64 },
+}
+
+/// Rangeヘッダー解析結果
+#[derive(Debug, Clone)]
+pub struct ParsedRange {
+    /// Range指定のリスト（複数レンジ対応だが、単一レンジのみ実装）
+    pub ranges: Vec<RangeSpec>,
+}
+
+/// Rangeヘッダーをパース (RFC 7233 Section 2.1)
+/// 
+/// 形式: Range: bytes=start-end または bytes=-suffix または bytes=start-
+/// 
+/// # Arguments
+/// * `range_header` - Rangeヘッダーの値
+/// 
+/// # Returns
+/// * `Some(ParsedRange)` - 正常にパースできた場合
+/// * `None` - 不正な形式の場合
+#[allow(dead_code)]
+fn parse_range_header(range_header: &[u8]) -> Option<ParsedRange> {
+    // "bytes=" プレフィックスを確認
+    if range_header.len() < 6 || !range_header[..6].eq_ignore_ascii_case(b"bytes=") {
+        return None;
+    }
+    
+    let range_str = std::str::from_utf8(&range_header[6..]).ok()?;
+    let mut ranges = Vec::new();
+    
+    for range_part in range_str.split(',') {
+        let range_part = range_part.trim();
+        if range_part.is_empty() {
+            continue;
+        }
+        
+        if let Some(dash_pos) = range_part.find('-') {
+            let start_str = range_part[..dash_pos].trim();
+            let end_str = range_part[dash_pos + 1..].trim();
+            
+            if start_str.is_empty() {
+                // bytes=-suffix 形式
+                if let Ok(suffix) = end_str.parse::<u64>() {
+                    if suffix > 0 {
+                        ranges.push(RangeSpec::Suffix { suffix_length: suffix });
+                    }
+                }
+            } else if let Ok(start) = start_str.parse::<u64>() {
+                // bytes=start- または bytes=start-end 形式
+                let end = if end_str.is_empty() {
+                    None
+                } else {
+                    end_str.parse::<u64>().ok()
+                };
+                
+                // バリデーション: start <= end
+                if let Some(e) = end {
+                    if start > e {
+                        return None; // 不正なレンジ
+                    }
+                }
+                
+                ranges.push(RangeSpec::Bytes { start, end });
+            }
+        }
+    }
+    
+    if ranges.is_empty() {
+        None
+    } else {
+        Some(ParsedRange { ranges })
+    }
+}
+
+/// レンジが満足可能かチェック (RFC 7233 Section 4.4)
+/// 
+/// # Returns
+/// * `Some((actual_start, actual_end))` - 満足可能なレンジ（0-indexed、両端含む）
+/// * `None` - 416 Range Not Satisfiable を返すべき
+#[allow(dead_code)]
+fn normalize_range(spec: &RangeSpec, content_length: u64) -> Option<(u64, u64)> {
+    if content_length == 0 {
+        return None;
+    }
+    
+    match spec {
+        RangeSpec::Bytes { start, end } => {
+            if *start >= content_length {
+                return None; // 開始位置がコンテンツ長を超えている
+            }
+            let actual_end = end.map_or(content_length - 1, |e| e.min(content_length - 1));
+            Some((*start, actual_end))
+        }
+        RangeSpec::Suffix { suffix_length } => {
+            if *suffix_length == 0 {
+                return None;
+            }
+            let start = content_length.saturating_sub(*suffix_length);
+            Some((start, content_length - 1))
+        }
+    }
+}
+
+/// 206 Partial Content レスポンスヘッダーを構築 (RFC 7233 Section 4.1)
+/// 
+/// # Arguments
+/// * `start` - 開始バイト位置
+/// * `end` - 終了バイト位置（含む）
+/// * `total_length` - コンテンツ全体の長さ
+/// * `content_type` - Content-Type
+/// * `close_connection` - Connection: close を追加するか
+/// 
+/// # Returns
+/// 206レスポンスヘッダー（ボディなし）
+#[allow(dead_code)]
+fn build_partial_response_header(
+    start: u64,
+    end: u64,
+    total_length: u64,
+    content_type: &str,
+    close_connection: bool,
+) -> Vec<u8> {
+    let content_length = end - start + 1;
+    let mut response = Vec::with_capacity(256);
+    
+    response.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\n");
+    response.extend_from_slice(b"Accept-Ranges: bytes\r\n");
+    
+    // Content-Range: bytes start-end/total
+    response.extend_from_slice(b"Content-Range: bytes ");
+    response.extend_from_slice(start.to_string().as_bytes());
+    response.extend_from_slice(b"-");
+    response.extend_from_slice(end.to_string().as_bytes());
+    response.extend_from_slice(b"/");
+    response.extend_from_slice(total_length.to_string().as_bytes());
+    response.extend_from_slice(b"\r\n");
+    
+    // Content-Length
+    response.extend_from_slice(b"Content-Length: ");
+    response.extend_from_slice(content_length.to_string().as_bytes());
+    response.extend_from_slice(b"\r\n");
+    
+    // Content-Type
+    response.extend_from_slice(b"Content-Type: ");
+    response.extend_from_slice(content_type.as_bytes());
+    response.extend_from_slice(b"\r\n");
+    
+    // Connection
+    if close_connection {
+        response.extend_from_slice(b"Connection: close\r\n");
+    } else {
+        response.extend_from_slice(b"Connection: keep-alive\r\n");
+    }
+    
+    response.extend_from_slice(b"\r\n");
+    response
+}
+
+/// 416 Range Not Satisfiable レスポンスを構築 (RFC 7233 Section 4.4)
+#[allow(dead_code)]
+fn build_range_not_satisfiable_response(content_length: u64) -> Vec<u8> {
+    let mut response = Vec::with_capacity(128);
+    response.extend_from_slice(b"HTTP/1.1 416 Range Not Satisfiable\r\n");
+    response.extend_from_slice(b"Content-Range: bytes */");
+    response.extend_from_slice(content_length.to_string().as_bytes());
+    response.extend_from_slice(b"\r\n");
+    response.extend_from_slice(b"Content-Length: 0\r\n");
+    response.extend_from_slice(b"Connection: close\r\n\r\n");
+    response
+}
+
+/// TE ヘッダー解析結果 (RFC 7230 Section 4.3)
+#[derive(Debug, Clone, Default)]
+pub struct TeHeader {
+    /// trailers をサポートするか
+    pub supports_trailers: bool,
+    /// サポートする転送エンコーディング（chunked以外）
+    pub encodings: Vec<String>,
+}
+
+/// TE ヘッダーをパース (RFC 7230 Section 4.3)
+/// 
+/// TE ヘッダーはHop-by-hopであり、クライアントがサポートする転送エンコーディングと
+/// トレーラーのサポートを示します。
+/// 
+/// # Arguments
+/// * `te_header` - TEヘッダーの値
+/// 
+/// # Returns
+/// `TeHeader` 構造体
+#[allow(dead_code)]
+fn parse_te_header(te_header: &[u8]) -> TeHeader {
+    let mut result = TeHeader::default();
+    
+    let te_str = match std::str::from_utf8(te_header) {
+        Ok(s) => s,
+        Err(_) => return result,
+    };
+    
+    for part in te_str.split(',') {
+        let part = part.trim();
+        if part.is_empty() {
+            continue;
+        }
+        
+        // 品質値を除去 (e.g., "gzip;q=0.5" -> "gzip")
+        let encoding = part.split(';').next().unwrap_or(part).trim();
+        
+        if encoding.eq_ignore_ascii_case("trailers") {
+            result.supports_trailers = true;
+        } else if !encoding.eq_ignore_ascii_case("chunked") {
+            // chunkedはTE経由で指定すべきではないが、無害なのでスキップ
+            result.encodings.push(encoding.to_string());
+        }
+    }
+    
+    result
+}
+
+/// リクエストからRangeヘッダーを取得
+#[allow(dead_code)]
+fn get_range_header<'a>(headers: &'a [(impl AsRef<[u8]>, impl AsRef<[u8]>)]) -> Option<&'a [u8]> {
+    headers.iter()
+        .find(|(name, _)| name.as_ref().eq_ignore_ascii_case(b"range"))
+        .map(|(_, value)| value.as_ref())
+}
+
+/// Accept-Ranges: bytes ヘッダーを追加するかチェック
+/// 
+/// 静的ファイル配信時にクライアントにRangeリクエストサポートを通知
+#[allow(dead_code)]
+fn should_advertise_accept_ranges(method: &[u8]) -> bool {
+    // GETとHEADでのみAccept-Rangesを通知
+    method.eq_ignore_ascii_case(b"GET") || method.eq_ignore_ascii_case(b"HEAD")
+}
+
 #[derive(Clone)]
 enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
@@ -9687,6 +10038,15 @@ async fn handle_requests(
                     .map(|h| (h.name.as_bytes().into(), h.value.into()))
                     .collect();
                 
+                // HTTP/1.1 Hostヘッダー必須チェック (RFC 7230 Section 5.4)
+                // HTTP/1.1リクエストにはHostヘッダーが必須
+                if validate_host_header(&headers_for_proxy, 1).is_err() {
+                    drop(req);
+                    let err_buf = ERR_MSG_BAD_REQUEST.to_vec();
+                    let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
+                    return;
+                }
+                
                 drop(req);
                 
                 // HTTP/1.1 100 Continue レスポンス (RFC 7231 Section 5.1.1)
@@ -10302,7 +10662,11 @@ async fn handle_backend(
             }
         }
         Backend::SendFile(base_path, is_dir, index_file, security, _cache, _) => {
-            handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close, &security).await
+            // Range ヘッダーを抽出 (RFC 7233)
+            let range_header = headers.iter()
+                .find(|(n, _)| n.eq_ignore_ascii_case(b"range"))
+                .map(|(_, v)| v.as_ref());
+            handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close, &security, range_header).await
         }
         Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             handle_redirect(tls_stream, &redirect_url, status_code, preserve_path, req_path, &prefix, client_wants_close).await
@@ -14811,6 +15175,7 @@ async fn handle_sendfile(
     prefix: &[u8],
     client_wants_close: bool,
     security: &SecurityConfig,
+    range_header: Option<&[u8]>,  // RFC 7233 Range header support
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
     // 
@@ -14925,15 +15290,58 @@ async fn handle_sendfile(
     let file_size = metadata.len();
     let mime_type = mime_guess::from_path(&final_path).first_or_octet_stream();
     
+    // RFC 7233 Range リクエスト処理
+    let range_info: Option<(u64, u64)> = if let Some(range_bytes) = range_header {
+        if let Some(parsed) = parse_range_header(range_bytes) {
+            if let Some(ref first_range) = parsed.ranges.first() {
+                match normalize_range(first_range, file_size) {
+                    Some((start, end)) => Some((start, end)),
+                    None => {
+                        // 416 Range Not Satisfiable
+                        let resp = build_range_not_satisfiable_response(file_size);
+                        let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(resp)).await;
+                        return Some((tls_stream, 416, 0, true));
+                    }
+                }
+            } else {
+                None
+            }
+        } else {
+            None // 不正なRange形式は無視して通常レスポンス
+        }
+    } else {
+        None
+    };
+    
     // ヘッダー構築（Keep-Alive対応 + カスタムレスポンスヘッダー）
     let mut header_buf = Vec::with_capacity(HEADER_BUF_CAPACITY);
-    header_buf.extend_from_slice(HTTP_200_PREFIX);
-    header_buf.extend_from_slice(mime_type.as_ref().as_bytes());
-    header_buf.extend_from_slice(CONTENT_LENGTH_HEADER);
     
-    let mut num_buf = itoa::Buffer::new();
-    header_buf.extend_from_slice(num_buf.format(file_size).as_bytes());
-    header_buf.extend_from_slice(b"\r\n");
+    // Range リクエストの場合は 206 Partial Content
+    let (response_status, response_content_length) = if let Some((start, end)) = range_info {
+        let content_length = end - start + 1;
+        header_buf.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\nContent-Type: ");
+        header_buf.extend_from_slice(mime_type.as_ref().as_bytes());
+        header_buf.extend_from_slice(b"\r\nAccept-Ranges: bytes\r\nContent-Range: bytes ");
+        header_buf.extend_from_slice(start.to_string().as_bytes());
+        header_buf.extend_from_slice(b"-");
+        header_buf.extend_from_slice(end.to_string().as_bytes());
+        header_buf.extend_from_slice(b"/");
+        header_buf.extend_from_slice(file_size.to_string().as_bytes());
+        header_buf.extend_from_slice(b"\r\nContent-Length: ");
+        header_buf.extend_from_slice(content_length.to_string().as_bytes());
+        header_buf.extend_from_slice(b"\r\n");
+        (206u16, content_length)
+    } else {
+        // 通常のレスポンス
+        header_buf.extend_from_slice(HTTP_200_PREFIX);
+        header_buf.extend_from_slice(mime_type.as_ref().as_bytes());
+        header_buf.extend_from_slice(b"\r\nAccept-Ranges: bytes");  // Range サポートを通知
+        header_buf.extend_from_slice(CONTENT_LENGTH_HEADER);
+        let mut num_buf = itoa::Buffer::new();
+        header_buf.extend_from_slice(num_buf.format(file_size).as_bytes());
+        header_buf.extend_from_slice(b"\r\n");
+        (200u16, file_size)
+    };
     
     // 追加レスポンスヘッダー（セキュリティヘッダーなど）
     for (header_name, header_value) in &security.add_response_headers {
@@ -15023,16 +15431,23 @@ async fn handle_sendfile(
     }
 
     // ファイル転送
+    // Range リクエストの場合はオフセットと長さを調整
+    let (transfer_offset, transfer_length) = if let Some((start, end)) = range_info {
+        (start as i64, end - start + 1)
+    } else {
+        (0i64, file_size)
+    };
+    
     // kTLS が有効な場合は sendfile によるゼロコピー送信を使用
     #[cfg(feature = "ktls")]
     {
         if tls_stream.is_ktls_send_enabled() {
-            return handle_sendfile_zerocopy(tls_stream, &file, file_size, client_wants_close).await;
+            return handle_sendfile_zerocopy(tls_stream, &file, transfer_offset, transfer_length, client_wants_close, response_status).await;
         }
     }
     
     // kTLS が無効な場合は従来の read/write を使用
-    handle_sendfile_userspace(tls_stream, &file, file_size, client_wants_close).await
+    handle_sendfile_userspace(tls_stream, &file, transfer_offset, transfer_length, client_wants_close, response_status).await
 }
 
 /// kTLS + sendfile によるゼロコピーファイル送信
@@ -15043,13 +15458,16 @@ async fn handle_sendfile(
 async fn handle_sendfile_zerocopy(
     tls_stream: ServerTls,
     file: &monoio::fs::File,
-    file_size: u64,
+    transfer_offset: i64,
+    transfer_length: u64,
     client_wants_close: bool,
+    response_status: u16,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     use std::os::unix::io::AsRawFd;
     
     let file_fd = file.as_raw_fd();
-    let mut offset: i64 = 0;
+    let mut offset: i64 = transfer_offset;
+    let target_end = transfer_offset + transfer_length as i64;
     let mut total_sent = 0u64;
     
     // sendfile を使用してファイルをゼロコピー送信
@@ -15057,13 +15475,13 @@ async fn handle_sendfile_zerocopy(
     let chunk_size_config = {
         let config = CURRENT_CONFIG.load();
         match config.performance.chunk_size_mode {
-            ChunkSizeMode::Dynamic => calculate_optimal_chunk_size(file_size),
+            ChunkSizeMode::Dynamic => calculate_optimal_chunk_size(transfer_length),
             ChunkSizeMode::Manual => config.performance.manual_chunk_size,
         }
     };
     
-    while (offset as u64) < file_size {
-        let remaining = file_size - (offset as u64);
+    while offset < target_end {
+        let remaining = (target_end - offset) as u64;
         let chunk_size = (remaining as usize).min(chunk_size_config);
         
         // sendfile 実行
@@ -15090,7 +15508,7 @@ async fn handle_sendfile_zerocopy(
         }
     }
 
-    Some((tls_stream, 200, total_sent, client_wants_close))
+    Some((tls_stream, response_status, total_sent, client_wants_close))
 }
 
 /// 従来の read/write によるファイル送信（ユーザー空間経由）
@@ -15099,13 +15517,16 @@ async fn handle_sendfile_zerocopy(
 async fn handle_sendfile_userspace(
     mut tls_stream: ServerTls,
     file: &monoio::fs::File,
-    file_size: u64,
+    transfer_offset: i64,
+    transfer_length: u64,
     client_wants_close: bool,
+    response_status: u16,
 ) -> Option<(ServerTls, u16, u64, bool)> {
     let mut total_sent = 0u64;
-    let mut offset = 0u64;
+    let mut offset = transfer_offset as u64;
+    let target_end = transfer_offset as u64 + transfer_length;
     
-    while offset < file_size {
+    while offset < target_end {
         let read_buf = buf_get();
         let (res, mut returned_buf) = file.read_at(read_buf, offset).await;
         
@@ -15114,7 +15535,11 @@ async fn handle_sendfile_userspace(
                 buf_put(returned_buf);
                 break;
             }
-            Ok(n) => n,
+            Ok(n) => {
+                // Range リクエストの場合、読み取りサイズを制限
+                let remaining = (target_end - offset) as usize;
+                n.min(remaining)
+            }
             Err(e) => {
                 buf_put(returned_buf);
                 error!("File read error: {}", e);
@@ -15141,7 +15566,7 @@ async fn handle_sendfile_userspace(
         }
     }
 
-    Some((tls_stream, 200, total_sent, client_wants_close))
+    Some((tls_stream, response_status, total_sent, client_wants_close))
 }
 
 // ====================
@@ -16667,6 +17092,372 @@ mod tests {
         fn test_check_header_count_max_limit() {
             let result = check_header_count(1024, 1024);
             assert!(result.is_err());
+        }
+    }
+
+    // ====================
+    // RFC 7230-7233 準拠ヘルパー関数テスト
+    // ====================
+    
+    mod rfc_compliance_tests {
+        use super::*;
+
+        // Hostヘッダー検証テスト (RFC 7230 Section 5.4)
+        
+        #[test]
+        fn test_validate_host_header_present_http11() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"host".to_vec(), b"example.com".to_vec()),
+            ];
+            assert!(validate_host_header(&headers, 1).is_ok());
+        }
+
+        #[test]
+        fn test_validate_host_header_missing_http11() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"content-type".to_vec(), b"text/html".to_vec()),
+            ];
+            assert!(validate_host_header(&headers, 1).is_err());
+        }
+
+        #[test]
+        fn test_validate_host_header_http10_optional() {
+            // HTTP/1.0ではHostヘッダーは任意
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"content-type".to_vec(), b"text/html".to_vec()),
+            ];
+            assert!(validate_host_header(&headers, 0).is_ok());
+        }
+
+        #[test]
+        fn test_validate_host_header_case_insensitive() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"HOST".to_vec(), b"example.com".to_vec()),
+            ];
+            assert!(validate_host_header(&headers, 1).is_ok());
+        }
+
+        // Hop-by-hopヘッダーテスト (RFC 7230 Section 6.1)
+        
+        #[test]
+        fn test_is_hop_by_hop_header_connection() {
+            assert!(is_hop_by_hop_header(b"connection"));
+            assert!(is_hop_by_hop_header(b"Connection"));
+            assert!(is_hop_by_hop_header(b"CONNECTION"));
+        }
+
+        #[test]
+        fn test_is_hop_by_hop_header_keep_alive() {
+            assert!(is_hop_by_hop_header(b"keep-alive"));
+            assert!(is_hop_by_hop_header(b"Keep-Alive"));
+        }
+
+        #[test]
+        fn test_is_hop_by_hop_header_proxy_connection() {
+            assert!(is_hop_by_hop_header(b"proxy-connection"));
+            assert!(is_hop_by_hop_header(b"Proxy-Connection"));
+        }
+
+        #[test]
+        fn test_is_hop_by_hop_header_te() {
+            assert!(is_hop_by_hop_header(b"te"));
+            assert!(is_hop_by_hop_header(b"TE"));
+        }
+
+        #[test]
+        fn test_is_hop_by_hop_header_trailer() {
+            assert!(is_hop_by_hop_header(b"trailer"));
+        }
+
+        #[test]
+        fn test_is_hop_by_hop_header_transfer_encoding() {
+            assert!(is_hop_by_hop_header(b"transfer-encoding"));
+        }
+
+        #[test]
+        fn test_is_hop_by_hop_header_upgrade() {
+            assert!(is_hop_by_hop_header(b"upgrade"));
+        }
+
+        #[test]
+        fn test_is_not_hop_by_hop_header() {
+            assert!(!is_hop_by_hop_header(b"content-type"));
+            assert!(!is_hop_by_hop_header(b"host"));
+            assert!(!is_hop_by_hop_header(b"accept"));
+            assert!(!is_hop_by_hop_header(b"cache-control"));
+        }
+
+        #[test]
+        fn test_strip_hop_by_hop_headers_basic() {
+            let mut headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"host".to_vec(), b"example.com".to_vec()),
+                (b"connection".to_vec(), b"keep-alive".to_vec()),
+                (b"keep-alive".to_vec(), b"timeout=5".to_vec()),
+                (b"content-type".to_vec(), b"text/html".to_vec()),
+            ];
+            
+            strip_hop_by_hop_headers(&mut headers);
+            
+            assert_eq!(headers.len(), 2);
+            assert!(headers.iter().any(|(n, _)| n == b"host"));
+            assert!(headers.iter().any(|(n, _)| n == b"content-type"));
+            assert!(!headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"connection")));
+            assert!(!headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(b"keep-alive")));
+        }
+
+        #[test]
+        fn test_strip_hop_by_hop_headers_custom() {
+            // Connectionヘッダーで指定されたカスタムヘッダーも削除
+            let mut headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"host".to_vec(), b"example.com".to_vec()),
+                (b"connection".to_vec(), b"keep-alive, x-custom".to_vec()),
+                (b"x-custom".to_vec(), b"value".to_vec()),
+            ];
+            
+            strip_hop_by_hop_headers(&mut headers);
+            
+            assert_eq!(headers.len(), 1);
+            assert!(headers.iter().any(|(n, _)| n == b"host"));
+        }
+
+        // Rangeヘッダーテスト (RFC 7233)
+        
+        #[test]
+        fn test_parse_range_header_single_range() {
+            let result = parse_range_header(b"bytes=0-99");
+            assert!(result.is_some());
+            let parsed = result.unwrap();
+            assert_eq!(parsed.ranges.len(), 1);
+            assert_eq!(parsed.ranges[0], RangeSpec::Bytes { start: 0, end: Some(99) });
+        }
+
+        #[test]
+        fn test_parse_range_header_open_end() {
+            let result = parse_range_header(b"bytes=100-");
+            assert!(result.is_some());
+            let parsed = result.unwrap();
+            assert_eq!(parsed.ranges[0], RangeSpec::Bytes { start: 100, end: None });
+        }
+
+        #[test]
+        fn test_parse_range_header_suffix() {
+            let result = parse_range_header(b"bytes=-500");
+            assert!(result.is_some());
+            let parsed = result.unwrap();
+            assert_eq!(parsed.ranges[0], RangeSpec::Suffix { suffix_length: 500 });
+        }
+
+        #[test]
+        fn test_parse_range_header_multiple() {
+            let result = parse_range_header(b"bytes=0-99, 200-299");
+            assert!(result.is_some());
+            let parsed = result.unwrap();
+            assert_eq!(parsed.ranges.len(), 2);
+        }
+
+        #[test]
+        fn test_parse_range_header_invalid_no_bytes() {
+            assert!(parse_range_header(b"0-99").is_none());
+        }
+
+        #[test]
+        fn test_parse_range_header_invalid_start_greater_than_end() {
+            assert!(parse_range_header(b"bytes=100-50").is_none());
+        }
+
+        #[test]
+        fn test_parse_range_header_case_insensitive() {
+            let result = parse_range_header(b"BYTES=0-100");
+            assert!(result.is_some());
+        }
+
+        // normalize_range テスト
+        
+        #[test]
+        fn test_normalize_range_bytes_within_bounds() {
+            let spec = RangeSpec::Bytes { start: 0, end: Some(99) };
+            let result = normalize_range(&spec, 1000);
+            assert_eq!(result, Some((0, 99)));
+        }
+
+        #[test]
+        fn test_normalize_range_bytes_end_exceeds() {
+            let spec = RangeSpec::Bytes { start: 0, end: Some(9999) };
+            let result = normalize_range(&spec, 1000);
+            assert_eq!(result, Some((0, 999))); // end should be clamped
+        }
+
+        #[test]
+        fn test_normalize_range_bytes_open_end() {
+            let spec = RangeSpec::Bytes { start: 500, end: None };
+            let result = normalize_range(&spec, 1000);
+            assert_eq!(result, Some((500, 999)));
+        }
+
+        #[test]
+        fn test_normalize_range_bytes_start_exceeds() {
+            let spec = RangeSpec::Bytes { start: 1000, end: Some(1100) };
+            let result = normalize_range(&spec, 1000);
+            assert_eq!(result, None); // 416 Range Not Satisfiable
+        }
+
+        #[test]
+        fn test_normalize_range_suffix() {
+            let spec = RangeSpec::Suffix { suffix_length: 100 };
+            let result = normalize_range(&spec, 1000);
+            assert_eq!(result, Some((900, 999)));
+        }
+
+        #[test]
+        fn test_normalize_range_suffix_larger_than_content() {
+            let spec = RangeSpec::Suffix { suffix_length: 2000 };
+            let result = normalize_range(&spec, 1000);
+            assert_eq!(result, Some((0, 999)));
+        }
+
+        #[test]
+        fn test_normalize_range_empty_content() {
+            let spec = RangeSpec::Bytes { start: 0, end: Some(100) };
+            let result = normalize_range(&spec, 0);
+            assert_eq!(result, None);
+        }
+
+        // 206 Partial Content レスポンス構築テスト
+        
+        #[test]
+        fn test_build_partial_response_header() {
+            let header = build_partial_response_header(0, 99, 1000, "text/plain", false);
+            let header_str = String::from_utf8_lossy(&header);
+            
+            assert!(header_str.contains("HTTP/1.1 206 Partial Content"));
+            assert!(header_str.contains("Content-Range: bytes 0-99/1000"));
+            assert!(header_str.contains("Content-Length: 100"));
+            assert!(header_str.contains("Content-Type: text/plain"));
+            assert!(header_str.contains("Connection: keep-alive"));
+        }
+
+        #[test]
+        fn test_build_partial_response_header_close() {
+            let header = build_partial_response_header(0, 99, 1000, "text/plain", true);
+            let header_str = String::from_utf8_lossy(&header);
+            
+            assert!(header_str.contains("Connection: close"));
+        }
+
+        #[test]
+        fn test_build_range_not_satisfiable_response() {
+            let response = build_range_not_satisfiable_response(1000);
+            let response_str = String::from_utf8_lossy(&response);
+            
+            assert!(response_str.contains("HTTP/1.1 416 Range Not Satisfiable"));
+            assert!(response_str.contains("Content-Range: bytes */1000"));
+            assert!(response_str.contains("Content-Length: 0"));
+        }
+
+        // TEヘッダーテスト (RFC 7230 Section 4.3)
+        
+        #[test]
+        fn test_parse_te_header_trailers() {
+            let te = parse_te_header(b"trailers");
+            assert!(te.supports_trailers);
+            assert!(te.encodings.is_empty());
+        }
+
+        #[test]
+        fn test_parse_te_header_trailers_case_insensitive() {
+            let te = parse_te_header(b"TRAILERS");
+            assert!(te.supports_trailers);
+        }
+
+        #[test]
+        fn test_parse_te_header_gzip() {
+            let te = parse_te_header(b"gzip");
+            assert!(!te.supports_trailers);
+            assert_eq!(te.encodings.len(), 1);
+            assert_eq!(te.encodings[0], "gzip");
+        }
+
+        #[test]
+        fn test_parse_te_header_multiple() {
+            let te = parse_te_header(b"trailers, gzip, deflate");
+            assert!(te.supports_trailers);
+            assert_eq!(te.encodings.len(), 2);
+            assert!(te.encodings.contains(&"gzip".to_string()));
+            assert!(te.encodings.contains(&"deflate".to_string()));
+        }
+
+        #[test]
+        fn test_parse_te_header_with_quality() {
+            let te = parse_te_header(b"gzip;q=0.5, deflate;q=1.0");
+            assert_eq!(te.encodings.len(), 2);
+            assert_eq!(te.encodings[0], "gzip");
+            assert_eq!(te.encodings[1], "deflate");
+        }
+
+        #[test]
+        fn test_parse_te_header_chunked_ignored() {
+            // chunkedはTE経由で指定すべきではないがスキップ
+            let te = parse_te_header(b"chunked, trailers");
+            assert!(te.supports_trailers);
+            assert!(te.encodings.is_empty());
+        }
+
+        #[test]
+        fn test_parse_te_header_empty() {
+            let te = parse_te_header(b"");
+            assert!(!te.supports_trailers);
+            assert!(te.encodings.is_empty());
+        }
+
+        // get_range_header テスト
+        
+        #[test]
+        fn test_get_range_header_found() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"host".to_vec(), b"example.com".to_vec()),
+                (b"range".to_vec(), b"bytes=0-100".to_vec()),
+            ];
+            let result = get_range_header(&headers);
+            assert_eq!(result, Some(b"bytes=0-100".as_slice()));
+        }
+
+        #[test]
+        fn test_get_range_header_not_found() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"host".to_vec(), b"example.com".to_vec()),
+            ];
+            let result = get_range_header(&headers);
+            assert!(result.is_none());
+        }
+
+        #[test]
+        fn test_get_range_header_case_insensitive() {
+            let headers: Vec<(Vec<u8>, Vec<u8>)> = vec![
+                (b"Range".to_vec(), b"bytes=0-100".to_vec()),
+            ];
+            let result = get_range_header(&headers);
+            assert!(result.is_some());
+        }
+
+        // should_advertise_accept_ranges テスト
+        
+        #[test]
+        fn test_should_advertise_accept_ranges_get() {
+            assert!(should_advertise_accept_ranges(b"GET"));
+            assert!(should_advertise_accept_ranges(b"get"));
+        }
+
+        #[test]
+        fn test_should_advertise_accept_ranges_head() {
+            assert!(should_advertise_accept_ranges(b"HEAD"));
+            assert!(should_advertise_accept_ranges(b"head"));
+        }
+
+        #[test]
+        fn test_should_not_advertise_accept_ranges_post() {
+            assert!(!should_advertise_accept_ranges(b"POST"));
+            assert!(!should_advertise_accept_ranges(b"PUT"));
+            assert!(!should_advertise_accept_ranges(b"DELETE"));
         }
     }
 }

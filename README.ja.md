@@ -38,6 +38,10 @@ io_uring (monoio) と rustls を使用した高性能リバースプロキシサ
 - **Chunked転送**: RFC 7230準拠のChunkedデコーダ（ステートマシンベース）
 - **Viaヘッダー**: RFC 7230 Section 5.7.1準拠のViaヘッダー挿入（プロキシチェーン追跡）
 - **100 Continue**: RFC 7231 Section 5.1.1準拠のExpect: 100-continue対応
+- **Hostヘッダー検証**: RFC 7230 Section 5.4準拠のHTTP/1.1必須Hostヘッダーチェック
+- **Hop-by-hopヘッダー**: RFC 7230 Section 6.1準拠のヘッダー削除（Connection, Keep-Alive, TE等）
+- **Rangeリクエスト**: RFC 7233準拠のRangeヘッダー解析と206 Partial Contentサポート
+- **TEヘッダー**: RFC 7230 Section 4.3準拠のTEヘッダー解析（trailersサポート）
 - **バッファプール**: スレッドローカルバッファプール（サイズ設定可能、メモリアロケーションオーバーヘッド削減）
 - **レスポンス圧縮**: Gzip/Brotli/Zstdによる動的圧縮（Accept-Encodingネゴシエーション対応）
 
