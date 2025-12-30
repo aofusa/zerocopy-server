@@ -562,6 +562,85 @@ impl Drop for ConnectionGuard {
     }
 }
 
+// ====================
+// Task-Level Panic Recovery (Layer 1)
+// ====================
+//
+// monoio::spawn does NOT catch panics like Tokio does.
+// A panic in a monoio::spawn task kills the entire runtime thread.
+// This wrapper uses std::panic::catch_unwind to prevent thread death.
+//
+// Note: We cannot use FutureExt::catch_unwind from futures crate since
+// it's not a dependency. Instead, we use a poll-based approach with
+// std::panic::catch_unwind around each poll.
+
+use std::panic::{AssertUnwindSafe, catch_unwind};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+
+/// A future wrapper that catches panics during polling
+/// 
+/// Uses Box<dyn Future> internally to handle pin projection safely.
+/// The Box makes the inner future Unpin, allowing safe mutable access.
+struct CatchUnwindFuture {
+    inner: Option<Pin<Box<dyn std::future::Future<Output = ()> + 'static>>>,
+}
+
+impl CatchUnwindFuture {
+    fn new<F>(future: F) -> Self
+    where
+        F: std::future::Future<Output = ()> + 'static,
+    {
+        Self { inner: Some(Box::pin(future)) }
+    }
+}
+
+impl std::future::Future for CatchUnwindFuture
+{
+    type Output = ();
+
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
+        // Get mutable reference to inner (safe because this struct is Unpin due to Box)
+        let inner = match self.inner.as_mut() {
+            Some(f) => f,
+            None => return Poll::Ready(()),
+        };
+        
+        // Wrap the poll in catch_unwind to catch panics
+        let result = catch_unwind(AssertUnwindSafe(|| inner.as_mut().poll(cx)));
+        
+        match result {
+            Ok(Poll::Ready(())) => {
+                self.inner = None;
+                Poll::Ready(())
+            }
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(panic_info) => {
+                // Panic caught - log and complete the future
+                error!("Task panicked during poll: {:?}", panic_info);
+                self.inner = None;
+                Poll::Ready(())
+            }
+        }
+    }
+}
+
+/// Spawn a task with panic catching
+/// 
+/// Unlike Tokio, monoio does not catch panics in spawned tasks.
+/// A panic in a monoio::spawn task kills the entire runtime thread,
+/// causing all other connections on that worker to be lost.
+/// 
+/// This wrapper catches panics and logs them, preventing thread death.
+/// The ConnectionGuard's Drop trait still runs on panic, ensuring
+/// connection counters remain accurate.
+fn spawn_with_panic_catch<F>(future: F)
+where
+    F: std::future::Future<Output = ()> + 'static,
+{
+    monoio::spawn(CatchUnwindFuture::new(future));
+}
+
 /// アップストリーム健康状態ゲージ（upstream, server ラベル付き）
 /// 1 = healthy, 0 = unhealthy
 static HTTP_UPSTREAM_HEALTH: Lazy<IntGaugeVec> = Lazy::new(|| {
@@ -6942,7 +7021,8 @@ fn main() {
                     
                     let acceptor = acceptor_clone.clone();
                     
-                    monoio::spawn(async move {
+                    // spawn_with_panic_catch を使用してパニック時もスレッドが生存し続ける
+                    spawn_with_panic_catch(async move {
                         // ConnectionGuard がスコープ内で生存している間、接続がカウントされる
                         // パニック時も Drop が呼ばれるため、カウンターの整合性が保証される
                         let _guard = ConnectionGuard::new();
@@ -7008,8 +7088,8 @@ fn main() {
                     
                     let _ = stream.set_nodelay(true);
                     
-                    // 軽量なリダイレクト処理をspawn
-                    monoio::spawn(async move {
+                    // 軽量なリダイレクト処理をspawn（パニック耐性あり）
+                    spawn_with_panic_catch(async move {
                         handle_http_redirect(stream).await;
                     });
                 }
@@ -7264,7 +7344,8 @@ fn spawn_background_revalidation(
     prefix: Vec<u8>,
     headers: Vec<(Box<[u8]>, Box<[u8]>)>,
 ) {
-    monoio::spawn(async move {
+    // パニック耐性のあるspawn (stale-while-revalidate のバックグラウンドタスク)
+    spawn_with_panic_catch(async move {
         debug!("Background revalidation started for {:?}", cache_key.path());
         
         // サーバーを選択
