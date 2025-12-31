@@ -11652,6 +11652,13 @@ async fn handle_proxy(
         .and_then(|(_, v)| std::str::from_utf8(v).ok())
         .unwrap_or("unknown");
     
+    // RFC 7230 Section 4.3: TE ヘッダーを解析
+    // クライアントがtrailersをサポートしているかを判定
+    let _client_supports_trailers = headers.iter()
+        .find(|(name, _)| name.eq_ignore_ascii_case(b"te"))
+        .map(|(_, value)| parse_te_header(value).supports_trailers)
+        .unwrap_or(false);
+    
     let path_str = std::str::from_utf8(req_path).unwrap_or("/");
     
     // ===================
@@ -11921,6 +11928,13 @@ async fn handle_proxy(
     for (name, value) in headers {
         // host と connection ヘッダーは別途処理済みのためスキップ
         if name.eq_ignore_ascii_case(b"host") || name.eq_ignore_ascii_case(b"connection") {
+            continue;
+        }
+        
+        // RFC 7230 Section 6.1: Hop-by-hopヘッダーを削除
+        // Connection, Keep-Alive, Proxy-Connection, TE, Trailer, Transfer-Encoding, Upgrade
+        // これらのヘッダーはプロキシで終端され、バックエンドに転送してはならない
+        if is_hop_by_hop_header(name) {
             continue;
         }
         
