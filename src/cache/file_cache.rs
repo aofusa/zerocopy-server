@@ -103,21 +103,17 @@ impl CachedFileInfo {
 
 /// Unix タイムスタンプを年月日時分秒に変換
 fn unix_timestamp_to_date(timestamp: i64) -> (i32, u32, u32, u32, u32, u32) {
-    let secs_per_day = 86400i64;
-    let days_per_400_years = 146097i64;
-    let days_per_100_years = 36524i64;
-    let days_per_4_years = 1461i64;
-    let days_per_year = 365i64;
+    const DAYS_PER_400_YEARS: i64 = 146097;
     
     let sec = (timestamp % 60) as u32;
     let timestamp = timestamp / 60;
     let min = (timestamp % 60) as u32;
     let timestamp = timestamp / 60;
     let hour = (timestamp % 24) as u32;
-    let mut days = timestamp / 24 + 719468; // days from year 0
+    let days = timestamp / 24 + 719468; // days from year 0
     
-    let era = if days >= 0 { days } else { days - days_per_400_years + 1 } / days_per_400_years;
-    let doe = (days - era * days_per_400_years) as i32;
+    let era = if days >= 0 { days } else { days - DAYS_PER_400_YEARS + 1 } / DAYS_PER_400_YEARS;
+    let doe = (days - era * DAYS_PER_400_YEARS) as i32;
     let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
     let year = yoe + (era as i32) * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
