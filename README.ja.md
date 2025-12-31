@@ -449,8 +449,16 @@ path = "/var/www/index.html"
 配列の順序で評価（first-match方式）。すべてのルートは統合された `[[route]]` 構造を使用し、`conditions` と `action` フィールドを持ちます。
 
 1. **ルート条件** (`[route.conditions]`): ホスト、パス、ヘッダー、メソッド、クエリパラメータ、またはソースIPでマッチ
+   - `host`: ホストヘッダーマッチ（ワイルドカード対応、例: "api.example.com", "*.example.com"）
+   - `path`: パスパターンマッチ（ワイルドカード対応、例: "/api/*", "/static/*"）
+   - `header`: HTTPヘッダーマッチ（マップで複数ヘッダー指定可能、例: `{ "X-Version" = "v2" }`）
+   - `method`: HTTPリクエストメソッドマッチ（配列で複数メソッド指定可能、例: `["GET", "POST"]`）
+   - `query`: クエリパラメータマッチ（マップで複数クエリ指定可能、例: `{ "token" = "secret" }`）
+   - `source_ip`: ソースIPマッチ（CIDR表記、配列で複数CIDR指定可能、例: `["192.168.0.0/16", "10.0.0.0/8"]`）
+   - すべての条件はANDで結合されます。条件が指定されていない場合は、すべてのリクエストにマッチします（デフォルトルート）。
 2. **ルートアクション** (`[route.action]`): バックエンドアクション（File、Proxy、Redirectなど）
 3. **ルートレベルの設定** (`[route.security]`, `[route.cache]`, `[route.compression]`, `[route.buffering]`, `[route.open_file_cache]`): actionレベルの設定をオーバーライド
+4. **ルートレベルのWASMモジュール** (`modules`): このルートに適用するWASMモジュール名のリスト（route直下で設定、`route.action`配下ではない）
 
 ### バックエンドタイプ
 
@@ -572,6 +580,139 @@ url = "http://localhost:3000"
 | `/api/v1/users` | `"/api/"` → `url = ".../app/"` | `http://localhost:8080/app/v1/users` |
 | `/backend` | `"/backend"` → `url = ".../"` | `http://localhost:3000/` |
 | `/backend/users` | `"/backend"` | `http://localhost:3000/users` |
+
+### ルート条件の例
+
+すべての条件はANDで結合されます。条件が指定されていない場合は、すべてのリクエストにマッチします（デフォルトルート）。
+
+#### ホストとパス条件
+
+```toml
+# ホストベースルーティング
+[[route]]
+[route.conditions]
+host = "api.example.com"
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080"
+
+# パスベースルーティング
+[[route]]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080"
+```
+
+#### HTTPヘッダー条件
+
+```toml
+# X-Versionヘッダーが"v2"の場合のみマッチ
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+header = { "X-Version" = "v2" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/v2/"
+
+# 複数ヘッダー（すべてマッチする必要がある）
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/v2/"
+```
+
+#### HTTPメソッド条件
+
+```toml
+# GETとPOSTのみマッチ
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+method = ["GET", "POST"]
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+```
+
+#### クエリパラメータ条件
+
+```toml
+# tokenクエリパラメータが"secret"の場合のみマッチ
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+query = { "token" = "secret" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+
+# 複数クエリパラメータ（すべてマッチする必要がある）
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+query = { "format" = "json", "version" = "1" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+```
+
+#### ソースIP条件
+
+```toml
+# 特定のCIDR範囲からのアクセスのみマッチ
+[[route]]
+[route.conditions]
+host = "admin.example.com"
+path = "/admin/*"
+source_ip = ["192.168.0.0/16", "10.0.0.0/8"]
+[route.action]
+type = "Proxy"
+url = "http://localhost:9000/"
+```
+
+#### 複数条件の組み合わせ
+
+```toml
+# すべての条件がマッチする必要がある（AND論理）
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/v2/*"
+header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+method = ["GET", "POST"]
+query = { "format" = "json" }
+source_ip = ["192.168.0.0/16"]
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/v2/"
+```
+
+### Proxy-Wasm拡張機能（ルートレベル設定）
+
+WASMモジュールはroute直下で設定します（`route.action`配下ではありません）：
+
+```toml
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+# このルートに適用するWASMモジュール名のリスト
+modules = ["header_filter", "waf_filter"]
+```
 
 ### ファイル配信モード
 

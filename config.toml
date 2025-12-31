@@ -987,6 +987,29 @@ connection_window_size = 16777216
 #    プレフィックス除去後の残りパスをバックエンドURLに結合
 #    例: "/api/" + url="http://backend:3000/app/"
 #        リクエスト "/api/v1/users" → "http://backend:3000/app/v1/users"
+#
+# ルーティング条件（[route.conditions]）:
+# 
+# すべての条件はANDで結合されます。
+# 条件が指定されていない場合は、すべてのリクエストにマッチします（デフォルトルート）。
+#
+# - host: ホスト名マッチ（ワイルドカード対応）
+#   例: "api.example.com", "*.example.com"
+#
+# - path: パスマッチ（ワイルドカード対応）
+#   例: "/api/*", "/static/*", "/api/v2/*"
+#
+# - header: HTTPヘッダーマッチ（マップで複数ヘッダー指定可能）
+#   例: { "X-Version" = "v2", "X-API-Key" = "secret" }
+#
+# - method: HTTPメソッドマッチ（配列で複数メソッド指定可能）
+#   例: ["GET", "POST"]
+#
+# - query: クエリパラメータマッチ（マップで複数クエリ指定可能）
+#   例: { "key" = "value", "token" = "abc123" }
+#
+# - source_ip: ソースIPマッチ（CIDR表記、配列で複数CIDR指定可能）
+#   例: ["192.168.0.0/16", "10.0.0.0/8"]
 
 
 # ------------------------------------------
@@ -1093,6 +1116,81 @@ allowed_methods = ["GET", "POST", "PUT"]
 max_request_body_size = 5_242_880
 backend_connect_timeout_secs = 5
 rate_limit_requests_per_min = 60
+
+# ------------------------------------------
+# ルーティング条件の例（header, method, query, source_ip）
+# ------------------------------------------
+
+# HTTPヘッダー条件付きルーティング
+# X-Versionヘッダーが"v2"の場合のみマッチ
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+header = { "X-Version" = "v2" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/v2/"
+
+# HTTPメソッド条件付きルーティング
+# GETとPOSTのみ許可
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+method = ["GET", "POST"]
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+
+# クエリパラメータ条件付きルーティング
+# tokenクエリパラメータが"secret"の場合のみマッチ
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+query = { "token" = "secret" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+
+# ソースIP条件付きルーティング
+# 特定のCIDR範囲からのアクセスのみ許可
+[[route]]
+[route.conditions]
+host = "admin.example.com"
+path = "/admin/*"
+source_ip = ["192.168.0.0/16", "10.0.0.0/8"]
+[route.action]
+type = "Proxy"
+url = "http://localhost:9000/"
+
+# 複数条件の組み合わせ（すべてANDで結合）
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/v2/*"
+header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+method = ["GET", "POST"]
+query = { "format" = "json" }
+source_ip = ["192.168.0.0/16"]
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/v2/"
+
+# ------------------------------------------
+# Proxy-Wasm拡張機能（route直下で設定）
+# ------------------------------------------
+# WASMモジュールはroute直下で設定します（route.action配下ではありません）
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+# WASMモジュール名のリスト（このルートに適用するWASMモジュール）
+modules = ["header_filter", "waf_filter"]
 
 # ------------------------------------------
 # レスポンス圧縮設定付きプロキシ

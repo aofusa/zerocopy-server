@@ -449,8 +449,16 @@ path = "/var/www/index.html"
 Routes are evaluated in array order (first-match). All routes use the unified `[[route]]` structure with `conditions` and `action` fields.
 
 1. **Route conditions** (`[route.conditions]`): Match on host, path, headers, method, query parameters, or source IP
+   - `host`: Host header matching (wildcard supported, e.g., "api.example.com", "*.example.com")
+   - `path`: Path pattern matching (wildcard supported, e.g., "/api/*", "/static/*")
+   - `header`: HTTP header matching (map for multiple headers, e.g., `{ "X-Version" = "v2" }`)
+   - `method`: HTTP request method matching (array for multiple methods, e.g., `["GET", "POST"]`)
+   - `query`: Query string parameter matching (map for multiple query params, e.g., `{ "token" = "secret" }`)
+   - `source_ip`: Source IP matching (CIDR notation, array for multiple CIDRs, e.g., `["192.168.0.0/16", "10.0.0.0/8"]`)
+   - All conditions are combined with AND logic. If a condition is not specified, it matches all requests (default route).
 2. **Route action** (`[route.action]`): Backend action (File, Proxy, Redirect, etc.)
 3. **Route-level settings** (`[route.security]`, `[route.cache]`, `[route.compression]`, `[route.buffering]`, `[route.open_file_cache]`): Override action-level settings
+4. **Route-level WASM modules** (`modules`): List of WASM module names to apply to this route (set at route level, not under `route.action`)
 
 ### Backend Types
 
@@ -572,6 +580,139 @@ url = "http://localhost:3000"
 | `/api/v1/users` | `"/api/"` → `url = ".../app/"` | `http://localhost:8080/app/v1/users` |
 | `/backend` | `"/backend"` → `url = ".../"` | `http://localhost:3000/` |
 | `/backend/users` | `"/backend"` | `http://localhost:3000/users` |
+
+### Route Conditions Examples
+
+All conditions are combined with AND logic. If a condition is not specified, it matches all requests (default route).
+
+#### Host and Path Conditions
+
+```toml
+# Host-based routing
+[[route]]
+[route.conditions]
+host = "api.example.com"
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080"
+
+# Path-based routing
+[[route]]
+[route.conditions]
+path = "/api/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080"
+```
+
+#### HTTP Header Condition
+
+```toml
+# Match requests with X-Version header set to "v2"
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+header = { "X-Version" = "v2" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/v2/"
+
+# Multiple headers (all must match)
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/v2/"
+```
+
+#### HTTP Method Condition
+
+```toml
+# Match only GET and POST requests
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+method = ["GET", "POST"]
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+```
+
+#### Query String Condition
+
+```toml
+# Match requests with token query parameter set to "secret"
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+query = { "token" = "secret" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+
+# Multiple query parameters (all must match)
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+query = { "format" = "json", "version" = "1" }
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+```
+
+#### Source IP Condition
+
+```toml
+# Match requests from specific CIDR ranges
+[[route]]
+[route.conditions]
+host = "admin.example.com"
+path = "/admin/*"
+source_ip = ["192.168.0.0/16", "10.0.0.0/8"]
+[route.action]
+type = "Proxy"
+url = "http://localhost:9000/"
+```
+
+#### Combined Conditions
+
+```toml
+# All conditions must match (AND logic)
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/v2/*"
+header = { "X-Version" = "v2", "X-API-Key" = "secret" }
+method = ["GET", "POST"]
+query = { "format" = "json" }
+source_ip = ["192.168.0.0/16"]
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/v2/"
+```
+
+### Proxy-Wasm Extension (Route-level Configuration)
+
+WASM modules are configured at the route level (not under `route.action`):
+
+```toml
+[[route]]
+[route.conditions]
+host = "api.example.com"
+path = "/api/*"
+[route.action]
+type = "Proxy"
+url = "http://localhost:8080/"
+# WASM module names to apply to this route
+modules = ["header_filter", "waf_filter"]
+```
 
 ### File Serving Mode
 
