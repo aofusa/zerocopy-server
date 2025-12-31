@@ -56,6 +56,23 @@ pub struct Http2Connection<S> {
     /// 送信キュー
     #[allow(dead_code)]
     send_queue: VecDeque<Vec<u8>>,
+    
+    // ====================
+    // DoS 対策用状態
+    // ====================
+    
+    /// RST_STREAM カウンター (Rapid Reset 対策)
+    rst_stream_count: u32,
+    /// RST_STREAM ウィンドウ開始時刻
+    rst_stream_window_start: std::time::Instant,
+    
+    /// 制御フレームカウンター (Control Frame Flooding 対策)
+    control_frame_count: u32,
+    /// 制御フレームウィンドウ開始時刻
+    control_frame_window_start: std::time::Instant,
+    
+    /// 現在のストリームの CONTINUATION カウンター
+    continuation_count: u32,
 }
 
 impl<S> Http2Connection<S>
@@ -75,6 +92,9 @@ where
         
         // コネクションウィンドウサイズを設定から取得
         let conn_window = settings.connection_window_size as i32;
+        
+        // DoS 対策用のタイムスタンプを初期化
+        let now = std::time::Instant::now();
 
         Self {
             stream,
@@ -95,6 +115,12 @@ where
             buf_start: 0,
             buf_end: 0,
             send_queue: VecDeque::new(),
+            // DoS 対策
+            rst_stream_count: 0,
+            rst_stream_window_start: now,
+            control_frame_count: 0,
+            control_frame_window_start: now,
+            continuation_count: 0,
         }
     }
 
@@ -395,13 +421,16 @@ where
         Ok(())
     }
 
-    /// SETTINGS フレームを処理
+    /// SETTINGS フレームを処理 (Control Frame Flooding 対策付き)
     async fn handle_settings(&mut self, ack: bool, settings: &[(u16, u32)]) -> Http2Result<()> {
         if ack {
             // ACK を受信
             self.settings_ack_pending = false;
             return Ok(());
         }
+        
+        // レート制限チェック (非ACK の SETTINGS フレーム)
+        self.check_control_frame_rate()?;
 
         // クライアントの設定を適用
         for &(id, value) in settings {
@@ -466,7 +495,9 @@ where
         Ok(())
     }
 
-    /// HEADERS フレームを処理
+    /// HEADERS フレームを処理 (CONTINUATION Flood 対策付き)
+    /// 
+    /// CVE-2024-24786 対策として、ヘッダーブロックサイズと CONTINUATION フレーム数を制限。
     async fn handle_headers(
         &mut self,
         stream_id: u32,
@@ -480,6 +511,23 @@ where
             if pending_id != stream_id {
                 return Err(Http2Error::protocol_error("Expected CONTINUATION frame"));
             }
+        }
+        
+        // CONTINUATION カウンターをリセット (新しいヘッダーブロック開始)
+        self.continuation_count = 0;
+        
+        // ヘッダーブロックサイズチェック (HPACK Bomb 対策)
+        if header_block.len() > self.local_settings.max_header_block_size {
+            ftlog::warn!(
+                "[HTTP/2] Header block too large: {} bytes (limit: {})",
+                header_block.len(),
+                self.local_settings.max_header_block_size
+            );
+            return Err(Http2Error::stream_error(
+                stream_id,
+                Http2ErrorCode::EnhanceYourCalm,
+                "Header block size limit exceeded",
+            ));
         }
 
         // Check if this is a trailer (second HEADERS on existing stream)
@@ -537,6 +585,7 @@ where
 
         if end_headers {
             self.streams.set_receiving_headers(None);
+            self.continuation_count = 0;  // リセット
             self.decode_and_set_headers(stream_id, is_trailer)?;
 
             // リクエストが完了したかチェック
@@ -551,7 +600,9 @@ where
         Ok(None)
     }
 
-    /// CONTINUATION フレームを処理
+    /// CONTINUATION フレームを処理 (CONTINUATION Flood 対策付き)
+    /// 
+    /// CVE-2024-24786 対策として、CONTINUATION フレーム数と累積ヘッダーブロックサイズを制限。
     async fn handle_continuation(
         &mut self,
         stream_id: u32,
@@ -565,11 +616,41 @@ where
         if pending_id != stream_id {
             return Err(Http2Error::protocol_error("CONTINUATION for wrong stream"));
         }
+        
+        // CONTINUATION フレーム数チェック (CONTINUATION Flood 対策)
+        self.continuation_count += 1;
+        if self.continuation_count > self.local_settings.max_continuation_frames {
+            ftlog::warn!(
+                "[HTTP/2] CONTINUATION Flood detected: {} frames (limit: {})",
+                self.continuation_count,
+                self.local_settings.max_continuation_frames
+            );
+            return Err(Http2Error::connection_error(
+                Http2ErrorCode::EnhanceYourCalm,
+                "CONTINUATION frame limit exceeded",
+            ));
+        }
 
         // ストリームを取得 - CONTINUATION中はストリームが必ず存在するはず
         // RFC 7540: ストリームが見つからない場合は接続エラー
         let stream = self.streams.get(stream_id)
             .ok_or_else(|| Http2Error::protocol_error("Stream not found during CONTINUATION"))?;
+        
+        // 累積ヘッダーブロックサイズチェック (HPACK Bomb 対策)
+        let current_size = stream.pending_header_len();
+        let new_size = current_size + header_block.len();
+        if new_size > self.local_settings.max_header_block_size {
+            ftlog::warn!(
+                "[HTTP/2] Cumulative header block too large: {} bytes (limit: {})",
+                new_size,
+                self.local_settings.max_header_block_size
+            );
+            return Err(Http2Error::stream_error(
+                stream_id,
+                Http2ErrorCode::EnhanceYourCalm,
+                "Cumulative header block size limit exceeded",
+            ));
+        }
 
         // end_stream: HalfClosedRemote means END_STREAM was set on HEADERS
         let end_stream = matches!(stream.state, StreamState::HalfClosedRemote | StreamState::Closed);
@@ -583,6 +664,7 @@ where
 
         if end_headers {
             self.streams.set_receiving_headers(None);
+            self.continuation_count = 0;  // リセット
             self.decode_and_set_headers(stream_id, is_trailer)?;
 
             if end_stream {
@@ -878,13 +960,50 @@ where
         Ok(())
     }
 
-    /// PING を処理
+    /// PING を処理 (Control Frame Flooding 対策付き)
+    /// 
+    /// 制御フレームのレート制限を適用し、フラッド攻撃を防止。
     async fn handle_ping(&mut self, ack: bool, data: &[u8; 8]) -> Http2Result<()> {
+        // レート制限チェック (ACK でない場合のみカウント)
         if !ack {
+            self.check_control_frame_rate()?;
+            
             // PING ACK を送信
             let frame = self.frame_encoder.encode_ping(data, true);
             self.write_all(&frame).await?;
         }
+        Ok(())
+    }
+    
+    /// 制御フレームのレート制限をチェック
+    /// 
+    /// PING, SETTINGS, WINDOW_UPDATE(stream_id=0) などの制御フレームを
+    /// 対象としてレート制限を適用。
+    fn check_control_frame_rate(&mut self) -> Http2Result<()> {
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.control_frame_window_start);
+        
+        if elapsed.as_secs() >= 1 {
+            // ウィンドウをリセット
+            self.control_frame_count = 1;
+            self.control_frame_window_start = now;
+        } else {
+            self.control_frame_count += 1;
+            
+            // 閾値超過チェック
+            if self.control_frame_count > self.local_settings.max_control_frames_per_second {
+                ftlog::warn!(
+                    "[HTTP/2] Control frame flood detected: {} frames in 1 second (limit: {})",
+                    self.control_frame_count,
+                    self.local_settings.max_control_frames_per_second
+                );
+                return Err(Http2Error::connection_error(
+                    Http2ErrorCode::EnhanceYourCalm,
+                    "Control frame rate limit exceeded",
+                ));
+            }
+        }
+        
         Ok(())
     }
 
@@ -918,8 +1037,36 @@ where
         Ok(())
     }
 
-    /// RST_STREAM を処理
+    /// RST_STREAM を処理 (Rapid Reset 対策付き)
+    /// 
+    /// CVE-2023-44487 (Rapid Reset) 対策として、RST_STREAM のレート制限を実装。
+    /// 閾値を超えた場合は ENHANCE_YOUR_CALM (0xb) エラーで接続を切断。
     fn handle_rst_stream(&mut self, stream_id: u32, error_code: u32) -> Http2Result<()> {
+        // レート制限チェック (Rapid Reset 対策)
+        let now = std::time::Instant::now();
+        let elapsed = now.duration_since(self.rst_stream_window_start);
+        
+        if elapsed.as_secs() >= 1 {
+            // ウィンドウをリセット
+            self.rst_stream_count = 1;
+            self.rst_stream_window_start = now;
+        } else {
+            self.rst_stream_count += 1;
+            
+            // 閾値超過チェック
+            if self.rst_stream_count > self.local_settings.max_rst_stream_per_second {
+                ftlog::warn!(
+                    "[HTTP/2] Rapid Reset attack detected: {} RST_STREAM frames in 1 second (limit: {})",
+                    self.rst_stream_count,
+                    self.local_settings.max_rst_stream_per_second
+                );
+                return Err(Http2Error::connection_error(
+                    Http2ErrorCode::EnhanceYourCalm,
+                    "RST_STREAM rate limit exceeded",
+                ));
+            }
+        }
+        
         if let Some(stream) = self.streams.get(stream_id) {
             stream.recv_rst_stream(error_code);
         }

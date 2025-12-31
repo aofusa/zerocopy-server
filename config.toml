@@ -557,6 +557,48 @@ max_frame_size = 65536
 # 注意: 大きなレスポンスを複数ストリームで同時に送信する場合に増加推奨
 connection_window_size = 16777216
 
+# ------------------------------------------
+# HTTP/2 DoS 対策設定
+# ------------------------------------------
+#
+# HTTP/2 プロトコルに対する各種 DoS 攻撃を防止するための設定です。
+# 以下の脆弱性に対応しています:
+#   - CVE-2023-44487 (Rapid Reset Attack)
+#   - CVE-2024-24786 (CONTINUATION Flood)
+#   - Control Frame Flooding (PING/SETTINGS)
+#   - HPACK Bomb
+#   - Slow Loris
+#
+# これらの設定を調整する場合は、正規のクライアントに影響がないことを
+# 確認してください。
+
+# RST_STREAM レート制限 (1秒あたりの最大数)
+# Rapid Reset 対策 (CVE-2023-44487)
+# デフォルト: 100
+# max_rst_stream_per_second = 100
+
+# 制御フレームレート制限 (1秒あたりの最大数)
+# PING/SETTINGS フラッド対策
+# デフォルト: 500
+# max_control_frames_per_second = 500
+
+# CONTINUATION フレーム制限 (ヘッダーブロックあたりの最大数)
+# CONTINUATION Flood 対策 (CVE-2024-24786)
+# デフォルト: 10
+# max_continuation_frames = 10
+
+# 最大ヘッダーブロックサイズ (bytes)
+# HPACK Bomb 対策
+# HEADERS + CONTINUATION の累積サイズ上限
+# デフォルト: 65536 (64KB)
+# max_header_block_size = 65536
+
+# ストリームアイドルタイムアウト (秒)
+# Slow Loris 対策
+# リクエストが完了しないストリームの切断までの時間
+# デフォルト: 60
+# stream_idle_timeout_secs = 60
+
 
 # ==========================================
 # HTTP/3 詳細設定 (RFC 9114, QUIC RFC 9000)

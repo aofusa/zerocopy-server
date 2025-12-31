@@ -3688,6 +3688,40 @@ pub struct Http2ConfigSection {
     /// デフォルト: 65535 (64KB - 1)
     #[serde(default = "default_h2_connection_window_size")]
     pub connection_window_size: u32,
+    
+    // ====================
+    // DoS 対策設定
+    // ====================
+    
+    /// RST_STREAM レート制限 (1秒あたりの最大数)
+    /// Rapid Reset 対策 (CVE-2023-44487)
+    /// デフォルト: 100
+    #[serde(default = "default_h2_max_rst_stream_per_second")]
+    pub max_rst_stream_per_second: u32,
+    
+    /// 制御フレームレート制限 (1秒あたりの最大数)
+    /// PING/SETTINGS フラッド対策
+    /// デフォルト: 500
+    #[serde(default = "default_h2_max_control_frames_per_second")]
+    pub max_control_frames_per_second: u32,
+    
+    /// CONTINUATION フレーム制限 (ヘッダーブロックあたりの最大数)
+    /// CONTINUATION Flood 対策 (CVE-2024-24786)
+    /// デフォルト: 10
+    #[serde(default = "default_h2_max_continuation_frames")]
+    pub max_continuation_frames: u32,
+    
+    /// 最大ヘッダーブロックサイズ (bytes)
+    /// HPACK Bomb 対策
+    /// デフォルト: 65536 (64KB)
+    #[serde(default = "default_h2_max_header_block_size")]
+    pub max_header_block_size: usize,
+    
+    /// ストリームアイドルタイムアウト (秒)
+    /// Slow Loris 対策
+    /// デフォルト: 60
+    #[serde(default = "default_h2_stream_idle_timeout_secs")]
+    pub stream_idle_timeout_secs: u64,
 }
 
 // HTTP/2 設定のデフォルト値（high_performance と同等）
@@ -3699,6 +3733,13 @@ fn default_h2_max_frame_size() -> u32 { 65536 }         // 64KB (より大きな
 fn default_h2_max_header_list_size() -> u32 { 65536 }   // 64KB
 fn default_h2_connection_window_size() -> u32 { 1048576 } // 1MB
 
+// DoS 対策のデフォルト値
+fn default_h2_max_rst_stream_per_second() -> u32 { 100 }
+fn default_h2_max_control_frames_per_second() -> u32 { 500 }
+fn default_h2_max_continuation_frames() -> u32 { 10 }
+fn default_h2_max_header_block_size() -> usize { 65536 }
+fn default_h2_stream_idle_timeout_secs() -> u64 { 60 }
+
 impl Default for Http2ConfigSection {
     fn default() -> Self {
         Self {
@@ -3708,6 +3749,12 @@ impl Default for Http2ConfigSection {
             max_frame_size: default_h2_max_frame_size(),
             max_header_list_size: default_h2_max_header_list_size(),
             connection_window_size: default_h2_connection_window_size(),
+            // DoS 対策
+            max_rst_stream_per_second: default_h2_max_rst_stream_per_second(),
+            max_control_frames_per_second: default_h2_max_control_frames_per_second(),
+            max_continuation_frames: default_h2_max_continuation_frames(),
+            max_header_block_size: default_h2_max_header_block_size(),
+            stream_idle_timeout_secs: default_h2_stream_idle_timeout_secs(),
         }
     }
 }
@@ -3724,6 +3771,12 @@ impl Http2ConfigSection {
             max_header_list_size: self.max_header_list_size,
             enable_push: false, // サーバーではpush無効
             connection_window_size: self.connection_window_size,
+            // DoS 対策
+            max_rst_stream_per_second: self.max_rst_stream_per_second,
+            max_control_frames_per_second: self.max_control_frames_per_second,
+            max_continuation_frames: self.max_continuation_frames,
+            max_header_block_size: self.max_header_block_size,
+            stream_idle_timeout_secs: self.stream_idle_timeout_secs,
         }
     }
 }
