@@ -3696,6 +3696,11 @@ pub struct Route {
     /// ルートレベルのOpenFileCache設定（actionの設定をオーバーライド、Fileバックエンドのみ）
     #[serde(default)]
     pub open_file_cache: Option<cache::OpenFileCacheConfig>,
+    
+    /// ルートレベルのWASMモジュール名のリスト（このルートに適用するWASMモジュール）
+    /// 注意: modules は route 直下で設定（action配下の設定は削除）
+    #[serde(default)]
+    pub modules: Option<Vec<String>>,
 }
 
 #[derive(Deserialize)]
@@ -5013,43 +5018,36 @@ pub enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
     /// - sni_name: TLS接続時のSNI名（IP直打ち時にドメイン名を指定可能）
     /// - use_h2c: H2C (HTTP/2 over cleartext) を使用するかどうか
-    /// 注意: security, compression, buffering, cache は route 直下で設定
+    /// 注意: security, compression, buffering, cache, modules は route 直下で設定
     Proxy { 
         url: String, 
         sni_name: Option<String>, 
         use_h2c: bool, 
-        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        modules: Option<Vec<String>>,
     },
     /// Upstream グループ参照（ロードバランシング用）
-    /// 注意: security, compression, buffering, cache は route 直下で設定
+    /// 注意: security, compression, buffering, cache, modules は route 直下で設定
     ProxyUpstream { 
         upstream: String, 
-        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        modules: Option<Vec<String>>,
     },
     /// File バックエンド設定
     /// - path: ファイルまたはディレクトリのパス
     /// - mode: "sendfile" または "memory"
     /// - index: ディレクトリアクセス時に返すファイル名（デフォルト: "index.html"）
-    /// 注意: security, cache, open_file_cache は route 直下で設定
+    /// 注意: security, cache, open_file_cache, modules は route 直下で設定
     File { 
         path: String, 
         mode: String, 
         index: Option<String>, 
-        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        modules: Option<Vec<String>>,
     },
     /// Redirect バックエンド設定
     /// - redirect_url: リダイレクト先URL（$request_uri, $host, $path 変数使用可能）
     /// - redirect_status: ステータスコード（301, 302, 307, 308）
     /// - preserve_path: 元のパスをリダイレクト先に追加するか
+    /// 注意: modules は route 直下で設定
     Redirect { 
         redirect_url: String, 
         redirect_status: u16, 
         preserve_path: bool,
-        /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
-        modules: Option<Vec<String>>,
     },
 }
 
@@ -5087,8 +5085,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut sni_name: Option<String> = None;
                 // H2C 用フィールド（Proxy用）
                 let mut use_h2c: Option<bool> = None;
-                // WASMモジュール名のリスト
-                let mut modules: Option<Vec<String>> = None;
                 
                 while let Some(key) = map.next_key::<String>()? {
                     match key.as_str() {
@@ -5098,8 +5094,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "path" => path = Some(map.next_value()?),
                         "mode" => mode = Some(map.next_value()?),
                         "index" => index = Some(map.next_value()?),
-                        // security, compression, buffering, cache, open_file_cache は route 直下で設定されるため、ここでは無視
-                        "security" | "compression" | "buffering" | "cache" | "open_file_cache" => {
+                        // security, compression, buffering, cache, open_file_cache, modules は route 直下で設定されるため、ここでは無視
+                        "security" | "compression" | "buffering" | "cache" | "open_file_cache" | "modules" => {
                             let _: serde::de::IgnoredAny = map.next_value()?;
                         }
                         "redirect_url" => redirect_url = Some(map.next_value()?),
@@ -5107,7 +5103,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "preserve_path" => preserve_path = Some(map.next_value()?),
                         "sni_name" => sni_name = Some(map.next_value()?),
                         "use_h2c" | "h2c" => use_h2c = Some(map.next_value()?),
-                        "modules" => modules = Some(map.next_value()?),
                         _ => { let _: serde::de::IgnoredAny = map.next_value()?; }
                     }
                 }
@@ -5120,7 +5115,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         if let Some(upstream_name) = upstream {
                             Ok(BackendConfig::ProxyUpstream { 
                                 upstream: upstream_name, 
-                                modules,
                             })
                         } else {
                             let url = url.ok_or_else(|| serde::de::Error::missing_field("url or upstream"))?;
@@ -5129,7 +5123,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                                 url, 
                                 sni_name, 
                                 use_h2c, 
-                                modules,
                             })
                         }
                     }
@@ -5148,7 +5141,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             redirect_url, 
                             redirect_status, 
                             preserve_path,
-                            modules,
                         })
                     }
                     "File" | _ => {
@@ -5158,7 +5150,6 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             path, 
                             mode, 
                             index, 
-                            modules,
                         })
                     }
                 }
@@ -5751,8 +5742,8 @@ fn validate_config(config: &Config) -> io::Result<()> {
     if let Some(ref routes) = config.route {
         for (i, route) in routes.iter().enumerate() {
             let route_name = format!("route[{}]", i);
-            validate_backend_config(
-                &route.action, 
+            validate_route_config(
+                route, 
                 &route_name,
                 #[cfg(feature = "wasm")]
                 config.wasm.as_ref(),
@@ -5775,14 +5766,14 @@ fn validate_config(config: &Config) -> io::Result<()> {
     Ok(())
 }
 
-/// バックエンド設定の妥当性チェック
-fn validate_backend_config(
-    config: &BackendConfig, 
+/// ルート設定の妥当性チェック
+fn validate_route_config(
+    route: &Route, 
     route_name: &str,
     #[cfg(feature = "wasm")]
     wasm_config: Option<&crate::wasm::WasmConfig>,
 ) -> io::Result<()> {
-    match config {
+    match &route.action {
         BackendConfig::Proxy { url, .. } => {
             if ProxyTarget::parse(url).is_none() {
                 return Err(io::Error::new(
@@ -5832,10 +5823,10 @@ fn validate_backend_config(
         }
     }
     
-    // WASMモジュールの参照チェック
+    // WASMモジュールの参照チェック（route直下のmodulesを使用）
     #[cfg(feature = "wasm")]
     if let Some(wasm_cfg) = wasm_config {
-        if let Some(modules) = config.modules() {
+        if let Some(ref modules) = route.modules {
             for module_name in modules {
                 if !wasm_cfg.modules.iter().any(|m| &m.name == module_name) {
                     return Err(io::Error::new(
@@ -5851,19 +5842,6 @@ fn validate_backend_config(
     }
     
     Ok(())
-}
-
-// BackendConfigにmodules()メソッドを追加
-impl BackendConfig {
-    #[allow(dead_code)]
-    pub fn modules(&self) -> Option<&Vec<String>> {
-        match self {
-            BackendConfig::Proxy { modules, .. } => modules.as_ref(),
-            BackendConfig::ProxyUpstream { modules, .. } => modules.as_ref(),
-            BackendConfig::File { modules, .. } => modules.as_ref(),
-            BackendConfig::Redirect { modules, .. } => modules.as_ref(),
-        }
-    }
 }
 
 // rustls 用の TLS 設定読み込み（統一）
@@ -6701,9 +6679,10 @@ fn load_backend(
     let compression = route.compression.as_ref().map(|c| c.clone()).unwrap_or_default();
     let buffering = route.buffering.as_ref().map(|b| b.clone()).unwrap_or_default();
     let cache = route.cache.as_ref().map(|c| c.clone()).unwrap_or_default();
+    let modules_arc = route.modules.as_ref().map(|m| Arc::new(m.clone()));
     
     match &route.action {
-        BackendConfig::Proxy { url, sni_name, use_h2c, modules } => {
+        BackendConfig::Proxy { url, sni_name, use_h2c } => {
             // 単一URLの場合は UpstreamGroup::single で単一サーバーのグループを作成
             let target = ProxyTarget::parse(url)
                 .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "Invalid proxy URL"))?
@@ -6733,17 +6712,16 @@ fn load_backend(
             }
             
             let group = UpstreamGroup::single(target);
-            let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
             Ok(Backend::Proxy(
                 Arc::new(group), 
                 Arc::new(security.clone()), 
                 Arc::new(compression.clone()),
                 Arc::new(buffering.clone()),
                 Arc::new(cache.clone()),
-                modules_arc,
+                modules_arc.clone(),
             ))
         }
-        BackendConfig::ProxyUpstream { upstream, modules } => {
+        BackendConfig::ProxyUpstream { upstream } => {
             // Upstream グループ参照
             let group = upstream_groups.get(upstream)
                 .ok_or_else(|| io::Error::new(
@@ -6769,17 +6747,16 @@ fn load_backend(
                       upstream, cache.max_memory_size, cache.default_ttl_secs);
             }
             
-            let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
             Ok(Backend::Proxy(
                 group.clone(), 
                 Arc::new(security.clone()), 
                 Arc::new(compression.clone()),
                 Arc::new(buffering.clone()),
                 Arc::new(cache.clone()),
-                modules_arc,
+                modules_arc.clone(),
             ))
         }
-        BackendConfig::File { path, mode, index, modules } => {
+        BackendConfig::File { path, mode, index } => {
             // Routeレベルの設定のみを使用
             let security = route.security.as_ref().map(|s| s.clone()).unwrap_or_default();
             let cache = route.cache.as_ref().map(|c| c.clone()).unwrap_or_default();
@@ -6813,20 +6790,17 @@ fn load_backend(
                     }
                     let data = fs::read(path)?;
                     let mime_type = mime_guess::from_path(path).first_or_octet_stream();
-                    let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
                     
-                    Ok(Backend::MemoryFile(Arc::new(data), Arc::from(mime_type.as_ref()), security, modules_arc))
+                    Ok(Backend::MemoryFile(Arc::new(data), Arc::from(mime_type.as_ref()), security, modules_arc.clone()))
                 }
                 "sendfile" | "" => {
-                    let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
-                    Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security, cache, open_file_cache_arc, modules_arc))
+                    Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security, cache, open_file_cache_arc, modules_arc.clone()))
                 }
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
         }
-        BackendConfig::Redirect { redirect_url, redirect_status, preserve_path, modules } => {
-            let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
-            Ok(Backend::Redirect(Arc::from(redirect_url.as_str()), *redirect_status, *preserve_path, modules_arc))
+        BackendConfig::Redirect { redirect_url, redirect_status, preserve_path } => {
+            Ok(Backend::Redirect(Arc::from(redirect_url.as_str()), *redirect_status, *preserve_path, modules_arc.clone()))
         }
     }
 }
