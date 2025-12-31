@@ -4989,7 +4989,7 @@ fn should_advertise_accept_ranges(method: &[u8]) -> bool {
 
 #[derive(Clone)]
 #[derive(Debug)]
-enum BackendConfig {
+pub enum BackendConfig {
     /// 単一URLプロキシ（後方互換性のため維持）
     /// - sni_name: TLS接続時のSNI名（IP直打ち時にドメイン名を指定可能）
     /// - use_h2c: H2C (HTTP/2 over cleartext) を使用するかどうか
@@ -5196,7 +5196,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
 // ====================
 
 #[derive(Clone)]
-enum Backend {
+pub enum Backend {
     /// Proxy バックエンド（ロードバランシング対応）
     /// - Arc<UpstreamGroup>: アップストリームグループ（単一または複数バックエンド）
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
@@ -5620,134 +5620,6 @@ impl UpstreamGroup {
         self.tls_insecure
     }
 }
-
-// ====================
-// nginx風パスルーター（最長プレフィックス一致）
-// ====================
-//
-// nginxの location ディレクティブと同様のマッチング動作を実現。
-//
-// ## nginxのマッチング規則（優先順位順）
-//
-// | 優先度 | nginx記法 | 説明                     | 本実装での対応       |
-// |--------|-----------|--------------------------|---------------------|
-// | 1      | = /path   | 完全一致                 | 将来対応予定         |
-// | 2      | ^~ /path  | 優先プレフィックス       | 将来対応予定         |
-// | 3      | ~ regex   | 正規表現                 | 対応なし             |
-// | 4      | /path     | **最長プレフィックス一致** | ✓ 実装済み         |
-//
-// ## 動作例
-//
-// 設定:
-//   "/static" = { path = "./www/static/" }  ← 末尾スラッシュなしでもOK
-//   "/api"    = { url = "http://backend:8080" }
-//   "/"       = { path = "./www/index.html" }
-//
-// リクエスト → マッチするルート:
-//   /                     → /       (完全一致)
-//   /static               → /static (完全一致) → index.html を返す
-//   /static/              → /static (ディレクトリアクセス) → index.html を返す
-//   /static/css/style.css → /static (プレフィックスマッチ)
-//   /api/users            → /api    (プレフィックスマッチ)
-//   /favicon.ico          → 404     (マッチなし)
-//   /unknown              → 404     (マッチなし)
-//
-// ## パフォーマンス
-//
-// matchit (Radix Tree) を使用: O(log n)
-// | ルート数 | 線形探索 O(n) | Radix Tree O(log n) |
-// |----------|---------------|---------------------|
-// | 10       | ~100ns        | ~50ns               |
-// | 100      | ~1μs          | ~100ns              |
-// | 1000     | ~10μs         | ~150ns              |
-
-/// nginx風パスルーター
-/// 
-/// 最長プレフィックス一致による高速なルーティングを提供。
-/// "/" が登録されている場合はcatch-all（フォールバック）として機能。
-#[derive(Clone)]
-struct PathRouter {
-    /// matchit Router（Radix Tree実装）
-    router: Arc<matchit::Router<usize>>,
-    /// Backendの実体を保持
-    backends: Arc<Vec<(Arc<[u8]>, Backend)>>,
-}
-
-impl PathRouter {
-    /// 新しいPathRouterを構築
-    /// 
-    /// nginx風の最長プレフィックス一致を実現するため、
-    /// 各プレフィックスに対して完全一致とワイルドカードの両方を登録。
-    fn new(entries: Vec<(String, Backend)>) -> io::Result<Self> {
-        let mut router = matchit::Router::new();
-        let mut backends = Vec::with_capacity(entries.len());
-        
-        // バックエンドを登録（インデックスを確定）
-        for (prefix, backend) in entries.iter() {
-            backends.push((Arc::from(prefix.as_bytes()), backend.clone()));
-        }
-        
-        // ルートを登録
-        // matchitの優先順位: 静的パス > パラメータ > ワイルドカード
-        // より具体的なプレフィックスが自動的に優先される
-        for (i, (prefix, _)) in entries.iter().enumerate() {
-            if prefix == "/" {
-                // "/" はcatch-allとして機能（すべてのパスにマッチ）
-                // 1. "/" への完全一致
-                if let Err(e) = router.insert("/".to_string(), i) {
-                    warn!("Route registration failed for '/': {}", e);
-                }
-                // 2. "/{*rest}" でサブパスにマッチ（catch-all）
-                let _ = router.insert("/{*rest}".to_string(), i);
-            } else if prefix.ends_with('/') {
-                // "/api/" スタイル（ディレクトリ）
-                let base = prefix.trim_end_matches('/');
-                
-                // "/api" への完全一致
-                let _ = router.insert(base.to_string(), i);
-                // "/api/" への完全一致
-                let _ = router.insert(prefix.clone(), i);
-                // "/api/{*rest}" でサブパスにマッチ
-                let _ = router.insert(format!("{base}/{{*rest}}"), i);
-            } else {
-                // "/api" スタイル（通常のプレフィックス）
-                // 末尾スラッシュなしでもディレクトリ配信やプロキシが動作するように
-                // 3つのパターンを登録：
-                // 1. "/api" への完全一致
-                let _ = router.insert(prefix.clone(), i);
-                // 2. "/api/" への完全一致（ディレクトリアクセス）
-                let _ = router.insert(format!("{prefix}/"), i);
-                // 3. "/api/{*rest}" でサブパスにマッチ
-                let _ = router.insert(format!("{prefix}/{{*rest}}"), i);
-            }
-        }
-        
-        Ok(Self {
-            router: Arc::new(router),
-            backends: Arc::new(backends),
-        })
-    }
-    
-    /// パスに最長一致するバックエンドを検索（nginx風）
-    /// 
-    /// matchitが内部でRadix Treeを使用し、
-    /// 最も具体的な（＝最長の）プレフィックスを自動的に選択。
-    fn find_longest(&self, path: &[u8]) -> Option<(&[u8], &Backend)> {
-        let path_str = std::str::from_utf8(path).ok()?;
-        
-        match self.router.at(path_str) {
-            Ok(matched) => {
-                let idx = *matched.value;
-                let (prefix, backend) = &self.backends[idx];
-                Some((prefix.as_ref(), backend))
-            }
-            Err(_) => None,
-        }
-    }
-}
-
-// SortedPathMapはPathRouterに完全移行済み
-// 型エイリアスは削除し、すべてPathRouterを使用
 
 // ====================
 // 非同期I/Oトレイト（コード重複解消）
