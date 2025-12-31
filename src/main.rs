@@ -15331,7 +15331,7 @@ async fn handle_sendfile(
     let mut header_buf = Vec::with_capacity(HEADER_BUF_CAPACITY);
     
     // Range リクエストの場合は 206 Partial Content
-    let (response_status, response_content_length) = if let Some((start, end)) = range_info {
+    let (response_status, _response_content_length) = if let Some((start, end)) = range_info {
         let content_length = end - start + 1;
         header_buf.extend_from_slice(b"HTTP/1.1 206 Partial Content\r\nContent-Type: ");
         header_buf.extend_from_slice(mime_type.as_ref().as_bytes());
