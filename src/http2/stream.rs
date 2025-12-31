@@ -104,6 +104,8 @@ pub struct Stream {
     pub content_length: Option<u64>,
     /// 受信済みボディサイズ
     pub received_body_size: u64,
+    /// 最終アクティビティ時刻 (Slow Loris 対策)
+    pub last_activity: std::time::Instant,
 }
 
 impl Stream {
@@ -125,6 +127,7 @@ impl Stream {
             receiving_headers: false,
             content_length: None,
             received_body_size: 0,
+            last_activity: std::time::Instant::now(),
         }
     }
 
@@ -344,6 +347,18 @@ impl Stream {
     pub fn pending_header_len(&self) -> usize {
         self.pending_headers.len()
     }
+    
+    /// 最終アクティビティ時刻を更新
+    #[inline]
+    pub fn update_activity(&mut self) {
+        self.last_activity = std::time::Instant::now();
+    }
+    
+    /// アイドルタイムアウトを超過しているか確認
+    #[inline]
+    pub fn is_idle_timeout(&self, timeout_secs: u64) -> bool {
+        self.last_activity.elapsed().as_secs() >= timeout_secs
+    }
 
     /// ストリームがアクティブかどうか
     pub fn is_active(&self) -> bool {
@@ -495,6 +510,23 @@ impl StreamManager {
     /// クローズ済みストリームをクリーンアップ
     pub fn cleanup_closed(&mut self) {
         self.streams.retain(|_, s| s.state != StreamState::Closed);
+    }
+    
+    /// アイドルタイムアウトを超過したストリーム ID を取得
+    /// 
+    /// Slow Loris 対策として、リクエストが完了しないストリームを検出する。
+    /// 返されたストリームには RST_STREAM を送信して閉じる必要がある。
+    pub fn get_idle_streams(&self, timeout_secs: u64) -> Vec<u32> {
+        self.streams
+            .iter()
+            .filter(|(_, s)| {
+                // アクティブなストリームのみ対象
+                // Open または HalfClosedLocal = まだリクエストを受信中
+                matches!(s.state, StreamState::Open | StreamState::HalfClosedLocal)
+                    && s.is_idle_timeout(timeout_secs)
+            })
+            .map(|(id, _)| *id)
+            .collect()
     }
 
     /// ピアの初期ウィンドウサイズを更新（SETTINGS_INITIAL_WINDOW_SIZE受信時）

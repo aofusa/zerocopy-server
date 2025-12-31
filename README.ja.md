@@ -1476,6 +1476,43 @@ max_header_list_size = 65536
 connection_window_size = 1048576
 ```
 
+### DoS対策
+
+HTTP/2 DoS攻撃対策はデフォルトで有効です。`[http2]` セクションで設定できます：
+
+| 攻撃 | CVE | 設定項目 | デフォルト |
+|------|-----|----------|-----------|
+| Rapid Reset | CVE-2023-44487 | `max_rst_stream_per_second` | 100 |
+| CONTINUATION Flood | CVE-2024-24786 | `max_continuation_frames` | 10 |
+| 制御フレームフラッド | - | `max_control_frames_per_second` | 500 |
+| HPACK Bomb | - | `max_header_block_size` | 65536 |
+| Slow Loris | - | `stream_idle_timeout_secs` | 60 |
+
+```toml
+[http2]
+# RST_STREAMレート制限（1秒あたり）
+# Rapid Reset攻撃対策 (CVE-2023-44487)
+max_rst_stream_per_second = 100
+
+# 制御フレームレート制限（1秒あたり）
+# PING/SETTINGSフラッド対策
+max_control_frames_per_second = 500
+
+# CONTINUATIONフレーム制限（ヘッダーブロックあたり）
+# CONTINUATION Flood対策 (CVE-2024-24786)
+max_continuation_frames = 10
+
+# 最大ヘッダーブロックサイズ（バイト）
+# HPACK Bomb対策
+max_header_block_size = 65536
+
+# ストリームアイドルタイムアウト（秒）
+# Slow Loris対策（0で無効化）
+stream_idle_timeout_secs = 60
+```
+
+制限を超過した場合、サーバーは `ENHANCE_YOUR_CALM` (0xb) エラーで応答し、接続を閉じます。
+
 ### HTTP/1.1フォールバック
 
 HTTP/2をサポートしないクライアントは自動的にHTTP/1.1にフォールバックします。

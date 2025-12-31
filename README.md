@@ -1475,6 +1475,43 @@ max_header_list_size = 65536
 connection_window_size = 1048576
 ```
 
+### DoS Protection
+
+HTTP/2 DoS attack mitigations are enabled by default. Configure in the `[http2]` section:
+
+| Attack | CVE | Setting | Default |
+|--------|-----|---------|---------|
+| Rapid Reset | CVE-2023-44487 | `max_rst_stream_per_second` | 100 |
+| CONTINUATION Flood | CVE-2024-24786 | `max_continuation_frames` | 10 |
+| Control Frame Flood | - | `max_control_frames_per_second` | 500 |
+| HPACK Bomb | - | `max_header_block_size` | 65536 |
+| Slow Loris | - | `stream_idle_timeout_secs` | 60 |
+
+```toml
+[http2]
+# RST_STREAM rate limit (per second)
+# Rapid Reset attack mitigation (CVE-2023-44487)
+max_rst_stream_per_second = 100
+
+# Control frame rate limit (per second)
+# Mitigates PING/SETTINGS flood attacks
+max_control_frames_per_second = 500
+
+# CONTINUATION frame limit (per header block)
+# CONTINUATION Flood mitigation (CVE-2024-24786)
+max_continuation_frames = 10
+
+# Maximum header block size (bytes)
+# HPACK Bomb mitigation
+max_header_block_size = 65536
+
+# Stream idle timeout (seconds)
+# Slow Loris mitigation (0 = disabled)
+stream_idle_timeout_secs = 60
+```
+
+When limits are exceeded, the server responds with `ENHANCE_YOUR_CALM` (0xb) error and closes the connection.
+
 ### HTTP/1.1 Fallback
 
 Clients that don't support HTTP/2 automatically fall back to HTTP/1.1.

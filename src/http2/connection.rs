@@ -889,6 +889,9 @@ where
         let stream = self.streams.get(stream_id)
             .ok_or_else(|| Http2Error::stream_error(stream_id, Http2ErrorCode::StreamClosed, "Stream not found"))?;
 
+        // アクティビティ更新 (Slow Loris 対策)
+        stream.update_activity();
+        
         stream.recv_data(data, end_stream)?;
 
         // WINDOW_UPDATE を送信 (必要に応じて)
@@ -1278,6 +1281,43 @@ where
         }
 
         Ok(())
+    }
+    
+    /// アイドルタイムアウトを超過したストリームをクリーンアップ (Slow Loris 対策)
+    /// 
+    /// リクエストが完了しないストリームを検出し、RST_STREAM(CANCEL) で閉じる。
+    /// この関数は定期的に呼び出す必要がある（例: 10秒ごと）。
+    /// 
+    /// 戻り値: クリーンアップしたストリーム数
+    pub async fn cleanup_idle_streams(&mut self) -> Http2Result<usize> {
+        let timeout_secs = self.local_settings.stream_idle_timeout_secs;
+        
+        // タイムアウトが0の場合は無効
+        if timeout_secs == 0 {
+            return Ok(0);
+        }
+        
+        let idle_streams = self.streams.get_idle_streams(timeout_secs);
+        let count = idle_streams.len();
+        
+        for stream_id in idle_streams {
+            ftlog::debug!(
+                "[HTTP/2] Closing idle stream {} (timeout: {}s)",
+                stream_id,
+                timeout_secs
+            );
+            self.send_rst_stream(stream_id, Http2ErrorCode::Cancel).await?;
+        }
+        
+        if count > 0 {
+            ftlog::info!(
+                "[HTTP/2] Cleaned up {} idle streams (timeout: {}s)",
+                count,
+                timeout_secs
+            );
+        }
+        
+        Ok(count)
     }
 
     /// メインループ: フレームを読み込んで処理
