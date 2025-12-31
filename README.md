@@ -251,6 +251,61 @@ cargo build --release --features ktls
 By default, `/etc/veil/config.toml` is loaded.
 Use the `-c` or `--config` option to specify a different path.
 
+### Default Values Reference
+
+The following table lists default values for major configuration options:
+
+| Section | Option | Default Value | Description |
+|---------|--------|---------------|-------------|
+| `[server]` | `server_header_enabled` | `false` | Enable Server header |
+| `[server]` | `server_header_value` | `"veil"` | Server header value |
+| `[server]` | `http2_enabled` | `false` | Enable HTTP/2 |
+| `[server]` | `http3_enabled` | `false` | Enable HTTP/3 |
+| `[logging]` | `level` | `"info"` | Log level |
+| `[logging]` | `format` | `"text"` | Log format |
+| `[logging]` | `channel_size` | `100000` | Log channel buffer size |
+| `[logging]` | `flush_interval_ms` | `1000` | Flush interval (ms) |
+| `[logging]` | `max_log_size` | `104857600` | Max log file size (100MB) |
+| `[prometheus]` | `enabled` | `false` | Enable Prometheus metrics |
+| `[prometheus]` | `path` | `"/__metrics"` | Metrics endpoint path |
+| `[performance]` | `reuseport_balancing` | `"cbpf"` | SO_REUSEPORT balancing |
+| `[performance]` | `huge_pages_enabled` | `false` | Enable Huge Pages |
+| `[performance]` | `open_file_cache_enabled` | `false` | Enable OpenFileCache |
+| `[performance]` | `open_file_cache_valid_duration_secs` | `60` | Cache validity (seconds) |
+| `[performance]` | `open_file_cache_max_entries` | `10000` | Max cache entries |
+| `[tls]` | `ktls_enabled` | `false` | Enable kTLS |
+| `[tls]` | `ktls_fallback_enabled` | `true` | kTLS fallback to rustls |
+| `[tls]` | `tcp_cork_enabled` | `true` | Enable TCP_CORK |
+| `[buffer_pool]` | `read_buffer_size` | `65536` | Read buffer size (64KB) |
+| `[buffer_pool]` | `initial_read_buffers` | `32` | Initial read buffers |
+| `[buffer_pool]` | `max_read_buffers` | `128` | Max read buffers |
+| `[buffer_pool]` | `request_buffer_size` | `1024` | Request buffer size (1KB) |
+| `[buffer_pool]` | `initial_request_buffers` | `16` | Initial request buffers |
+| `[buffer_pool]` | `large_request_buffer_size` | `4096` | Large request buffer (4KB) |
+| `[buffer_pool]` | `path_string_size` | `256` | Path string buffer size |
+| `[buffer_pool]` | `response_header_buffer_size` | `512` | Response header buffer size |
+| `[http2]` | `header_table_size` | `65536` | HPACK table size (64KB) |
+| `[http2]` | `max_concurrent_streams` | `256` | Max concurrent streams |
+| `[http2]` | `initial_window_size` | `1048576` | Stream window size (1MB) |
+| `[http2]` | `max_frame_size` | `65536` | Max frame size (64KB) |
+| `[http2]` | `max_header_list_size` | `65536` | Max header list size (64KB) |
+| `[http2]` | `connection_window_size` | `1048576` | Connection window (1MB) |
+| `[http2]` | `max_rst_stream_per_second` | `100` | RST_STREAM rate limit |
+| `[http2]` | `max_control_frames_per_second` | `500` | Control frame rate limit |
+| `[http2]` | `max_continuation_frames` | `10` | Max CONTINUATION frames |
+| `[http2]` | `max_header_block_size` | `65536` | Max header block (64KB) |
+| `[http2]` | `stream_idle_timeout_secs` | `60` | Stream idle timeout (seconds) |
+| `[http3]` | `max_idle_timeout` | `30000` | Max idle timeout (ms, 30s) |
+| `[http3]` | `max_udp_payload_size` | `1350` | Max UDP payload size |
+| `[http3]` | `initial_max_data` | `10000000` | Initial max data (10MB) |
+| `[http3]` | `initial_max_stream_data_bidi_local` | `1000000` | Stream data bidi local (1MB) |
+| `[http3]` | `initial_max_stream_data_bidi_remote` | `1000000` | Stream data bidi remote (1MB) |
+| `[http3]` | `initial_max_stream_data_uni` | `1000000` | Stream data uni (1MB) |
+| `[http3]` | `initial_max_streams_bidi` | `100` | Max bidirectional streams |
+| `[http3]` | `initial_max_streams_uni` | `100` | Max unidirectional streams |
+| `[http3]` | `compression_enabled` | `false` | Enable compression |
+| `[http3]` | `gso_gro_enabled` | `false` | Enable GSO/GRO |
+
 Configuration file example (`config.toml`):
 
 ```toml
@@ -1915,10 +1970,19 @@ max_udp_payload_size = 1350
 # Initial maximum data size (entire connection, default: 10000000)
 initial_max_data = 10000000
 
-# Initial maximum bidirectional streams
+# Initial maximum stream data size (bidirectional local, default: 1000000)
+initial_max_stream_data_bidi_local = 1000000
+
+# Initial maximum stream data size (bidirectional remote, default: 1000000)
+initial_max_stream_data_bidi_remote = 1000000
+
+# Initial maximum stream data size (unidirectional, default: 1000000)
+initial_max_stream_data_uni = 1000000
+
+# Initial maximum bidirectional streams (default: 100)
 initial_max_streams_bidi = 100
 
-# Initial maximum unidirectional streams
+# Initial maximum unidirectional streams (default: 100)
 initial_max_streams_uni = 100
 
 # GSO/GRO optimization (UDP performance optimization)

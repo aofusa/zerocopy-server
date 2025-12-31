@@ -252,6 +252,61 @@ cargo build --release --features ktls
 デフォルトでは `/etc/veil/config.toml` を読み込みます。
 `-c` または `--config` オプションで別のパスを指定できます。
 
+### デフォルト値一覧
+
+主要な設定項目のデフォルト値を以下に示します：
+
+| セクション | 項目 | デフォルト値 | 説明 |
+|-----------|------|-------------|------|
+| `[server]` | `server_header_enabled` | `false` | Serverヘッダーを有効化 |
+| `[server]` | `server_header_value` | `"veil"` | Serverヘッダーの値 |
+| `[server]` | `http2_enabled` | `false` | HTTP/2を有効化 |
+| `[server]` | `http3_enabled` | `false` | HTTP/3を有効化 |
+| `[logging]` | `level` | `"info"` | ログレベル |
+| `[logging]` | `format` | `"text"` | ログ形式 |
+| `[logging]` | `channel_size` | `100000` | ログチャネルバッファサイズ |
+| `[logging]` | `flush_interval_ms` | `1000` | フラッシュ間隔（ミリ秒） |
+| `[logging]` | `max_log_size` | `104857600` | 最大ログファイルサイズ（100MB） |
+| `[prometheus]` | `enabled` | `false` | Prometheusメトリクスを有効化 |
+| `[prometheus]` | `path` | `"/__metrics"` | メトリクスエンドポイントパス |
+| `[performance]` | `reuseport_balancing` | `"cbpf"` | SO_REUSEPORT振り分け方式 |
+| `[performance]` | `huge_pages_enabled` | `false` | Huge Pagesを有効化 |
+| `[performance]` | `open_file_cache_enabled` | `false` | OpenFileCacheを有効化 |
+| `[performance]` | `open_file_cache_valid_duration_secs` | `60` | キャッシュ有効期間（秒） |
+| `[performance]` | `open_file_cache_max_entries` | `10000` | 最大キャッシュエントリ数 |
+| `[tls]` | `ktls_enabled` | `false` | kTLSを有効化 |
+| `[tls]` | `ktls_fallback_enabled` | `true` | kTLS失敗時のrustlsフォールバック |
+| `[tls]` | `tcp_cork_enabled` | `true` | TCP_CORKを有効化 |
+| `[buffer_pool]` | `read_buffer_size` | `65536` | 読み込みバッファサイズ（64KB） |
+| `[buffer_pool]` | `initial_read_buffers` | `32` | 読み込みバッファ初期数 |
+| `[buffer_pool]` | `max_read_buffers` | `128` | 読み込みバッファ最大数 |
+| `[buffer_pool]` | `request_buffer_size` | `1024` | リクエストバッファサイズ（1KB） |
+| `[buffer_pool]` | `initial_request_buffers` | `16` | リクエストバッファ初期数 |
+| `[buffer_pool]` | `large_request_buffer_size` | `4096` | 大容量リクエストバッファ（4KB） |
+| `[buffer_pool]` | `path_string_size` | `256` | パス文字列バッファサイズ |
+| `[buffer_pool]` | `response_header_buffer_size` | `512` | レスポンスヘッダーバッファサイズ |
+| `[http2]` | `header_table_size` | `65536` | HPACKテーブルサイズ（64KB） |
+| `[http2]` | `max_concurrent_streams` | `256` | 最大同時ストリーム数 |
+| `[http2]` | `initial_window_size` | `1048576` | ストリームウィンドウサイズ（1MB） |
+| `[http2]` | `max_frame_size` | `65536` | 最大フレームサイズ（64KB） |
+| `[http2]` | `max_header_list_size` | `65536` | 最大ヘッダーリストサイズ（64KB） |
+| `[http2]` | `connection_window_size` | `1048576` | コネクションウィンドウ（1MB） |
+| `[http2]` | `max_rst_stream_per_second` | `100` | RST_STREAMレート制限 |
+| `[http2]` | `max_control_frames_per_second` | `500` | 制御フレームレート制限 |
+| `[http2]` | `max_continuation_frames` | `10` | 最大CONTINUATIONフレーム数 |
+| `[http2]` | `max_header_block_size` | `65536` | 最大ヘッダーブロック（64KB） |
+| `[http2]` | `stream_idle_timeout_secs` | `60` | ストリームアイドルタイムアウト（秒） |
+| `[http3]` | `max_idle_timeout` | `30000` | 最大アイドルタイムアウト（ミリ秒、30秒） |
+| `[http3]` | `max_udp_payload_size` | `1350` | 最大UDPペイロードサイズ |
+| `[http3]` | `initial_max_data` | `10000000` | 初期最大データ（10MB） |
+| `[http3]` | `initial_max_stream_data_bidi_local` | `1000000` | ストリームデータ双方向ローカル（1MB） |
+| `[http3]` | `initial_max_stream_data_bidi_remote` | `1000000` | ストリームデータ双方向リモート（1MB） |
+| `[http3]` | `initial_max_stream_data_uni` | `1000000` | ストリームデータ単方向（1MB） |
+| `[http3]` | `initial_max_streams_bidi` | `100` | 最大双方向ストリーム数 |
+| `[http3]` | `initial_max_streams_uni` | `100` | 最大単方向ストリーム数 |
+| `[http3]` | `compression_enabled` | `false` | 圧縮を有効化 |
+| `[http3]` | `gso_gro_enabled` | `false` | GSO/GROを有効化 |
+
 設定ファイル例（`config.toml`）:
 
 ```toml
@@ -1915,10 +1970,19 @@ max_udp_payload_size = 1350
 # 初期最大データサイズ（コネクション全体、デフォルト: 10000000）
 initial_max_data = 10000000
 
-# 初期最大双方向ストリーム数
+# 初期最大ストリームデータサイズ（双方向ローカル、デフォルト: 1000000）
+initial_max_stream_data_bidi_local = 1000000
+
+# 初期最大ストリームデータサイズ（双方向リモート、デフォルト: 1000000）
+initial_max_stream_data_bidi_remote = 1000000
+
+# 初期最大ストリームデータサイズ（単方向、デフォルト: 1000000）
+initial_max_stream_data_uni = 1000000
+
+# 初期最大双方向ストリーム数（デフォルト: 100）
 initial_max_streams_bidi = 100
 
-# 初期最大単方向ストリーム数
+# 初期最大単方向ストリーム数（デフォルト: 100）
 initial_max_streams_uni = 100
 
 # GSO/GRO最適化（UDPパフォーマンス最適化）
