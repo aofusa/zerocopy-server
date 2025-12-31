@@ -48,6 +48,7 @@ A high-performance reverse proxy server using io_uring (monoio) and rustls.
 ### Performance
 - **CPU Affinity**: Pin worker threads to CPU cores
 - **CBPF Distribution**: Client IP-based load balancing with SO_REUSEPORT (Linux 4.6+)
+- **OpenFileCache**: File metadata cache to reduce system calls (canonicalize, metadata, mime_guess) - 60-67% reduction in system calls for static file serving
 
 ### Operations
 - **Graceful Shutdown**: Safe termination via SIGINT/SIGTERM
@@ -314,6 +315,36 @@ reuseport_balancing = "cbpf"
 # 5-10% performance improvement by reducing TLB misses
 huge_pages_enabled = true
 
+# OpenFileCache (File Metadata Cache)
+# Caches file metadata (canonicalize, metadata, mime_guess) to reduce system calls
+# Performance improvement: 60-67% reduction in system calls (cache hit)
+# 
+# Effects:
+#   - Caches canonicalize, metadata, mime_guess system calls
+#   - Reduces 5-6 system calls per request to 2 (cache hit)
+# 
+# Notes:
+#   - File change detection may be delayed up to 60 seconds (default)
+#   - Symbolic link changes may be delayed
+#   - Optimal for static file serving (not suitable for dynamically changing files)
+#
+# Route-specific configuration:
+#   - Each route ([path_routes] or [host_routes]) can specify `open_file_cache` section
+#   - If route configuration is not specified, this global setting is used
+#
+# Default: false (disabled)
+#open_file_cache_enabled = false
+
+# OpenFileCache validity duration (seconds, global default)
+# Duration for which cached file information is considered valid
+# Default: 60 seconds
+#open_file_cache_valid_duration_secs = 60
+
+# OpenFileCache maximum entries (global default)
+# Maximum number of file information entries to keep in cache
+# Default: 10000
+#open_file_cache_max_entries = 10000
+
 [tls]
 cert_path = "/path/to/cert.pem"
 key_path = "/path/to/key.pem"
@@ -343,6 +374,13 @@ path = "/var/www/robots.txt"
 type = "File"
 path = "/var/www/assets/"
 mode = "sendfile"
+
+# OpenFileCache configuration (route-specific, overrides global setting)
+# This enables file metadata caching for this route, reducing system calls
+[path_routes."example.com"."/static/".open_file_cache]
+enabled = true
+valid_duration_secs = 300  # 5 minutes (static files change infrequently)
+max_entries = 50000
 
 # Directory serving (without trailing slash - same behavior, no redirect)
 [path_routes."example.com"."/docs"]

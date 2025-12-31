@@ -52,5 +52,5 @@ pub use disk::DiskCache;
 pub use manager::{CacheManager, CacheStats, init_global_cache, get_global_cache};
 pub use policy::{CachePolicy, CacheControl, VaryResult};
 pub use revalidation::{try_start_revalidation, finish_revalidation, active_revalidations, collapsed_request_count};
-pub use file_cache::{get_file_cache, get_file_info, invalidate_file_cache, CachedFileInfo, OpenFileCache};
+pub use file_cache::{get_file_cache, get_file_info, get_file_info_with_config, invalidate_file_cache, CachedFileInfo, OpenFileCache, OpenFileCacheConfig, configure_global_open_file_cache};
 

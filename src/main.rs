@@ -4192,6 +4192,50 @@ struct PerformanceConfigSection {
     #[serde(default)]
     #[cfg_attr(not(feature = "ktls"), allow(dead_code))]
     per_stream_pipe_enabled: bool,
+    
+    // ====================
+    // OpenFileCache設定
+    // ====================
+    
+    /// OpenFileCache（ファイルメタデータキャッシュ）のグローバルデフォルト設定
+    /// 
+    /// 効果:
+    ///   - canonicalize、metadata、mime_guessのシステムコールをキャッシュ
+    ///   - 1リクエストあたり5〜6回のシステムコールを2回に削減（キャッシュヒット時）
+    ///   - パフォーマンス向上: 60〜67%のシステムコール削減
+    /// 
+    /// 注意事項:
+    ///   - ファイル変更の検出が最大60秒（デフォルト）遅延する可能性
+    ///   - シンボリックリンク変更の検出が遅延する可能性
+    ///   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
+    /// 
+    /// ルーティングごとの設定:
+    ///   - 各ルーティング（[path_routes]や[host_routes]）で`open_file_cache`セクションを指定可能
+    ///   - ルーティング設定がない場合は、このグローバル設定が使用される
+    /// 
+    /// デフォルト: false（無効）
+    #[serde(default)]
+    open_file_cache_enabled: bool,
+    
+    /// OpenFileCacheの有効期間（秒、グローバルデフォルト）
+    /// キャッシュされたファイル情報が有効とみなされる期間
+    /// デフォルト: 60秒
+    #[serde(default = "default_open_file_cache_valid_duration")]
+    open_file_cache_valid_duration_secs: u64,
+    
+    /// OpenFileCacheの最大エントリ数（グローバルデフォルト）
+    /// キャッシュに保持する最大ファイル情報数
+    /// デフォルト: 10000
+    #[serde(default = "default_open_file_cache_max_entries")]
+    open_file_cache_max_entries: usize,
+}
+
+fn default_open_file_cache_valid_duration() -> u64 {
+    60
+}
+
+fn default_open_file_cache_max_entries() -> usize {
+    10000
 }
 
 // ====================
@@ -4912,12 +4956,14 @@ enum BackendConfig {
     /// - index: ディレクトリアクセス時に返すファイル名（デフォルト: "index.html"）
     /// - security: ルートごとのセキュリティ設定
     /// - cache: キャッシュ設定（オプション、静的ファイルのキャッシュ用）
+    /// - open_file_cache: OpenFileCache設定（ルーティングごと、グローバル設定を上書き可能）
     File { 
         path: String, 
         mode: String, 
         index: Option<String>, 
         security: SecurityConfig,
         cache: cache::CacheConfig,
+        open_file_cache: Option<cache::OpenFileCacheConfig>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
         modules: Option<Vec<String>>,
     },
@@ -4975,6 +5021,8 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                 let mut buffering_config: Option<buffering::BufferingConfig> = None;
                 // キャッシュ設定（Proxy/File用）
                 let mut cache_config: Option<cache::CacheConfig> = None;
+                // OpenFileCache設定（File用）
+                let mut open_file_cache_config: Option<cache::OpenFileCacheConfig> = None;
                 // WASMモジュール名のリスト
                 let mut modules: Option<Vec<String>> = None;
                 
@@ -4990,6 +5038,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                         "compression" => compression = Some(map.next_value()?),
                         "buffering" => buffering_config = Some(map.next_value()?),
                         "cache" => cache_config = Some(map.next_value()?),
+                        "open_file_cache" => open_file_cache_config = Some(map.next_value()?),
                         "redirect_url" => redirect_url = Some(map.next_value()?),
                         "redirect_status" => redirect_status = Some(map.next_value()?),
                         "preserve_path" => preserve_path = Some(map.next_value()?),
@@ -5060,6 +5109,7 @@ impl<'de> serde::Deserialize<'de> for BackendConfig {
                             index, 
                             security, 
                             cache,
+                            open_file_cache: open_file_cache_config,
                             modules,
                         })
                     }
@@ -5111,12 +5161,14 @@ enum Backend {
     /// - Option<Arc<str>>: インデックスファイル名（None = "index.html"）
     /// - Arc<SecurityConfig>: ルートごとのセキュリティ設定
     /// - Arc<cache::CacheConfig>: キャッシュ設定
+    /// - Option<Arc<cache::OpenFileCacheConfig>>: OpenFileCache設定（ルーティングごと）
     SendFile(
         Arc<PathBuf>, 
         bool, 
         Option<Arc<str>>, 
         Arc<SecurityConfig>, 
         Arc<cache::CacheConfig>,
+        Option<Arc<cache::OpenFileCacheConfig>>,
         /// WASMモジュール名のリスト（このバックエンドに適用するWASMモジュール）
         #[allow(dead_code)]
         Option<Arc<Vec<String>>>,
@@ -5145,7 +5197,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, security, _, _, _, _) => security,
             Backend::MemoryFile(_, _, security, _) => security,
-            Backend::SendFile(_, _, _, security, _, _) => security,
+            Backend::SendFile(_, _, _, security, _, _, _) => security,
             Backend::Redirect(_, _, _, _) => &DEFAULT_SECURITY,
         }
     }
@@ -5157,7 +5209,7 @@ impl Backend {
         match self {
             Backend::Proxy(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
             Backend::MemoryFile(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
-            Backend::SendFile(_, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
+            Backend::SendFile(_, _, _, _, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
             Backend::Redirect(_, _, _, modules) => modules.as_deref().map(|v| v.as_slice()),
         }
     }
@@ -5178,7 +5230,7 @@ impl Backend {
     fn cache(&self) -> Option<&cache::CacheConfig> {
         match self {
             Backend::Proxy(_, _, _, _, cache, _) => Some(cache),
-            Backend::SendFile(_, _, _, _, cache, _) => Some(cache),
+            Backend::SendFile(_, _, _, _, cache, _, _) => Some(cache),
             _ => None,
         }
     }
@@ -6276,6 +6328,14 @@ fn load_config_without_tls(path: &Path) -> io::Result<LoadedConfigWithoutTls> {
         }
     }
 
+    // グローバルOpenFileCache設定を適用
+    let performance_config = &config.performance;
+    cache::configure_global_open_file_cache(
+        performance_config.open_file_cache_enabled,
+        performance_config.open_file_cache_valid_duration_secs,
+        performance_config.open_file_cache_max_entries,
+    );
+
     Ok(LoadedConfigWithoutTls {
         host_routes: Arc::new(host_routes_bytes),
         path_routes: Arc::new(path_routes_bytes),
@@ -6388,6 +6448,14 @@ fn load_config(path: &Path) -> io::Result<LoadedConfig> {
             );
         }
     }
+
+    // グローバルOpenFileCache設定を適用
+    let performance_config = &config.performance;
+    cache::configure_global_open_file_cache(
+        performance_config.open_file_cache_enabled,
+        performance_config.open_file_cache_valid_duration_secs,
+        performance_config.open_file_cache_max_entries,
+    );
 
     // スレッド数の決定: 未指定または0の場合はCPUコア数を使用
     let num_threads = match config.server.threads {
@@ -6834,13 +6902,14 @@ fn load_backend(
                 modules_arc,
             ))
         }
-        BackendConfig::File { path, mode, index, security, cache, modules } => {
+        BackendConfig::File { path, mode, index, security, cache, open_file_cache, modules } => {
             let metadata = fs::metadata(path)?;
             let is_dir = metadata.is_dir();
             // インデックスファイル名を Arc<str> に変換（None = デフォルトで "index.html"）
             let index_file: Option<Arc<str>> = index.as_ref().map(|s| Arc::from(s.as_str()));
             let security = Arc::new(security.clone());
             let cache = Arc::new(cache.clone());
+            let open_file_cache_arc = open_file_cache.as_ref().map(|c| Arc::new(c.clone()));
             
             // キャッシュ設定のログ出力
             if cache.enabled {
@@ -6861,7 +6930,7 @@ fn load_backend(
                 }
                 "sendfile" | "" => {
                     let modules_arc = modules.as_ref().map(|m| Arc::new(m.clone()));
-                    Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security, cache, modules_arc))
+                    Ok(Backend::SendFile(Arc::new(PathBuf::from(path)), is_dir, index_file, security, cache, open_file_cache_arc, modules_arc))
                 }
                 _ => Err(io::Error::new(io::ErrorKind::InvalidInput, "Invalid mode")),
             }
@@ -8956,7 +9025,7 @@ where
             }
             Some((200, data.len() as u64))
         }
-        Backend::SendFile(base_path, is_dir, index_file, security, _cache, _) => {
+        Backend::SendFile(base_path, is_dir, index_file, security, _cache, _open_file_cache_config, _) => {
             handle_http2_sendfile(conn, stream_id, &base_path, is_dir, index_file.as_deref(), path, &prefix, &security).await
         }
         Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
@@ -10738,12 +10807,12 @@ async fn handle_backend(
                 _ => None,
             }
         }
-        Backend::SendFile(base_path, is_dir, index_file, security, _cache, _) => {
+        Backend::SendFile(base_path, is_dir, index_file, security, _cache, open_file_cache_config, _) => {
             // Range ヘッダーを抽出 (RFC 7233)
             let range_header = headers.iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case(b"range"))
                 .map(|(_, v)| v.as_ref());
-            handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close, &security, range_header).await
+            handle_sendfile(tls_stream, &base_path, is_dir, index_file.as_deref(), req_path, &prefix, client_wants_close, &security, range_header, open_file_cache_config.as_deref()).await
         }
         Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             handle_redirect(tls_stream, &redirect_url, status_code, preserve_path, req_path, &prefix, client_wants_close).await
@@ -15267,6 +15336,7 @@ async fn handle_sendfile(
     client_wants_close: bool,
     security: &SecurityConfig,
     range_header: Option<&[u8]>,  // RFC 7233 Range header support
+    open_file_cache_config: Option<&cache::OpenFileCacheConfig>,  // OpenFileCache設定（ルーティングごと）
 ) -> Option<(ServerTls, u16, u64, bool)> {
     // --- パス解決ロジック（Nginx風） ---
     // 
@@ -15327,7 +15397,8 @@ async fn handle_sendfile(
 
     // OpenFileCacheを使用してファイル情報を取得（キャッシュ優先）
     // これにより、canonicalize、metadata、mime_guessのシステムコールをキャッシュ
-    let file_info = match cache::get_file_info(&full_path) {
+    // ルーティングごとの設定を考慮
+    let file_info = match cache::get_file_info_with_config(&full_path, open_file_cache_config) {
         Some(info) => info,
         None => {
             let err_buf = ERR_MSG_NOT_FOUND.to_vec();
@@ -15339,7 +15410,7 @@ async fn handle_sendfile(
     // ディレクトリの場合はセキュリティチェック
     if is_dir {
         // ベースパスのキャッシュ情報も取得（頻繁にアクセスされるため）
-        if let Some(base_info) = cache::get_file_info(base_path) {
+        if let Some(base_info) = cache::get_file_info_with_config(base_path, open_file_cache_config) {
             if !file_info.canonical_path.starts_with(&base_info.canonical_path) {
                 let err_buf = ERR_MSG_FORBIDDEN.to_vec();
                 let _ = timeout(WRITE_TIMEOUT, tls_stream.write_all(err_buf)).await;
@@ -15354,7 +15425,7 @@ async fn handle_sendfile(
         let index_path = file_info.canonical_path.join(filename);
         
         // インデックスファイルの情報をキャッシュから取得
-        match cache::get_file_info(&index_path) {
+        match cache::get_file_info_with_config(&index_path, open_file_cache_config) {
             Some(idx_info) if idx_info.is_file => {
                 (idx_info.canonical_path.clone(), idx_info.file_size, idx_info.mime_type.clone())
             }

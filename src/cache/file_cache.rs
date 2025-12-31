@@ -15,11 +15,42 @@
 use dashmap::DashMap;
 use once_cell::sync::Lazy;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime};
 
 /// ファイル情報キャッシュのグローバルインスタンス
 static OPEN_FILE_CACHE: Lazy<OpenFileCache> = Lazy::new(OpenFileCache::new);
+
+/// OpenFileCacheの設定（ルーティングごと）
+#[derive(Clone, Debug, serde::Deserialize)]
+pub struct OpenFileCacheConfig {
+    /// 有効化フラグ（Noneの場合はグローバル設定を使用）
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// 有効期間（Noneの場合はグローバル設定を使用）
+    #[serde(default, rename = "valid_duration_secs")]
+    pub valid_duration_secs: Option<u64>,
+    /// 最大エントリ数（Noneの場合はグローバル設定を使用）
+    #[serde(default, rename = "max_entries")]
+    pub max_entries: Option<usize>,
+}
+
+/// OpenFileCacheのグローバル設定（デフォルト値）
+static OPEN_FILE_CACHE_GLOBAL_ENABLED: AtomicBool = AtomicBool::new(false);
+static OPEN_FILE_CACHE_GLOBAL_VALID_DURATION: Lazy<Mutex<Duration>> = Lazy::new(|| Mutex::new(Duration::from_secs(60)));
+static OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES: Lazy<Mutex<usize>> = Lazy::new(|| Mutex::new(10000));
+
+/// グローバルOpenFileCache設定を適用
+pub fn configure_global_open_file_cache(enabled: bool, valid_duration_secs: u64, max_entries: usize) {
+    OPEN_FILE_CACHE_GLOBAL_ENABLED.store(enabled, Ordering::Relaxed);
+    *OPEN_FILE_CACHE_GLOBAL_VALID_DURATION.lock().unwrap() = Duration::from_secs(valid_duration_secs);
+    *OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES.lock().unwrap() = max_entries;
+    
+    // キャッシュの設定も更新
+    *OPEN_FILE_CACHE.valid_duration.lock().unwrap() = Duration::from_secs(valid_duration_secs);
+    *OPEN_FILE_CACHE.max_entries.lock().unwrap() = max_entries;
+}
 
 /// キャッシュされたファイル情報
 #[derive(Clone, Debug)]
@@ -104,14 +135,14 @@ fn unix_timestamp_to_date(timestamp: i64) -> (i32, u32, u32, u32, u32, u32) {
 pub struct OpenFileCache {
     /// キャッシュエントリ（パス → ファイル情報）
     entries: DashMap<PathBuf, CachedFileInfo>,
-    /// キャッシュエントリの有効期間
-    valid_duration: Duration,
+    /// キャッシュエントリの有効期間（Mutexで保護）
+    valid_duration: Mutex<Duration>,
     /// キャッシュヒット数
     hits: AtomicU64,
     /// キャッシュミス数
     misses: AtomicU64,
-    /// 最大エントリ数
-    max_entries: usize,
+    /// 最大エントリ数（Mutexで保護）
+    max_entries: Mutex<usize>,
 }
 
 impl OpenFileCache {
@@ -119,10 +150,10 @@ impl OpenFileCache {
     fn new() -> Self {
         Self {
             entries: DashMap::with_capacity(1024),
-            valid_duration: Duration::from_secs(60), // デフォルト60秒
+            valid_duration: Mutex::new(Duration::from_secs(60)), // デフォルト60秒
             hits: AtomicU64::new(0),
             misses: AtomicU64::new(0),
-            max_entries: 10000,
+            max_entries: Mutex::new(10000),
         }
     }
     
@@ -136,9 +167,12 @@ impl OpenFileCache {
     /// - `Some(CachedFileInfo)`: ファイルが存在し情報を取得できた場合
     /// - `None`: ファイルが存在しないか、エラーが発生した場合
     pub fn get_or_fetch(&self, path: &Path) -> Option<CachedFileInfo> {
+        let valid_duration = *self.valid_duration.lock().unwrap();
+        let max_entries = *self.max_entries.lock().unwrap();
+        
         // まずキャッシュから検索
         if let Some(entry) = self.entries.get(path) {
-            if entry.is_valid(self.valid_duration) {
+            if entry.is_valid(valid_duration) {
                 self.hits.fetch_add(1, Ordering::Relaxed);
                 return Some(entry.clone());
             }
@@ -150,7 +184,7 @@ impl OpenFileCache {
         let info = self.fetch_file_info(path)?;
         
         // キャッシュが大きすぎる場合は古いエントリを削除
-        if self.entries.len() >= self.max_entries {
+        if self.entries.len() >= max_entries {
             self.evict_oldest();
         }
         
@@ -159,7 +193,7 @@ impl OpenFileCache {
     }
     
     /// ファイル情報を直接フェッチ（キャッシュをバイパス）
-    fn fetch_file_info(&self, path: &Path) -> Option<CachedFileInfo> {
+    pub(crate) fn fetch_file_info(&self, path: &Path) -> Option<CachedFileInfo> {
         // パスを正規化
         let canonical = path.canonicalize().ok()?;
         
@@ -183,7 +217,8 @@ impl OpenFileCache {
     
     /// 古いエントリを削除（10%を削除）
     fn evict_oldest(&self) {
-        let to_remove = self.max_entries / 10;
+        let max_entries = *self.max_entries.lock().unwrap();
+        let to_remove = max_entries / 10;
         let mut removed = 0;
         
         // 最も古いエントリから削除
@@ -253,6 +288,37 @@ impl OpenFileCache {
         self.hits.store(0, Ordering::Relaxed);
         self.misses.store(0, Ordering::Relaxed);
     }
+    
+    /// 設定を考慮してファイル情報を取得
+    pub fn get_or_fetch_with_config(
+        &self,
+        path: &Path,
+        valid_duration: Duration,
+        max_entries: usize,
+    ) -> Option<CachedFileInfo> {
+        // まずキャッシュから検索
+        if let Some(entry) = self.entries.get(path) {
+            // ルーティングごとの有効期間で判定
+            if entry.is_valid(valid_duration) {
+                self.hits.fetch_add(1, Ordering::Relaxed);
+                return Some(entry.clone());
+            }
+        }
+        
+        // キャッシュミス: ファイルシステムから取得
+        self.misses.fetch_add(1, Ordering::Relaxed);
+        
+        let info = self.fetch_file_info(path)?;
+        
+        // ルーティングごとの最大エントリ数で判定
+        let current_max_entries = *self.max_entries.lock().unwrap();
+        if self.entries.len() >= max_entries.min(current_max_entries) {
+            self.evict_oldest();
+        }
+        
+        self.entries.insert(path.to_path_buf(), info.clone());
+        Some(info)
+    }
 }
 
 /// グローバルファイル情報キャッシュを取得
@@ -265,6 +331,35 @@ pub fn get_file_cache() -> &'static OpenFileCache {
 #[inline]
 pub fn get_file_info(path: &Path) -> Option<CachedFileInfo> {
     OPEN_FILE_CACHE.get_or_fetch(path)
+}
+
+/// ルーティングごとの設定を考慮してファイル情報を取得
+pub fn get_file_info_with_config(
+    path: &Path, 
+    config: Option<&OpenFileCacheConfig>
+) -> Option<CachedFileInfo> {
+    // ルーティング設定がある場合はそれを使用、ない場合はグローバル設定を使用
+    let enabled = config
+        .and_then(|c| c.enabled)
+        .unwrap_or_else(|| OPEN_FILE_CACHE_GLOBAL_ENABLED.load(Ordering::Relaxed));
+    
+    if !enabled {
+        // キャッシュ無効時は直接フェッチ（キャッシュしない）
+        return OPEN_FILE_CACHE.fetch_file_info(path);
+    }
+    
+    // 有効期間と最大エントリ数も同様に処理
+    let valid_duration = config
+        .and_then(|c| c.valid_duration_secs)
+        .map(Duration::from_secs)
+        .unwrap_or_else(|| *OPEN_FILE_CACHE_GLOBAL_VALID_DURATION.lock().unwrap());
+    
+    let max_entries = config
+        .and_then(|c| c.max_entries)
+        .unwrap_or_else(|| *OPEN_FILE_CACHE_GLOBAL_MAX_ENTRIES.lock().unwrap());
+    
+    // キャッシュから取得（有効期間と最大エントリ数を考慮）
+    OPEN_FILE_CACHE.get_or_fetch_with_config(path, valid_duration, max_entries)
 }
 
 /// 指定パスのキャッシュを無効化

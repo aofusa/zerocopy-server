@@ -445,6 +445,36 @@ huge_pages_enabled = true
 #
 # per_stream_pipe_enabled = false
 
+# ------------------------------------------
+# OpenFileCache設定（ファイルメタデータキャッシュ）
+# ------------------------------------------
+# 効果:
+#   - canonicalize、metadata、mime_guessのシステムコールをキャッシュ
+#   - 1リクエストあたり5〜6回のシステムコールを2回に削減（キャッシュヒット時）
+#   - パフォーマンス向上: 60〜67%のシステムコール削減
+# 
+# 注意事項:
+#   - ファイル変更の検出が最大60秒（デフォルト）遅延する可能性
+#   - シンボリックリンク変更の検出が遅延する可能性
+#   - 静的ファイル配信に最適（動的に変更されるファイルには不向き）
+#
+# ルーティングごとの設定:
+#   - 各ルーティング（[path_routes]や[host_routes]）で`open_file_cache`セクションを指定可能
+#   - ルーティング設定がない場合は、このグローバル設定が使用される
+#
+# デフォルト: false（無効）
+#open_file_cache_enabled = false
+
+# OpenFileCacheの有効期間（秒、グローバルデフォルト）
+# キャッシュされたファイル情報が有効とみなされる期間
+# デフォルト: 60秒
+#open_file_cache_valid_duration_secs = 60
+
+# OpenFileCacheの最大エントリ数（グローバルデフォルト）
+# キャッシュに保持する最大ファイル情報数
+# デフォルト: 10000
+#open_file_cache_max_entries = 10000
+
 
 # ==========================================
 # TLS設定
@@ -987,6 +1017,14 @@ path = "/var/www/robots.txt"
 type = "File"
 path = "/var/www/assets/"
 mode = "sendfile"
+
+# OpenFileCache設定（ルーティングごと、グローバル設定を上書き）
+# この設定により、ファイルメタデータ（canonicalize、metadata、mime_guess）がキャッシュされ、
+# システムコールが60〜67%削減されます（キャッシュヒット時）
+[path_routes."example.com"."/static/".open_file_cache]
+enabled = true
+valid_duration_secs = 300  # 5分（静的ファイルは変更頻度が低い）
+max_entries = 50000
 
 # カスタムインデックス (profile.html)
 [path_routes."example.com"."/user/"]
