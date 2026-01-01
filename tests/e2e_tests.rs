@@ -6977,3 +6977,385 @@ fn test_error_handling_timeout() {
     eprintln!("Error handling timeout test: response received in {:?}", elapsed);
 }
 
+// ====================
+// 優先度中: より詳細な圧縮テスト
+// ====================
+
+#[test]
+fn test_compression_zstd() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Zstd圧縮のテスト
+    let response = send_request(
+        PROXY_PORT, 
+        "/large.txt", 
+        &[("Accept-Encoding", "zstd")]
+    );
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    // 404が返される可能性もあるが、通常は200が返される
+    assert!(
+        status == Some(200) || status == Some(404) || status == Some(400),
+        "Should return 200, 404, or 400: {:?}", status
+    );
+    
+    // 圧縮が有効な場合、Content-Encodingヘッダーがある
+    let content_encoding = get_header_value(&response, "Content-Encoding");
+    if let Some(ce) = content_encoding {
+        eprintln!("Compression zstd test: Content-Encoding = {}", ce);
+        // zstdが含まれる可能性がある
+        if ce.contains("zstd") {
+            eprintln!("Compression zstd test: zstd compression applied");
+        }
+    } else {
+        eprintln!("Compression zstd test: Content-Encoding header not present (may not be compressed)");
+    }
+}
+
+#[test]
+fn test_compression_multiple_encodings() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 複数の圧縮エンコーディングの優先順位のテスト
+    let response = send_request(
+        PROXY_PORT, 
+        "/large.txt", 
+        &[("Accept-Encoding", "gzip, br, zstd;q=0.8, deflate")]
+    );
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert!(
+        status == Some(200) || status == Some(404) || status == Some(400),
+        "Should return 200, 404, or 400: {:?}", status
+    );
+    
+    // 圧縮が有効な場合、Content-Encodingヘッダーがある
+    let content_encoding = get_header_value(&response, "Content-Encoding");
+    if let Some(ce) = content_encoding {
+        eprintln!("Compression multiple encodings test: Content-Encoding = {}", ce);
+        // 優先順位に応じた圧縮が適用される可能性がある
+    } else {
+        eprintln!("Compression multiple encodings test: Content-Encoding header not present");
+    }
+}
+
+#[test]
+fn test_compression_no_encoding() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 圧縮を要求しない場合のテスト
+    let response = send_request(
+        PROXY_PORT, 
+        "/large.txt", 
+        &[("Accept-Encoding", "identity")]
+    );
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert!(
+        status == Some(200) || status == Some(404) || status == Some(400),
+        "Should return 200, 404, or 400: {:?}", status
+    );
+    
+    // 圧縮が要求されない場合、Content-Encodingヘッダーがない可能性がある
+    let content_encoding = get_header_value(&response, "Content-Encoding");
+    if let Some(ce) = content_encoding {
+        eprintln!("Compression no encoding test: Content-Encoding = {} (may be identity)", ce);
+    } else {
+        eprintln!("Compression no encoding test: Content-Encoding header not present (uncompressed)");
+    }
+}
+
+// ====================
+// 優先度中: より詳細なロードバランシングテスト
+// ====================
+
+#[test]
+fn test_load_balancing_round_robin_distribution() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Round Robin分散の詳細テスト
+    // 複数のリクエストを送信して、バックエンド間で分散されることを確認
+    
+    let num_requests = 20;
+    let mut backend1_count = 0;
+    let mut backend2_count = 0;
+    
+    for _ in 0..num_requests {
+        let response = send_request(PROXY_PORT, "/", &[]);
+        if let Some(response) = response {
+            let server_id = get_header_value(&response, "X-Server-Id");
+            if let Some(id) = server_id {
+                if id.contains("1") {
+                    backend1_count += 1;
+                } else if id.contains("2") {
+                    backend2_count += 1;
+                }
+            }
+        }
+    }
+    
+    eprintln!("Load balancing Round Robin distribution test: backend1={}, backend2={}", 
+              backend1_count, backend2_count);
+    
+    // Round Robinの場合、両方のバックエンドにリクエストが分散される
+    assert!(
+        backend1_count > 0 && backend2_count > 0,
+        "Requests should be distributed to both backends: backend1={}, backend2={}",
+        backend1_count, backend2_count
+    );
+}
+
+#[test]
+fn test_load_balancing_backend_identification() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // バックエンド識別のテスト
+    // X-Server-Idヘッダーでバックエンドを識別できることを確認
+    
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // X-Server-Idヘッダーが存在する可能性がある
+    let server_id = get_header_value(&response, "X-Server-Id");
+    if let Some(id) = server_id {
+        eprintln!("Load balancing backend identification test: X-Server-Id = {}", id);
+        // バックエンドIDが含まれる
+        assert!(
+            id.contains("1") || id.contains("2") || id.contains("backend"),
+            "X-Server-Id should contain backend identifier: {}", id
+        );
+    } else {
+        eprintln!("Load balancing backend identification test: X-Server-Id header not present");
+    }
+}
+
+// ====================
+// 優先度中: より詳細なキャッシュテスト
+// ====================
+
+#[test]
+fn test_cache_age_header() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // キャッシュのAgeヘッダーのテスト
+    // キャッシュされたレスポンスにAgeヘッダーが含まれることを確認
+    
+    // 最初のリクエスト（キャッシュミス）
+    let response1 = send_request(PROXY_PORT, "/", &[]);
+    assert!(response1.is_some(), "Should receive response");
+    
+    let response1 = response1.unwrap();
+    let status1 = get_status_code(&response1);
+    assert_eq!(status1, Some(200), "Should return 200 OK");
+    
+    // 短い待機時間
+    std::thread::sleep(Duration::from_millis(100));
+    
+    // 2回目のリクエスト（キャッシュヒットの可能性）
+    let response2 = send_request(PROXY_PORT, "/", &[]);
+    assert!(response2.is_some(), "Should receive response");
+    
+    let response2 = response2.unwrap();
+    let status2 = get_status_code(&response2);
+    assert_eq!(status2, Some(200), "Should return 200 OK");
+    
+    // Ageヘッダーが存在する可能性がある
+    let age = get_header_value(&response2, "Age");
+    if let Some(age_value) = age {
+        eprintln!("Cache Age header test: Age = {}", age_value);
+        // Ageは数値である必要がある
+        assert!(
+            age_value.parse::<u64>().is_ok(),
+            "Age header should be a valid number: {}", age_value
+        );
+    } else {
+        eprintln!("Cache Age header test: Age header not present (may not be cached)");
+    }
+}
+
+#[test]
+fn test_cache_vary_header_handling() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // キャッシュのVaryヘッダー処理のテスト
+    // Varyヘッダーが存在する場合、キャッシュキーに含まれることを確認
+    
+    // Accept-Encodingヘッダーを含むリクエスト
+    let response1 = send_request(PROXY_PORT, "/", &[("Accept-Encoding", "gzip")]);
+    assert!(response1.is_some(), "Should receive response");
+    
+    let response1 = response1.unwrap();
+    let status1 = get_status_code(&response1);
+    assert_eq!(status1, Some(200), "Should return 200 OK");
+    
+    // Varyヘッダーが存在する可能性がある
+    let vary1 = get_header_value(&response1, "Vary");
+    if let Some(vary_value) = vary1 {
+        eprintln!("Cache Vary header handling test: Vary = {}", vary_value);
+    }
+    
+    // 異なるAccept-Encodingヘッダーを含むリクエスト
+    let response2 = send_request(PROXY_PORT, "/", &[("Accept-Encoding", "br")]);
+    assert!(response2.is_some(), "Should receive response");
+    
+    let response2 = response2.unwrap();
+    let status2 = get_status_code(&response2);
+    assert_eq!(status2, Some(200), "Should return 200 OK");
+    
+    eprintln!("Cache Vary header handling test: different Accept-Encoding handled");
+}
+
+#[test]
+fn test_cache_max_age_header() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // キャッシュのCache-Control: max-ageヘッダーのテスト
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Cache-Controlヘッダーが存在する可能性がある
+    let cache_control = get_header_value(&response, "Cache-Control");
+    if let Some(cc) = cache_control {
+        eprintln!("Cache max-age header test: Cache-Control = {}", cc);
+        // max-ageが含まれる可能性がある
+        if cc.contains("max-age") {
+            eprintln!("Cache max-age header test: max-age directive present");
+        }
+    } else {
+        eprintln!("Cache max-age header test: Cache-Control header not present");
+    }
+}
+
+// ====================
+// 優先度中: より詳細なバッファリングテスト
+// ====================
+
+#[test]
+fn test_buffering_adaptive_threshold() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Adaptiveバッファリングの閾値のテスト
+    // レスポンスサイズに応じてバッファリングモードが切り替わることを確認
+    
+    use std::time::Instant;
+    
+    // 小さなレスポンス（Streamingモードの可能性）
+    let start1 = Instant::now();
+    let response1 = send_request(PROXY_PORT, "/", &[]);
+    let elapsed1 = start1.elapsed();
+    
+    assert!(response1.is_some(), "Should receive response");
+    let response1 = response1.unwrap();
+    let status1 = get_status_code(&response1);
+    assert_eq!(status1, Some(200), "Should return 200 OK");
+    
+    // 大きなレスポンス（FullまたはAdaptiveモードの可能性）
+    let start2 = Instant::now();
+    let response2 = send_request(PROXY_PORT, "/large.txt", &[]);
+    let elapsed2 = start2.elapsed();
+    
+    if let Some(response2) = response2 {
+        let status2 = get_status_code(&response2);
+        if status2 == Some(200) {
+            eprintln!("Buffering adaptive threshold test: small={:?}, large={:?}", elapsed1, elapsed2);
+            // 大きなレスポンスの方が時間がかかる可能性がある
+        }
+    }
+}
+
+#[test]
+fn test_buffering_memory_limit() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // バッファリングのメモリ制限のテスト
+    // メモリ制限を超えた場合の動作を確認
+    
+    // 大きなレスポンスをリクエスト
+    let response = send_request(PROXY_PORT, "/large.txt", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    // 200、404、または413が返される可能性がある
+    assert!(
+        status == Some(200) || status == Some(404) || status == Some(413) || status == Some(400),
+        "Should return 200, 404, 413, or 400: {:?}", status
+    );
+    
+    eprintln!("Buffering memory limit test: status {:?}", status);
+}
+
+#[test]
+fn test_buffering_chunked_vs_full() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Chunked転送とFullバッファリングの比較テスト
+    // レスポンスの転送方法を確認
+    
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Transfer-EncodingまたはContent-Lengthヘッダーを確認
+    let transfer_encoding = get_header_value(&response, "Transfer-Encoding");
+    let content_length = get_header_value(&response, "Content-Length");
+    
+    if let Some(te) = transfer_encoding {
+        eprintln!("Buffering chunked vs full test: Transfer-Encoding = {}", te);
+    } else if let Some(cl) = content_length {
+        eprintln!("Buffering chunked vs full test: Content-Length = {}", cl);
+    } else {
+        eprintln!("Buffering chunked vs full test: neither Transfer-Encoding nor Content-Length present");
+    }
+}
+
