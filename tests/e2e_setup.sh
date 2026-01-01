@@ -253,16 +253,16 @@ servers = [
 tls_insecure = true
 EOF
 
-    # ヘルスチェック設定を追加
+    # ヘルスチェック設定を追加（healthcheckタイプの時のみ有効化）
     if [ "$config_type" = "healthcheck" ]; then
         cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 
 [upstreams."backend-pool".health_check]
 enabled = true
 path = "/health"
-interval_secs = 5
+interval_secs = 1
 timeout_secs = 2
-healthy_threshold = 2
+healthy_threshold = 1
 unhealthy_threshold = 3
 EOF
     fi
@@ -286,8 +286,8 @@ preferred_encodings = ["zstd", "br", "gzip"]
 min_size = 1024
 EOF
 
-    # キャッシュ設定を追加
-    if [ "$config_type" = "cache" ]; then
+    # キャッシュ設定を追加（デフォルトでも有効化、cacheタイプの場合は詳細設定）
+    if [ "$config_type" = "cache" ] || [ "$config_type" = "default" ]; then
         cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 [route.cache]
 enabled = true
@@ -295,16 +295,59 @@ max_memory_size = 10485760
 default_ttl_secs = 60
 methods = ["GET", "HEAD"]
 cacheable_statuses = [200, 301, 302, 304]
+stale_while_revalidate = true
+stale_if_error = true
+respect_vary = true
+enable_etag = true
 EOF
     fi
     
-    # バッファリング設定を追加
-    if [ "$config_type" = "buffering" ]; then
+    # バッファリング設定を追加（デフォルトでも有効化、bufferingタイプの場合は詳細設定）
+    if [ "$config_type" = "buffering" ] || [ "$config_type" = "default" ]; then
         cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
 [route.buffering]
 mode = "adaptive"
 max_memory_buffer = 10485760
 adaptive_threshold = 1048576
+EOF
+    fi
+    
+    # バッファリングモード別のルート設定（streaming, full, adaptive）
+    if [ "$config_type" = "buffering" ] || [ "$config_type" = "default" ]; then
+        cat >> "${FIXTURES_DIR}/proxy.toml" << EOF
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/streaming/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.buffering]
+mode = "streaming"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/full/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.buffering]
+mode = "full"
+
+[[route]]
+[route.conditions]
+host = "localhost"
+path = "/cached/*"
+[route.action]
+type = "Proxy"
+upstream = "backend-pool"
+[route.cache]
+enabled = true
+default_ttl_secs = 1
+methods = ["GET"]
+cacheable_statuses = [200]
 EOF
     fi
     
