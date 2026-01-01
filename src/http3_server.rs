@@ -399,6 +399,18 @@ impl Http3Handler {
             stream_id
         );
 
+        // gRPC リクエスト検出フラグ
+        #[cfg(feature = "grpc")]
+        let is_grpc = Self::is_grpc_request(headers);
+        #[cfg(not(feature = "grpc"))]
+        let is_grpc = false;
+
+        #[cfg(feature = "grpc")]
+        if is_grpc {
+            debug!("[HTTP/3] gRPC request detected: {}", String::from_utf8_lossy(&path));
+        }
+
+
         // メトリクスエンドポイント（設定可能なパス）
         {
             let config = CURRENT_CONFIG.load();
@@ -510,6 +522,17 @@ impl Http3Handler {
                     String::from_utf8_lossy(&authority),
                     String::from_utf8_lossy(&path)
                 );
+                
+                // gRPC リクエストの場合は gRPC エラーレスポンスを返す
+                #[cfg(feature = "grpc")]
+                if is_grpc {
+                    // UNIMPLEMENTED (12) - サービス/メソッドが見つからない
+                    self.send_grpc_response(stream_id, &[], None, 12, Some("Service not found"))?;
+                    let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
+                    log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 200, 0, start_time);
+                    return Ok(());
+                }
+                
                 self.send_error_response(stream_id, 404, b"Not Found")?;
                 let user_agent_slice: &[u8] = if user_agent.is_empty() { &[] } else { &user_agent };
                 log_access(&method, &authority, &path, user_agent_slice, request_body.len() as u64, 404, 9, start_time);
@@ -754,10 +777,8 @@ impl Http3Handler {
 
     /// gRPC リクエストかどうかを判定
     ///
-    /// 将来のgRPCリクエスト処理用に準備されたAPI。
-    /// handle_request内でgRPCリクエストを検出し、専用処理に分岐する際に使用予定。
+    /// Content-Type ヘッダーが `application/grpc` で始まる場合にgRPCリクエストと判定。
     #[cfg(feature = "grpc")]
-    #[allow(dead_code)]
     fn is_grpc_request(headers: &[h3::Header]) -> bool {
         for header in headers {
             if header.name().eq_ignore_ascii_case(b"content-type") {
@@ -771,10 +792,7 @@ impl Http3Handler {
     ///
     /// HTTP/3 では QPACK を使用してトレイラーを送信します。
     /// ボディ送信後に grpc-status と grpc-message をトレイラーとして送信。
-    ///
-    /// 将来のgRPCレスポンス処理用に準備されたAPI。
     #[cfg(feature = "grpc")]
-    #[allow(dead_code)]
     fn send_grpc_response(
         &mut self,
         stream_id: u64,
@@ -800,14 +818,18 @@ impl Http3Handler {
             }
         }
 
+        // ボディがあるかどうかを判定
+        let has_body = body.is_some() && body.map_or(false, |b| !b.is_empty());
+        
+        // ボディがない場合はヘッダーのみ送信してトレイラーへ
         if let Err(e) = h3_conn.send_response(&mut self.conn, stream_id, &h3_headers, false) {
             warn!("[HTTP/3] gRPC send_response error: {}", e);
             return Ok(());
         }
 
-        // 2. ボディ送信
-        if let Some(body_data) = body {
-            if !body_data.is_empty() {
+        // 2. ボディ送信 (ボディがある場合のみ)
+        if has_body {
+            if let Some(body_data) = body {
                 if let Err(e) = h3_conn.send_body(&mut self.conn, stream_id, body_data, false) {
                     warn!("[HTTP/3] gRPC send_body error: {}", e);
                 }
@@ -820,9 +842,8 @@ impl Http3Handler {
 
     /// gRPC トレイラーを送信（内部ヘルパー）
     ///
-    /// 将来のgRPCレスポンス処理用に準備されたAPI。
+    /// grpc-status と grpc-message をトレイラーとして送信し、ストリームを終了。
     #[cfg(feature = "grpc")]
-    #[allow(dead_code)]
     fn send_grpc_trailers_internal(
         &mut self,
         stream_id: u64,
