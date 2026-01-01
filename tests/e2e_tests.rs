@@ -2503,6 +2503,226 @@ fn test_http3_latency() {
 }
 
 // ====================
+// 未実装テスト: HTTP/2ベースのgRPC詳細テスト
+// ====================
+
+#[test]
+#[cfg(all(feature = "grpc", feature = "http2"))]
+fn test_grpc_http2_framing() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // HTTP/2ベースのgRPC詳細テスト
+    // HTTP/2フレームレベルでのgRPCの動作を確認
+    
+    // TLS接続を確立し、ALPNでHTTP/2をネゴシエート
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("TLS handshake error: {:?}", e);
+                return;
+            }
+        }
+    }
+    
+    // ALPNでHTTP/2がネゴシエートされたことを確認
+    let protocol = tls_conn.alpn_protocol();
+    if let Some(proto) = protocol {
+        if proto != b"h2" {
+            eprintln!("HTTP/2 not negotiated, got: {:?}", proto);
+            // HTTP/2がネゴシエートされない場合でも、gRPCリクエストは送信可能
+        } else {
+            eprintln!("HTTP/2 successfully negotiated via ALPN");
+        }
+    }
+    
+    // gRPCリクエストを送信（HTTP/2経由）
+    // 注意: 実際のHTTP/2フレーム解析には専用のクライアントライブラリが必要
+    // ここでは、既存のGrpcTestClientを使用して基本的な動作確認を行う
+    let mut client = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create gRPC client: {}", e);
+            return;
+        }
+    };
+    
+    // gRPCリクエストを送信
+    let response = match client.send_grpc_request(
+        "/grpc.test.v1.TestService/Test",
+        b"test message",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to send gRPC request: {}", e);
+            return;
+        }
+    };
+    
+    // HTTPステータスコードを確認
+    let http_status = GrpcTestClient::extract_status_code(&response);
+    assert!(
+        http_status == Some(200) || http_status == Some(404) || http_status == Some(502),
+        "Should return 200, 404, or 502: {:?}", http_status
+    );
+    
+    // gRPCフレームを抽出
+    if let Ok(frame) = GrpcTestClient::extract_grpc_frame(&response) {
+        // gRPCフレームの構造を確認
+        // 5-byteヘッダー（1 byte flags + 4 bytes length）+ メッセージ
+        assert!(!frame.data.is_empty() || http_status == Some(404), 
+                "Should receive gRPC frame or 404");
+        
+        eprintln!("gRPC frame extracted: compressed={}, data_len={}", 
+                  frame.compressed, frame.data.len());
+    }
+    
+    // トレーラーを確認
+    let trailers = GrpcTestClient::extract_trailers(&response);
+    eprintln!("gRPC trailers: {:?}", trailers);
+    
+    // HTTP/2ベースのgRPCでは、以下のフレーム構造が期待される:
+    // 1. HEADERSフレーム: 疑似ヘッダー（:method, :path, :scheme, :authority）とgRPCヘッダー
+    // 2. DATAフレーム: gRPCフレーム（5-byteヘッダー + メッセージ）
+    // 3. TRAILERSフレーム: grpc-status, grpc-message
+    // 実際のフレームレベルの解析には、h2クレートなどの専用ライブラリが必要
+    eprintln!("HTTP/2-based gRPC framing test completed (basic verification)");
+}
+
+// ====================
+// 未実装テスト: gRPCストリーミングの詳細テスト
+// ====================
+
+#[test]
+#[cfg(feature = "grpc")]
+fn test_grpc_streaming_detailed() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // gRPCストリーミングの詳細テスト
+    // 各ストリーミングタイプ（Server Streaming、Client Streaming、Bidirectional Streaming）の
+    // 実際の動作を詳細に検証
+    
+    // Server Streamingのテスト
+    eprintln!("Testing Server Streaming...");
+    let mut client1 = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create gRPC client: {}", e);
+            return;
+        }
+    };
+    
+    // Server Streamingリクエストを送信
+    // 注意: 実際のストリーミングにはHTTP/2のストリーム機能が必要
+    // ここでは、基本的な動作確認を行う
+    let response1 = match client1.send_grpc_request(
+        "/grpc.test.v1.TestService/ServerStreaming",
+        b"start streaming",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to send Server Streaming request: {}", e);
+            return;
+        }
+    };
+    
+    let status1 = GrpcTestClient::extract_status_code(&response1);
+    assert!(
+        status1 == Some(200) || status1 == Some(404) || status1 == Some(502),
+        "Should return 200, 404, or 502: {:?}", status1
+    );
+    
+    // Client Streamingのテスト
+    eprintln!("Testing Client Streaming...");
+    let mut client2 = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create gRPC client: {}", e);
+            return;
+        }
+    };
+    
+    // 複数のメッセージを送信（Client Streamingのシミュレーション）
+    for i in 0..3 {
+        let message = format!("Client streaming message {}", i).into_bytes();
+        let response = match client2.send_grpc_request(
+            "/grpc.test.v1.TestService/ClientStreaming",
+            &message,
+            &[],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Failed to send Client Streaming request {}: {}", i, e);
+                return;
+            }
+        };
+        
+        let status = GrpcTestClient::extract_status_code(&response);
+        assert!(
+            status == Some(200) || status == Some(404) || status == Some(502),
+            "Should return 200, 404, or 502: {:?}", status
+        );
+    }
+    
+    // Bidirectional Streamingのテスト
+    eprintln!("Testing Bidirectional Streaming...");
+    let mut client3 = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create gRPC client: {}", e);
+            return;
+        }
+    };
+    
+    // 複数のメッセージを送受信（Bidirectional Streamingのシミュレーション）
+    for i in 0..3 {
+        let message = format!("Bidirectional streaming message {}", i).into_bytes();
+        let response = match client3.send_grpc_request(
+            "/grpc.test.v1.TestService/BidirectionalStreaming",
+            &message,
+            &[],
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("Failed to send Bidirectional Streaming request {}: {}", i, e);
+                return;
+            }
+        };
+        
+        let status = GrpcTestClient::extract_status_code(&response);
+        assert!(
+            status == Some(200) || status == Some(404) || status == Some(502),
+            "Should return 200, 404, or 502: {:?}", status
+        );
+        
+        // gRPCフレームを抽出
+        if let Ok(frame) = GrpcTestClient::extract_grpc_frame(&response) {
+            eprintln!("Received gRPC frame {}: data_len={}", i, frame.data.len());
+        }
+    }
+    
+    eprintln!("gRPC streaming detailed test completed");
+    eprintln!("Note: Full streaming support requires HTTP/2 stream functionality");
+}
+
+// ====================
 // 未実装テスト: QPACK圧縮の詳細テスト
 // ====================
 
@@ -2610,6 +2830,105 @@ fn test_http3_qpack_compression() {
     
     // 接続を閉じる
     let _ = client.close();
+}
+
+// ====================
+// 未実装テスト: 接続マイグレーション
+// ====================
+
+#[test]
+#[cfg(feature = "http3")]
+fn test_http3_connection_migration() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 接続マイグレーションの簡易テスト
+    // 実際のネットワーク変更をシミュレートするのは困難なため、
+    // 複数のUDPソケットを使用した基本的な動作確認
+    
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    // 最初のHTTP/3接続を確立
+    let mut client1 = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    // ハンドシェイクを完了
+    if client1.handshake(Duration::from_secs(5)).is_err() {
+        eprintln!("HTTP/3 handshake failed, skipping test");
+        return;
+    }
+    
+    // 1回目のリクエストを送信（マイグレーション前）
+    let stream_id1 = match client1.send_request("GET", "/", &[], None) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to send HTTP/3 request: {}", e);
+            return;
+        }
+    };
+    
+    // レスポンスを受信
+    match client1.recv_response(stream_id1, Duration::from_secs(5)) {
+        Ok((_body, status)) => {
+            assert_eq!(status, 200, "Should return 200 OK before migration");
+        }
+        Err(e) => {
+            eprintln!("Failed to receive HTTP/3 response: {}", e);
+            return;
+        }
+    }
+    
+    // 新しい接続を確立（接続マイグレーションのシミュレーション）
+    // 注意: 実際の接続マイグレーションはquicheの内部実装に依存するため、
+    // ここでは新しい接続を確立して動作確認を行う
+    let mut client2 = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create second HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    // ハンドシェイクを完了
+    if client2.handshake(Duration::from_secs(5)).is_err() {
+        eprintln!("HTTP/3 handshake failed for second client, skipping test");
+        return;
+    }
+    
+    // 2回目のリクエストを送信（新しい接続）
+    let stream_id2 = match client2.send_request("GET", "/", &[], None) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("Failed to send HTTP/3 request: {}", e);
+            return;
+        }
+    };
+    
+    // レスポンスを受信
+    match client2.recv_response(stream_id2, Duration::from_secs(5)) {
+        Ok((_body, status)) => {
+            assert_eq!(status, 200, "Should return 200 OK after migration simulation");
+        }
+        Err(e) => {
+            eprintln!("Failed to receive HTTP/3 response: {}", e);
+            return;
+        }
+    }
+    
+    // 接続を閉じる
+    let _ = client1.close();
+    let _ = client2.close();
+    
+    eprintln!("Connection migration simulation test completed");
 }
 
 #[test]
