@@ -896,7 +896,1025 @@ impl FilterEngine {
             FilterAction::Pause => Ok(BodyModuleResult::Pause),
         }
     }
+
+    /// Execute on_log callback for specified modules
+    ///
+    /// Called at the end of HTTP request processing (log phase).
+    /// This is the final callback before the stream is closed.
+    pub fn on_log_with_modules(&self, module_names: &[String]) {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        for module in &modules {
+            if let Err(e) = self.execute_on_log(module) {
+                ftlog::error!("[wasm:{}] on_log error: {}", module.name, e);
+            }
+        }
+    }
+
+    /// Execute on_log for a single module
+    fn execute_on_log(&self, module: &LoadedModule) -> anyhow::Result<()> {
+        // Create context
+        let http_ctx = HttpContext::new(1, module.capabilities.clone());
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        // Instantiate module
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize module
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        // Create contexts
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_log
+        // Signature: (context_id) -> void
+        if let Ok(func) = instance.get_typed_func::<i32, ()>(&mut store, "proxy_on_log") {
+            match func.call(&mut store, http_context_id) {
+                Ok(()) => {
+                    ftlog::debug!("[wasm:{}] proxy_on_log({}) OK", module.name, http_context_id)
+                }
+                Err(e) => ftlog::debug!("[wasm:{}] proxy_on_log error: {}", module.name, e),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute on_done callback for specified modules
+    ///
+    /// Called when an HTTP context is being deleted.
+    /// Returns true if the module wants to keep the context alive (async operation pending).
+    pub fn on_done_with_modules(&self, module_names: &[String]) -> bool {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        let mut any_pending = false;
+
+        for module in &modules {
+            match self.execute_on_done(module) {
+                Ok(keep_alive) => {
+                    if keep_alive {
+                        any_pending = true;
+                    }
+                }
+                Err(e) => {
+                    ftlog::error!("[wasm:{}] on_done error: {}", module.name, e);
+                }
+            }
+        }
+
+        any_pending
+    }
+
+    /// Execute on_done for a single module
+    fn execute_on_done(&self, module: &LoadedModule) -> anyhow::Result<bool> {
+        // Create context
+        let http_ctx = HttpContext::new(1, module.capabilities.clone());
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        // Instantiate module
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize module
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        // Create contexts
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_done
+        // Signature: (context_id) -> bool (1 = keep alive, 0 = delete)
+        if let Ok(func) = instance.get_typed_func::<i32, i32>(&mut store, "proxy_on_done") {
+            match func.call(&mut store, http_context_id) {
+                Ok(result) => {
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_done({}) => {}",
+                        module.name,
+                        http_context_id,
+                        result
+                    );
+                    return Ok(result != 0);
+                }
+                Err(e) => ftlog::debug!("[wasm:{}] proxy_on_done error: {}", module.name, e),
+            }
+        }
+
+        Ok(false)
+    }
+
+    /// Execute on_tick callback for a module
+    ///
+    /// Called periodically based on the tick period set by the module.
+    /// This should be called on the root context.
+    pub fn on_tick(&self, module_name: &str) {
+        let module = match self.registry.get_module(module_name) {
+            Some(m) => m,
+            None => return,
+        };
+
+        if let Err(e) = self.execute_on_tick(&module) {
+            ftlog::error!("[wasm:{}] on_tick error: {}", module_name, e);
+        }
+    }
+
+    /// Execute on_tick for a single module
+    fn execute_on_tick(&self, module: &LoadedModule) -> anyhow::Result<()> {
+        // Create context
+        let http_ctx = HttpContext::new(1, module.capabilities.clone());
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        // Instantiate module
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize module
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let config_size = module.configuration.len() as i32;
+
+        // Create root context only (tick is called on root context)
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        // Call proxy_on_tick on root context
+        // Signature: (context_id) -> void
+        if let Ok(func) = instance.get_typed_func::<i32, ()>(&mut store, "proxy_on_tick") {
+            match func.call(&mut store, root_context_id) {
+                Ok(()) => {
+                    ftlog::debug!("[wasm:{}] proxy_on_tick({}) OK", module.name, root_context_id)
+                }
+                Err(e) => ftlog::debug!("[wasm:{}] proxy_on_tick error: {}", module.name, e),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute on_request_trailers callback for specified modules
+    ///
+    /// Called when request trailers are received (HTTP/2, gRPC).
+    pub fn on_request_trailers_with_modules(
+        &self,
+        module_names: &[String],
+        trailers: &[(String, String)],
+    ) -> FilterResult {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        if modules.is_empty() {
+            return FilterResult::Continue {
+                headers: trailers.to_vec(),
+                body: None,
+            };
+        }
+
+        let mut current_trailers = trailers.to_vec();
+
+        for module in &modules {
+            let result = self.execute_on_request_trailers(module, &current_trailers);
+
+            match result {
+                Ok(ModuleResult::Continue { modified_headers }) => {
+                    if let Some(h) = modified_headers {
+                        current_trailers = h;
+                    }
+                }
+                Ok(ModuleResult::Pause) => {
+                    return FilterResult::Pause;
+                }
+                Ok(ModuleResult::LocalResponse(resp)) => {
+                    return FilterResult::LocalResponse(resp);
+                }
+                Err(e) => {
+                    ftlog::error!(
+                        "[wasm:{}] on_request_trailers error: {}",
+                        module.name,
+                        e
+                    );
+                }
+            }
+        }
+
+        FilterResult::Continue {
+            headers: current_trailers,
+            body: None,
+        }
+    }
+
+    /// Execute on_request_trailers for a single module
+    fn execute_on_request_trailers(
+        &self,
+        module: &LoadedModule,
+        trailers: &[(String, String)],
+    ) -> anyhow::Result<ModuleResult> {
+        // Create context
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.request_trailers = trailers.to_vec();
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        // Create store with fuel limit
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        // Instantiate module
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_request_trailers
+        // Signature: (context_id, num_trailers) -> action
+        let callback = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_request_trailers");
+
+        let action = match callback {
+            Ok(func) => {
+                let num_trailers = trailers.len() as i32;
+                func.call(&mut store, (http_context_id, num_trailers))?
+            }
+            Err(_) => 0,
+        };
+
+        // Check for local response
+        let state = store.data();
+        if let Some(local_response) = &state.http_ctx.local_response {
+            return Ok(ModuleResult::LocalResponse(local_response.clone()));
+        }
+
+        // Check for modifications
+        let modified_headers = if state.http_ctx.request_headers_modified {
+            Some(state.http_ctx.request_trailers.clone())
+        } else {
+            None
+        };
+
+        match FilterAction::from(action) {
+            FilterAction::Continue => Ok(ModuleResult::Continue { modified_headers }),
+            FilterAction::Pause => Ok(ModuleResult::Pause),
+        }
+    }
+
+    /// Execute on_response_trailers callback for specified modules
+    ///
+    /// Called when response trailers are received (HTTP/2, gRPC).
+    pub fn on_response_trailers_with_modules(
+        &self,
+        module_names: &[String],
+        trailers: &[(String, String)],
+    ) -> FilterResult {
+        let modules: Vec<Arc<LoadedModule>> = module_names
+            .iter()
+            .filter_map(|name| self.registry.get_module(name))
+            .collect();
+
+        if modules.is_empty() {
+            return FilterResult::Continue {
+                headers: trailers.to_vec(),
+                body: None,
+            };
+        }
+
+        let mut current_trailers = trailers.to_vec();
+
+        // Execute in reverse order for response
+        for module in modules.iter().rev() {
+            let result = self.execute_on_response_trailers(module, &current_trailers);
+
+            match result {
+                Ok(ModuleResult::Continue { modified_headers }) => {
+                    if let Some(h) = modified_headers {
+                        current_trailers = h;
+                    }
+                }
+                Ok(ModuleResult::Pause) => {
+                    return FilterResult::Pause;
+                }
+                Ok(ModuleResult::LocalResponse(resp)) => {
+                    return FilterResult::LocalResponse(resp);
+                }
+                Err(e) => {
+                    ftlog::error!(
+                        "[wasm:{}] on_response_trailers error: {}",
+                        module.name,
+                        e
+                    );
+                }
+            }
+        }
+
+        FilterResult::Continue {
+            headers: current_trailers,
+            body: None,
+        }
+    }
+
+    /// Execute on_response_trailers for a single module
+    fn execute_on_response_trailers(
+        &self,
+        module: &LoadedModule,
+        trailers: &[(String, String)],
+    ) -> anyhow::Result<ModuleResult> {
+        // Create context
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.response_trailers = trailers.to_vec();
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        // Create store with fuel limit
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        // Instantiate module
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_response_trailers
+        // Signature: (context_id, num_trailers) -> action
+        let callback = instance
+            .get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_response_trailers");
+
+        let action = match callback {
+            Ok(func) => {
+                let num_trailers = trailers.len() as i32;
+                func.call(&mut store, (http_context_id, num_trailers))?
+            }
+            Err(_) => 0,
+        };
+
+        // Check for local response
+        let state = store.data();
+        if let Some(local_response) = &state.http_ctx.local_response {
+            return Ok(ModuleResult::LocalResponse(local_response.clone()));
+        }
+
+        // Check for modifications
+        let modified_headers = if state.http_ctx.response_headers_modified {
+            Some(state.http_ctx.response_trailers.clone())
+        } else {
+            None
+        };
+
+        match FilterAction::from(action) {
+            FilterAction::Continue => Ok(ModuleResult::Continue { modified_headers }),
+            FilterAction::Pause => Ok(ModuleResult::Pause),
+        }
+    }
+
+    /// Execute on_queue_ready callback for a module
+    ///
+    /// Called when a message is enqueued to a shared queue that the module is subscribed to.
+    pub fn on_queue_ready(&self, module_name: &str, queue_id: u32) {
+        let module = match self.registry.get_module(module_name) {
+            Some(m) => m,
+            None => return,
+        };
+
+        if let Err(e) = self.execute_on_queue_ready(&module, queue_id) {
+            ftlog::error!("[wasm:{}] on_queue_ready error: {}", module_name, e);
+        }
+    }
+
+    /// Execute on_queue_ready for a single module
+    fn execute_on_queue_ready(&self, module: &LoadedModule, queue_id: u32) -> anyhow::Result<()> {
+        // Create context
+        let http_ctx = HttpContext::new(1, module.capabilities.clone());
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        // Instantiate module
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize module
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let config_size = module.configuration.len() as i32;
+
+        // Create root context (queue_ready is called on root context)
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        // Call proxy_on_queue_ready
+        // Signature: (context_id, queue_id) -> void
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_queue_ready")
+        {
+            match func.call(&mut store, (root_context_id, queue_id as i32)) {
+                Ok(()) => {
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_queue_ready({}, {}) OK",
+                        module.name,
+                        root_context_id,
+                        queue_id
+                    )
+                }
+                Err(e) => ftlog::debug!("[wasm:{}] proxy_on_queue_ready error: {}", module.name, e),
+            }
+        }
+
+        Ok(())
+    }
+
+    // =========================================================================
+    // P3: gRPC Response Callbacks
+    // =========================================================================
+
+    /// Execute on_grpc_receive_initial_metadata callback for a module
+    ///
+    /// Called when initial metadata is received from a gRPC call.
+    #[cfg(feature = "grpc")]
+    pub fn on_grpc_receive_initial_metadata(
+        &self,
+        module_name: &str,
+        call_id: u32,
+        headers: &[(String, String)],
+    ) {
+        let module = match self.registry.get_module(module_name) {
+            Some(m) => m,
+            None => return,
+        };
+
+        if let Err(e) = self.execute_on_grpc_receive_initial_metadata(&module, call_id, headers) {
+            ftlog::error!(
+                "[wasm:{}] on_grpc_receive_initial_metadata error: {}",
+                module_name,
+                e
+            );
+        }
+    }
+
+    #[cfg(feature = "grpc")]
+    fn execute_on_grpc_receive_initial_metadata(
+        &self,
+        module: &LoadedModule,
+        call_id: u32,
+        headers: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        // Create context
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_grpc_receive_initial_metadata
+        // Signature: (context_id, call_id, num_headers) -> void
+        if let Ok(func) = instance
+            .get_typed_func::<(i32, i32, i32), ()>(&mut store, "proxy_on_grpc_receive_initial_metadata")
+        {
+            let num_headers = headers.len() as i32;
+            match func.call(&mut store, (http_context_id, call_id as i32, num_headers)) {
+                Ok(()) => {
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_grpc_receive_initial_metadata({}, {}, {}) OK",
+                        module.name,
+                        http_context_id,
+                        call_id,
+                        num_headers
+                    )
+                }
+                Err(e) => ftlog::debug!(
+                    "[wasm:{}] proxy_on_grpc_receive_initial_metadata error: {}",
+                    module.name,
+                    e
+                ),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute on_grpc_receive callback for a module
+    ///
+    /// Called when a gRPC message is received.
+    #[cfg(feature = "grpc")]
+    pub fn on_grpc_receive(&self, module_name: &str, call_id: u32, message: &[u8]) {
+        let module = match self.registry.get_module(module_name) {
+            Some(m) => m,
+            None => return,
+        };
+
+        if let Err(e) = self.execute_on_grpc_receive(&module, call_id, message) {
+            ftlog::error!("[wasm:{}] on_grpc_receive error: {}", module_name, e);
+        }
+    }
+
+    #[cfg(feature = "grpc")]
+    fn execute_on_grpc_receive(
+        &self,
+        module: &LoadedModule,
+        call_id: u32,
+        message: &[u8],
+    ) -> anyhow::Result<()> {
+        // Create context
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_grpc_receive
+        // Signature: (context_id, call_id, message_size) -> void
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "proxy_on_grpc_receive")
+        {
+            let message_size = message.len() as i32;
+            match func.call(&mut store, (http_context_id, call_id as i32, message_size)) {
+                Ok(()) => {
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_grpc_receive({}, {}, {}) OK",
+                        module.name,
+                        http_context_id,
+                        call_id,
+                        message_size
+                    )
+                }
+                Err(e) => {
+                    ftlog::debug!("[wasm:{}] proxy_on_grpc_receive error: {}", module.name, e)
+                }
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute on_grpc_receive_trailing_metadata callback for a module
+    ///
+    /// Called when trailing metadata is received from a gRPC call.
+    #[cfg(feature = "grpc")]
+    pub fn on_grpc_receive_trailing_metadata(
+        &self,
+        module_name: &str,
+        call_id: u32,
+        trailers: &[(String, String)],
+    ) {
+        let module = match self.registry.get_module(module_name) {
+            Some(m) => m,
+            None => return,
+        };
+
+        if let Err(e) = self.execute_on_grpc_receive_trailing_metadata(&module, call_id, trailers) {
+            ftlog::error!(
+                "[wasm:{}] on_grpc_receive_trailing_metadata error: {}",
+                module_name,
+                e
+            );
+        }
+    }
+
+    #[cfg(feature = "grpc")]
+    fn execute_on_grpc_receive_trailing_metadata(
+        &self,
+        module: &LoadedModule,
+        call_id: u32,
+        trailers: &[(String, String)],
+    ) -> anyhow::Result<()> {
+        // Create context
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_grpc_receive_trailing_metadata
+        // Signature: (context_id, call_id, num_trailers) -> void
+        if let Ok(func) = instance.get_typed_func::<(i32, i32, i32), ()>(
+            &mut store,
+            "proxy_on_grpc_receive_trailing_metadata",
+        ) {
+            let num_trailers = trailers.len() as i32;
+            match func.call(&mut store, (http_context_id, call_id as i32, num_trailers)) {
+                Ok(()) => {
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_grpc_receive_trailing_metadata({}, {}, {}) OK",
+                        module.name,
+                        http_context_id,
+                        call_id,
+                        num_trailers
+                    )
+                }
+                Err(e) => ftlog::debug!(
+                    "[wasm:{}] proxy_on_grpc_receive_trailing_metadata error: {}",
+                    module.name,
+                    e
+                ),
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Execute on_grpc_close callback for a module
+    ///
+    /// Called when a gRPC call is closed.
+    #[cfg(feature = "grpc")]
+    pub fn on_grpc_close(&self, module_name: &str, call_id: u32, status_code: i32) {
+        let module = match self.registry.get_module(module_name) {
+            Some(m) => m,
+            None => return,
+        };
+
+        if let Err(e) = self.execute_on_grpc_close(&module, call_id, status_code) {
+            ftlog::error!("[wasm:{}] on_grpc_close error: {}", module_name, e);
+        }
+    }
+
+    #[cfg(feature = "grpc")]
+    fn execute_on_grpc_close(
+        &self,
+        module: &LoadedModule,
+        call_id: u32,
+        status_code: i32,
+    ) -> anyhow::Result<()> {
+        // Create context
+        let mut http_ctx = HttpContext::new(1, module.capabilities.clone());
+        http_ctx.plugin_name = module.name.clone();
+        http_ctx.plugin_configuration = module.configuration.clone();
+
+        let host_state = HostState::new(http_ctx);
+        let mut store = Store::new(self.registry.engine(), host_state);
+        store.set_fuel(self.fuel_limit)?;
+        store.set_epoch_deadline(self.epoch_deadline);
+        self.registry.engine().increment_epoch();
+
+        let instance = module.instance_pre.instantiate(&mut store)?;
+
+        // Initialize
+        if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_start") {
+            let _ = func.call(&mut store, ());
+        } else if let Ok(func) = instance.get_typed_func::<(), ()>(&mut store, "_initialize") {
+            let _ = func.call(&mut store, ());
+        }
+
+        let root_context_id = 1i32;
+        let http_context_id = 2i32;
+        let config_size = module.configuration.len() as i32;
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (root_context_id, 0));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_vm_start")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), i32>(&mut store, "proxy_on_configure")
+        {
+            let _ = func.call(&mut store, (root_context_id, config_size));
+        }
+
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32), ()>(&mut store, "proxy_on_context_create")
+        {
+            let _ = func.call(&mut store, (http_context_id, root_context_id));
+        }
+
+        // Call proxy_on_grpc_close
+        // Signature: (context_id, call_id, status_code) -> void
+        if let Ok(func) =
+            instance.get_typed_func::<(i32, i32, i32), ()>(&mut store, "proxy_on_grpc_close")
+        {
+            match func.call(&mut store, (http_context_id, call_id as i32, status_code)) {
+                Ok(()) => {
+                    ftlog::debug!(
+                        "[wasm:{}] proxy_on_grpc_close({}, {}, {}) OK",
+                        module.name,
+                        http_context_id,
+                        call_id,
+                        status_code
+                    )
+                }
+                Err(e) => {
+                    ftlog::debug!("[wasm:{}] proxy_on_grpc_close error: {}", module.name, e)
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
+
+
 
 /// Result from a single module execution
 enum ModuleResult {

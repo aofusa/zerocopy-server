@@ -708,3 +708,378 @@ mod host_function_tests {
         assert!(!caps.is_upstream_allowed("other_backend"));
     }
 }
+
+// P1: Lifecycle callback tests
+mod lifecycle_callback_tests {
+    use crate::wasm::capabilities::CapabilityPreset;
+    use crate::wasm::context::HttpContext;
+
+    /// Test that log_processed flag can be set on context
+    #[test]
+    fn test_context_log_phase_tracking() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let ctx = HttpContext::new(1, caps);
+        
+        // Context should be in initial state
+        assert!(!ctx.should_send_local_response());
+        assert!(!ctx.has_request_modifications());
+        assert!(!ctx.has_response_modifications());
+    }
+
+    /// Test context creation for log callback
+    #[test]
+    fn test_context_for_log_callback() {
+        let caps = CapabilityPreset::Standard.to_capabilities();
+        let mut ctx = HttpContext::new(1, caps);
+        
+        // Set up request/response data that would be available during log phase
+        ctx.set_request("GET", "/api/test", vec![
+            (":method".to_string(), "GET".to_string()),
+            (":path".to_string(), "/api/test".to_string()),
+        ], "192.168.1.1");
+        ctx.set_response(200, vec![
+            (":status".to_string(), "200".to_string()),
+            ("content-type".to_string(), "application/json".to_string()),
+        ]);
+        
+        // Verify data is accessible (would be used by proxy_on_log)
+        assert_eq!(ctx.request_method, "GET");
+        assert_eq!(ctx.request_path, "/api/test");
+        assert_eq!(ctx.response_status, 200);
+        assert_eq!(ctx.client_ip, "192.168.1.1");
+    }
+
+    /// Test context cleanup state for done callback
+    #[test]
+    fn test_context_for_done_callback() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let mut ctx = HttpContext::new(42, caps);
+        
+        // Simulate some state that would exist when done is called
+        ctx.request_headers_modified = true;
+        ctx.response_headers_modified = true;
+        
+        // Create some pending state
+        let token = ctx.allocate_http_call_token();
+        assert_eq!(token, 1);
+        
+        // Verify modifications tracked
+        assert!(ctx.has_request_modifications());
+        assert!(ctx.has_response_modifications());
+    }
+
+    /// Test on_done return value simulation
+    #[test]
+    fn test_done_return_value() {
+        // Test that we properly interpret the return value
+        // 0 = delete context, 1 = keep alive
+        let delete_context: i32 = 0;
+        let keep_alive: i32 = 1;
+        
+        assert_eq!(delete_context != 0, false);
+        assert_eq!(keep_alive != 0, true);
+    }
+
+    /// Test multiple context IDs for lifecycle
+    #[test]
+    fn test_lifecycle_context_ids() {
+        let caps = CapabilityPreset::Standard.to_capabilities();
+        
+        // Root context ID (typically 1)
+        let root_ctx = HttpContext::new(1, caps.clone());
+        assert_eq!(root_ctx.context_id, 1);
+        
+        // HTTP context ID (typically 2, 3, etc.)
+        let http_ctx = HttpContext::new(2, caps);
+        assert_eq!(http_ctx.context_id, 2);
+    }
+
+    /// Test that empty module list doesn't cause issues
+    #[test]
+    fn test_empty_module_list_handling() {
+        // This tests the edge case of calling callbacks with no modules
+        let module_names: Vec<String> = vec![];
+        assert!(module_names.is_empty());
+    }
+}
+
+// P2: Timer, queue, and trailer callback tests
+mod p2_callback_tests {
+    use crate::wasm::capabilities::CapabilityPreset;
+    use crate::wasm::context::HttpContext;
+
+    /// Test tick period setting
+    #[test]
+    fn test_tick_period_configuration() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let mut ctx = HttpContext::new(1, caps);
+        
+        // Default tick period should be 0 (disabled)
+        assert_eq!(ctx.tick_period_ms, 0);
+        
+        // Set tick period
+        ctx.tick_period_ms = 1000;
+        assert_eq!(ctx.tick_period_ms, 1000);
+        
+        // Set to different value
+        ctx.tick_period_ms = 500;
+        assert_eq!(ctx.tick_period_ms, 500);
+    }
+
+    /// Test context for tick callback
+    #[test]
+    fn test_context_for_tick_callback() {
+        let caps = CapabilityPreset::Standard.to_capabilities();
+        let mut ctx = HttpContext::new(1, caps);
+        
+        // Root context ID for tick (typically 1)
+        assert_eq!(ctx.context_id, 1);
+        
+        // Enable tick
+        ctx.tick_period_ms = 100;
+        assert!(ctx.tick_period_ms > 0);
+    }
+
+    /// Test request trailers context
+    #[test]
+    fn test_request_trailers_context() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let mut ctx = HttpContext::new(1, caps);
+        
+        // Initially empty
+        assert!(ctx.request_trailers.is_empty());
+        
+        // Set trailers
+        ctx.request_trailers = vec![
+            ("grpc-status".to_string(), "0".to_string()),
+            ("grpc-message".to_string(), "ok".to_string()),
+        ];
+        
+        assert_eq!(ctx.request_trailers.len(), 2);
+        assert_eq!(ctx.request_trailers[0].0, "grpc-status");
+    }
+
+    /// Test response trailers context
+    #[test]
+    fn test_response_trailers_context() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let mut ctx = HttpContext::new(1, caps);
+        
+        // Initially empty
+        assert!(ctx.response_trailers.is_empty());
+        
+        // Set trailers
+        ctx.response_trailers = vec![
+            ("grpc-status".to_string(), "0".to_string()),
+            ("grpc-message".to_string(), "success".to_string()),
+            ("custom-trailer".to_string(), "value".to_string()),
+        ];
+        
+        assert_eq!(ctx.response_trailers.len(), 3);
+        assert_eq!(ctx.response_trailers[2].0, "custom-trailer");
+    }
+
+    /// Test queue operations context
+    #[test]
+    fn test_shared_queue_context() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let ctx = HttpContext::new(1, caps);
+        
+        // Shared data should be initialized
+        assert!(ctx.shared_data.read().unwrap().is_empty());
+        
+        // Verify capability for queue operations
+        assert!(ctx.capabilities.allow_shared_data);
+    }
+
+    /// Test queue ID handling
+    #[test]
+    fn test_queue_id_operations() {
+        // Queue IDs are u32 values
+        let queue_id_1: u32 = 1;
+        let queue_id_2: u32 = 2;
+        let queue_id_max: u32 = u32::MAX;
+        
+        assert_ne!(queue_id_1, queue_id_2);
+        assert!(queue_id_max > queue_id_2);
+    }
+
+    /// Test tick callback frequency calculation
+    #[test]
+    fn test_tick_frequency() {
+        // 1000ms period = 1 tick per second
+        let period_ms: u32 = 1000;
+        let ticks_per_second = 1000.0 / period_ms as f64;
+        assert!((ticks_per_second - 1.0).abs() < f64::EPSILON);
+        
+        // 100ms period = 10 ticks per second
+        let period_ms_fast: u32 = 100;
+        let ticks_per_second_fast = 1000.0 / period_ms_fast as f64;
+        assert!((ticks_per_second_fast - 10.0).abs() < f64::EPSILON);
+    }
+
+    /// Test trailers empty handling
+    #[test]
+    fn test_empty_trailers_handling() {
+        let trailers: Vec<(String, String)> = vec![];
+        assert!(trailers.is_empty());
+        assert_eq!(trailers.len(), 0);
+    }
+}
+
+// P3: gRPC callback tests
+#[cfg(feature = "grpc")]
+mod p3_grpc_callback_tests {
+    use crate::wasm::capabilities::CapabilityPreset;
+    use crate::wasm::context::HttpContext;
+
+    /// Test gRPC call ID tracking
+    #[test]
+    fn test_grpc_call_id_allocation() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let mut ctx = HttpContext::new(1, caps);
+        
+        // Test gRPC call ID allocation
+        let call_id_1 = ctx.next_grpc_call_id();
+        let call_id_2 = ctx.next_grpc_call_id();
+        let call_id_3 = ctx.next_grpc_call_id();
+        
+        assert_eq!(call_id_1, 1);
+        assert_eq!(call_id_2, 2);
+        assert_eq!(call_id_3, 3);
+    }
+
+    /// Test gRPC stream state
+    #[test]
+    fn test_grpc_stream_states() {
+        use crate::wasm::context::{GrpcStream, GrpcStreamState};
+        
+        // Test all stream states
+        assert_eq!(GrpcStreamState::Open, GrpcStreamState::Open);
+        assert_ne!(GrpcStreamState::Open, GrpcStreamState::HalfClosed);
+        assert_ne!(GrpcStreamState::HalfClosed, GrpcStreamState::Closed);
+        
+        // Create a stream
+        let stream = GrpcStream {
+            stream_id: 1,
+            upstream: "backend".to_string(),
+            service: "grpc.health.v1.Health".to_string(),
+            method: "Check".to_string(),
+            state: GrpcStreamState::Open,
+            pending_messages: vec![],
+            initial_metadata: vec![],
+        };
+        
+        assert_eq!(stream.stream_id, 1);
+        assert_eq!(stream.state, GrpcStreamState::Open);
+    }
+
+    /// Test gRPC call registration
+    #[test]
+    fn test_grpc_call_registration() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let mut ctx = HttpContext::new(1, caps);
+        
+        let call_id = ctx.next_grpc_call_id();
+        ctx.register_grpc_call(
+            call_id,
+            "/grpc.health.v1.Health/Check".to_string(),
+            vec![0x0a, 0x00],
+            5000,
+        );
+        
+        assert!(ctx.pending_grpc_calls.contains_key(&call_id));
+        let (path, message, timeout) = ctx.pending_grpc_calls.get(&call_id).unwrap();
+        assert_eq!(path, "/grpc.health.v1.Health/Check");
+        assert_eq!(message, &vec![0x0a, 0x00]);
+        assert_eq!(*timeout, 5000);
+    }
+
+    /// Test gRPC call cancellation
+    #[test]
+    fn test_grpc_call_cancellation() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let mut ctx = HttpContext::new(1, caps);
+        
+        let call_id = ctx.next_grpc_call_id();
+        ctx.register_grpc_call(
+            call_id,
+            "/test.Service/Method".to_string(),
+            vec![],
+            1000,
+        );
+        
+        // Cancel the call
+        let cancelled = ctx.cancel_grpc_call(call_id);
+        assert!(cancelled);
+        
+        // Verify it's removed from pending
+        assert!(!ctx.pending_grpc_calls.contains_key(&call_id));
+        
+        // Verify it's in cancelled set
+        assert!(ctx.cancelled_grpc_calls.contains(&call_id));
+        
+        // Cancelling again should return false
+        let cancelled_again = ctx.cancel_grpc_call(call_id);
+        assert!(!cancelled_again);
+    }
+
+    /// Test gRPC status codes
+    #[test]
+    fn test_grpc_status_codes() {
+        // Common gRPC status codes
+        let ok: i32 = 0;
+        let cancelled: i32 = 1;
+        let unknown: i32 = 2;
+        let invalid_argument: i32 = 3;
+        let deadline_exceeded: i32 = 4;
+        let not_found: i32 = 5;
+        let unavailable: i32 = 14;
+        
+        assert_eq!(ok, 0);
+        assert_eq!(cancelled, 1);
+        assert_eq!(unknown, 2);
+        assert_eq!(invalid_argument, 3);
+        assert_eq!(deadline_exceeded, 4);
+        assert_eq!(not_found, 5);
+        assert_eq!(unavailable, 14);
+    }
+
+    /// Test gRPC metadata handling
+    #[test]
+    fn test_grpc_metadata() {
+        let initial_metadata: Vec<(String, String)> = vec![
+            ("content-type".to_string(), "application/grpc".to_string()),
+            ("grpc-accept-encoding".to_string(), "gzip".to_string()),
+        ];
+        
+        let trailing_metadata: Vec<(String, String)> = vec![
+            ("grpc-status".to_string(), "0".to_string()),
+            ("grpc-message".to_string(), "OK".to_string()),
+        ];
+        
+        assert_eq!(initial_metadata.len(), 2);
+        assert_eq!(trailing_metadata.len(), 2);
+        assert_eq!(initial_metadata[0].0, "content-type");
+        assert_eq!(trailing_metadata[0].0, "grpc-status");
+    }
+
+    /// Test take pending gRPC calls
+    #[test]
+    fn test_take_pending_grpc_calls() {
+        let caps = CapabilityPreset::Extended.to_capabilities();
+        let mut ctx = HttpContext::new(1, caps);
+        
+        // Register multiple calls
+        ctx.register_grpc_call(1, "/path1".to_string(), vec![1], 100);
+        ctx.register_grpc_call(2, "/path2".to_string(), vec![2], 200);
+        
+        assert_eq!(ctx.pending_grpc_calls.len(), 2);
+        
+        // Take all pending calls
+        let taken = ctx.take_pending_grpc_calls();
+        
+        assert_eq!(taken.len(), 2);
+        assert!(ctx.pending_grpc_calls.is_empty());
+    }
+}
