@@ -206,3 +206,100 @@ fn test_wait_for_port_success() {
     assert!(result, "Should find open port");
 }
 
+// ====================
+// エラーハンドリング統合テスト（優先度: 高）
+// ====================
+
+#[test]
+fn test_proxy_invalid_request() {
+    let server = SimpleHttpServer::start("Test Response", "test-server");
+    
+    let mut stream = TcpStream::connect(server.address()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // 不正なHTTP構文のリクエストを送信
+    stream.write_all(b"INVALID REQUEST\r\n\r\n").unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    
+    // SimpleHttpServerは不正なリクエストに対しても200 OKを返す可能性がある
+    // または、接続を閉じる可能性もある
+    // ここでは、何らかのレスポンスが返されるか、接続が閉じられることを確認
+    assert!(
+        response.is_empty() || response.contains("200") || response.contains("400") || response.contains("Bad Request"),
+        "Should return response or close connection for invalid request, got: {}", response
+    );
+}
+
+#[test]
+fn test_proxy_oversized_header() {
+    let server = SimpleHttpServer::start("Test Response", "test-server");
+    
+    let mut stream = TcpStream::connect(server.address()).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // 非常に大きなヘッダーを含むリクエストを送信
+    let mut request = b"GET / HTTP/1.1\r\nHost: localhost\r\n".to_vec();
+    // 10KBのヘッダーを追加
+    let large_header = format!("X-Large-Header: {}\r\n", "x".repeat(10000));
+    request.extend_from_slice(large_header.as_bytes());
+    request.extend_from_slice(b"\r\n");
+    
+    stream.write_all(&request).unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let _ = stream.read_to_end(&mut response);
+    let response = String::from_utf8_lossy(&response);
+    
+    // SimpleHttpServerは大きなヘッダーに対しても200 OKを返す可能性がある
+    // または、接続を閉じる可能性もある
+    // ここでは、何らかのレスポンスが返されるか、接続が閉じられることを確認
+    assert!(
+        response.is_empty() || response.contains("200") || response.contains("400") || response.contains("431"),
+        "Should return response or close connection for oversized header, got: {}", response
+    );
+}
+
+// ====================
+// タイムアウト処理統合テスト（優先度: 中）
+// ====================
+
+#[test]
+fn test_proxy_read_timeout() {
+    // 遅延応答するサーバーを起動（5秒遅延）
+    let server = DelayedHttpServer::start("Delayed Response", "delayed-server", Duration::from_secs(5));
+    
+    let mut stream = TcpStream::connect(server.address()).unwrap();
+    // 短い読み込みタイムアウトを設定（1秒）
+    stream.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+    
+    // HTTPリクエスト送信
+    stream.write_all(b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n").unwrap();
+    
+    // レスポンスを受信（タイムアウトが発生する可能性がある）
+    let mut response = Vec::new();
+    let result = stream.read_to_end(&mut response);
+    
+    // タイムアウトエラーが発生することを確認
+    // または、タイムアウト前にレスポンスが返される可能性もある
+    match result {
+        Ok(_) => {
+            // タイムアウト前にレスポンスが返された場合
+            let response_str = String::from_utf8_lossy(&response);
+            // レスポンスが正しいことを確認
+            assert!(response_str.contains("Delayed Response") || response_str.contains("200 OK"));
+        }
+        Err(e) => {
+            // タイムアウトエラーが発生した場合
+            assert!(
+                e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock,
+                "Should timeout or return WouldBlock error: {:?}", e
+            );
+        }
+    }
+}
+

@@ -271,6 +271,98 @@ pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     false
 }
 
+/// 遅延応答するHTTPサーバー（タイムアウトテスト用）
+pub struct DelayedHttpServer {
+    handle: Option<std::thread::JoinHandle<()>>,
+    pub addr: SocketAddr,
+    shutdown: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[allow(dead_code)]
+    delay: Duration,
+}
+
+impl DelayedHttpServer {
+    /// 新しい遅延応答HTTPサーバーを起動
+    /// 
+    /// # Arguments
+    /// * `response_body` - 返却するレスポンスボディ
+    /// * `server_id` - サーバー識別子
+    /// * `delay` - 応答までの遅延時間
+    pub fn start(response_body: &'static str, server_id: &'static str, delay: Duration) -> Self {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let shutdown = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let shutdown_clone = shutdown.clone();
+        let delay_clone = delay;
+        
+        let _ = listener.set_nonblocking(true);
+        
+        let handle = std::thread::spawn(move || {
+            while !shutdown_clone.load(std::sync::atomic::Ordering::Relaxed) {
+                match listener.accept() {
+                    Ok((mut stream, _)) => {
+                        let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                        let _ = stream.set_write_timeout(Some(Duration::from_secs(10)));
+                        
+                        // リクエストを読み取る
+                        let mut buf = [0u8; 4096];
+                        let _ = stream.read(&mut buf);
+                        
+                        // 遅延
+                        std::thread::sleep(delay_clone);
+                        
+                        // シンプルなHTTPレスポンス
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: text/plain\r\n\
+                             Content-Length: {}\r\n\
+                             X-Server-Id: {}\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            response_body.len(),
+                            server_id,
+                            response_body
+                        );
+                        
+                        let _ = stream.write_all(response.as_bytes());
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                    Err(_) => break,
+                }
+            }
+        });
+        
+        Self {
+            handle: Some(handle),
+            addr,
+            shutdown,
+            delay,
+        }
+    }
+    
+    /// サーバーのアドレスを取得
+    pub fn address(&self) -> String {
+        format!("127.0.0.1:{}", self.addr.port())
+    }
+    
+    /// サーバーのポートを取得
+    #[allow(dead_code)]
+    pub fn port(&self) -> u16 {
+        self.addr.port()
+    }
+}
+
+impl Drop for DelayedHttpServer {
+    fn drop(&mut self) {
+        self.shutdown.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
