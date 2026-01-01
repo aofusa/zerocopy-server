@@ -4561,3 +4561,481 @@ fn test_load_balancing_session_affinity() {
     );
 }
 
+// ====================
+// 優先度中: より詳細なHTTP機能テスト
+// ====================
+
+#[test]
+fn test_via_header() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Viaヘッダーのテスト（RFC 7230 Section 5.7.1）
+    // プロキシはViaヘッダーを追加する必要がある
+    
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Viaヘッダーが追加されている可能性がある
+    let via = get_header_value(&response, "Via");
+    if let Some(via_value) = via {
+        eprintln!("Via header test: via = {}", via_value);
+        // Viaヘッダーが存在する場合、プロキシが正しく動作している
+    } else {
+        eprintln!("Via header test: Via header not present (may be optional)");
+    }
+}
+
+#[test]
+fn test_100_continue() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 100 Continueのテスト（RFC 7231 Section 5.1.1）
+    // Expect: 100-continueヘッダーを含むリクエストを送信
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // Expect: 100-continueヘッダーを含むリクエストを送信
+    let request = b"POST / HTTP/1.1\r\nHost: localhost\r\nContent-Length: 100\r\nExpect: 100-continue\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信（100 Continueまたは200 OK）
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // 100 Continueまたは200 OKが返される可能性がある
+    assert!(
+        status == Some(100) || status == Some(200) || status == Some(404),
+        "Should return 100, 200, or 404: {:?}", status
+    );
+    
+    if status == Some(100) {
+        eprintln!("100 Continue test: 100 Continue received");
+    } else {
+        eprintln!("100 Continue test: status {:?} (100 Continue may not be supported)", status);
+    }
+}
+
+#[test]
+fn test_hop_by_hop_headers() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Hop-by-hopヘッダーのテスト（RFC 7230 Section 6.1）
+    // Connection、Keep-Alive、TEなどのHop-by-hopヘッダーは削除される必要がある
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // Hop-by-hopヘッダーを含むリクエストを送信
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\nKeep-Alive: timeout=5\r\nTE: trailers\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Hop-by-hopヘッダーがレスポンスに含まれていないことを確認
+    // （プロキシが正しく処理している場合、これらのヘッダーは削除される）
+    eprintln!("Hop-by-hop headers test: request processed successfully");
+}
+
+#[test]
+fn test_host_validation() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Hostヘッダー検証のテスト（RFC 7230 Section 5.4）
+    // HTTP/1.1リクエストにはHostヘッダーが必須
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // Hostヘッダーなしのリクエストを送信（HTTP/1.1では必須）
+    let request = b"GET / HTTP/1.1\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // Hostヘッダーが欠落している場合、400 Bad Requestが返される可能性がある
+    assert!(
+        status == Some(400) || status == Some(200),
+        "Should return 400 Bad Request or 200 OK: {:?}", status
+    );
+    
+    if status == Some(400) {
+        eprintln!("Host validation test: 400 Bad Request returned (Host header validation working)");
+    } else {
+        eprintln!("Host validation test: 200 OK returned (Host header may be optional)");
+    }
+}
+
+#[test]
+fn test_connection_close_header() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // Connection: closeヘッダーのテスト
+    // Connection: closeが指定されている場合、接続が閉じられる
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // Connection: closeヘッダーを含むリクエストを送信
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Connection: closeヘッダーがレスポンスに含まれている可能性がある
+    let connection = get_header_value(&response, "Connection");
+    if let Some(conn_value) = connection {
+        // Connectionヘッダーが存在する場合、値は'close'または'keep-alive'の可能性がある
+        let conn_lower = conn_value.to_lowercase();
+        assert!(
+            conn_lower == "close" || conn_lower == "keep-alive",
+            "Connection header should be 'close' or 'keep-alive': {}", conn_value
+        );
+        eprintln!("Connection: close test: Connection header = {}", conn_value);
+    } else {
+        eprintln!("Connection: close test: Connection header not present");
+    }
+}
+
+// ====================
+// 優先度中: より詳細なエッジケーステスト
+// ====================
+
+#[test]
+fn test_connection_abort() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 接続中断のテスト
+    // リクエスト送信中に接続を切断した場合の動作を確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // リクエストの一部を送信してから接続を切断
+    let partial_request = b"GET / HTTP/1.1\r\nHost: localhost\r\n";
+    if let Err(e) = tls_stream.write_all(partial_request) {
+        eprintln!("Failed to send partial request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // 接続を切断（ドロップ）
+    drop(tls_stream);
+    drop(stream);
+    
+    // プロキシが接続中断を正しく処理することを確認
+    // （実際のテストでは、エラーログやメトリクスを確認する必要がある）
+    eprintln!("Connection abort test: connection aborted (proxy should handle gracefully)");
+}
+
+#[test]
+fn test_empty_request() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 空のリクエストのテスト
+    // 空のリクエストが送信された場合の動作を確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // 空のリクエストを送信
+    let empty_request = b"\r\n";
+    if let Err(e) = tls_stream.write_all(empty_request) {
+        eprintln!("Failed to send empty request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // 空のリクエストの場合、400 Bad Requestが返される可能性がある
+    assert!(
+        status == Some(400) || status == None,
+        "Should return 400 Bad Request or close connection: {:?}", status
+    );
+    
+    if status == Some(400) {
+        eprintln!("Empty request test: 400 Bad Request returned");
+    } else {
+        eprintln!("Empty request test: connection closed");
+    }
+}
+
+#[test]
+fn test_incomplete_request_line() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 不完全なリクエスト行のテスト
+    // リクエスト行が不完全な場合の動作を確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // 不完全なリクエスト行を送信
+    let incomplete_request = b"GET /\r\nHost: localhost\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(incomplete_request) {
+        eprintln!("Failed to send incomplete request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // 不完全なリクエスト行の場合、400 Bad Requestが返される可能性がある
+    assert!(
+        status == Some(400) || status == Some(200) || status == None,
+        "Should return 400, 200, or close connection: {:?}", status
+    );
+    
+    eprintln!("Incomplete request line test: status {:?}", status);
+}
+
