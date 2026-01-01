@@ -250,13 +250,14 @@ fn url_decode(encoded: &str) -> String {
 
 /// TLSクライアント設定を作成（自己署名証明書を許可）
 fn create_client_config() -> Arc<ClientConfig> {
+    // CryptoProviderは既にe2e_tests.rsで初期化されていることを前提とする
+    // 初期化を試みるが、既に初期化されている場合はエラーを無視
     use rustls::crypto::CryptoProvider;
     
-    // CryptoProviderを初期化（一度だけ実行）
     static INIT: std::sync::Once = std::sync::Once::new();
     INIT.call_once(|| {
-        CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider())
-            .expect("Failed to install rustls crypto provider");
+        // 既に初期化されている場合はエラーを無視
+        let _ = CryptoProvider::install_default(rustls::crypto::aws_lc_rs::default_provider());
     });
     
     // 証明書検証をスキップするカスタム検証器

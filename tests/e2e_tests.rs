@@ -10529,7 +10529,7 @@ fn test_h2c_grpc_unary_call() {
     
     // H2C経由でのgRPC Unary RPCを確認
     // gRPCリクエストをH2Cルート経由で送信
-    use common::grpc_client::{GrpcTestClient, GrpcFrame};
+    use common::grpc_client::GrpcTestClient;
     
     let mut client = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
         Ok(c) => c,
@@ -10571,7 +10571,7 @@ fn test_h2c_grpc_streaming() {
     
     // H2C経由でのgRPCストリーミングを確認
     // gRPCストリーミングリクエストをH2Cルート経由で送信
-    use common::grpc_client::{GrpcTestClient, GrpcFrame};
+    use common::grpc_client::GrpcTestClient;
     
     let mut client = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
         Ok(c) => c,
