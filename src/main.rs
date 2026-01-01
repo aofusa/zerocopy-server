@@ -7230,6 +7230,10 @@ fn main() {
     
     // キャッシュクリーンアップスレッドを起動（期限切れエントリの削除、LRU eviction）
     spawn_cache_cleanup_thread();
+    
+    // WASMタイマースレッドを起動（on_tick コールバック処理）
+    #[cfg(feature = "wasm")]
+    spawn_wasm_tick_thread();
 
     let mut handles = Vec::with_capacity(num_threads);
 
@@ -8070,6 +8074,47 @@ fn spawn_cache_cleanup_thread() {
                 // 4. メトリクスを更新
                 let stats = cache_manager.stats();
                 update_cache_size_metrics(&stats);
+            }
+        }
+    });
+}
+
+/// WASMタイマースレッドを起動
+/// 
+/// WASM モジュールの `on_tick` コールバックを定期的に呼び出します。
+/// tick period は各モジュールの `proxy_set_tick_period` 設定に基づきます。
+#[cfg(feature = "wasm")]
+fn spawn_wasm_tick_thread() {
+    thread::spawn(move || {
+        info!("WASM tick thread started");
+        
+        // 最小tick間隔を取得（デフォルト: 100ms）
+        let tick_interval = {
+            let config = CURRENT_CONFIG.load();
+            if config.wasm_filter_engine.is_some() {
+                // get_min_tick_period() returns Option<Duration>
+                crate::wasm::get_min_tick_period()
+                    .unwrap_or(Duration::from_millis(100))
+            } else {
+                Duration::from_secs(1) // WASM未設定時は1秒
+            }
+        };
+        
+        debug!("WASM tick interval: {:?}", tick_interval);
+        
+        loop {
+            thread::sleep(tick_interval);
+            
+            // シャットダウン中は終了
+            if SHUTDOWN_FLAG.load(Ordering::Relaxed) {
+                info!("WASM tick thread shutting down");
+                break;
+            }
+            
+            // WASM tick処理
+            let config = CURRENT_CONFIG.load();
+            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                crate::wasm::process_ticks(wasm_engine);
             }
         }
     });
@@ -8936,18 +8981,18 @@ where
     
     // WASMモジュールの適用
     #[cfg(feature = "wasm")]
-    {
+    let wasm_modules_to_apply: Vec<String> = {
         let config = CURRENT_CONFIG.load();
         if let Some(ref wasm_engine) = config.wasm_filter_engine {
             let path_str = std::str::from_utf8(path).unwrap_or("/");
             let method_str = std::str::from_utf8(method).unwrap_or("GET");
             
-                let modules_to_apply = if let Some(backend_modules) = backend.modules() {
-                    backend_modules.to_vec()
-                } else {
-                    // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
-                    Vec::new()
-                };
+            let modules_to_apply = if let Some(backend_modules) = backend.modules() {
+                backend_modules.to_vec()
+            } else {
+                // ルートレベルのmodulesが指定されていない場合は、WASMモジュールを適用しない
+                Vec::new()
+            };
             
             if !modules_to_apply.is_empty() {
                 // HTTP/2のヘッダーを取得
@@ -8983,6 +9028,8 @@ where
                         }
                         
                         let _ = conn.send_response(stream_id, resp.status_code, &headers, Some(&resp.body)).await;
+                        // ライフサイクルコールバック: リクエスト完了
+                        crate::wasm::on_request_complete(wasm_engine, &modules_to_apply);
                         return Some((resp.status_code, resp.body.len() as u64));
                     }
                     crate::wasm::FilterResult::Pause => {
@@ -8994,8 +9041,11 @@ where
                     }
                 }
             }
+            modules_to_apply
+        } else {
+            Vec::new()
         }
-    }
+    };
     
     // Accept-Encoding を取得
     let client_encoding = if let Some(stream) = conn.get_stream(stream_id) {
@@ -9008,7 +9058,7 @@ where
     };
     
     // Backend処理
-    match backend {
+    let result = match backend {
         Backend::Proxy(upstream_group, _, compression, _buffering, _cache, _) => {
             handle_http2_proxy(conn, stream_id, &upstream_group, &compression, client_encoding, method, path, &prefix, client_ip).await
         }
@@ -9031,30 +9081,31 @@ where
                     headers.push(g.as_header());
                 }
                 let _ = conn.send_response(stream_id, 404, &headers, Some(b"Not Found")).await;
-                return Some((404, 9));
+                Some((404, 9))
+            } else {
+                let server_guard = get_server_header_guard();
+                let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(4);
+                headers.push((b"content-type", mime_type.as_bytes()));
+                if let Some(ref g) = server_guard {
+                    headers.push(g.as_header());
+                }
+                
+                // セキュリティヘッダー追加
+                let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
+                    .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
+                    .collect();
+                
+                for (k, v) in &security_headers {
+                    headers.push((k.as_slice(), v.as_slice()));
+                }
+                
+                if let Err(e) = conn.send_response(stream_id, 200, &headers, Some(&data)).await {
+                    warn!("[HTTP/2] Memory file response error: {}", e);
+                    None
+                } else {
+                    Some((200, data.len() as u64))
+                }
             }
-            
-            let server_guard = get_server_header_guard();
-            let mut headers: Vec<(&[u8], &[u8])> = Vec::with_capacity(4);
-            headers.push((b"content-type", mime_type.as_bytes()));
-            if let Some(ref g) = server_guard {
-                headers.push(g.as_header());
-            }
-            
-            // セキュリティヘッダー追加
-            let security_headers: Vec<(Vec<u8>, Vec<u8>)> = security.add_response_headers.iter()
-                .map(|(k, v)| (k.as_bytes().to_vec(), v.as_bytes().to_vec()))
-                .collect();
-            
-            for (k, v) in &security_headers {
-                headers.push((k.as_slice(), v.as_slice()));
-            }
-            
-            if let Err(e) = conn.send_response(stream_id, 200, &headers, Some(&data)).await {
-                warn!("[HTTP/2] Memory file response error: {}", e);
-                return None;
-            }
-            Some((200, data.len() as u64))
         }
         Backend::SendFile(base_path, is_dir, index_file, security, _cache, _open_file_cache_config, _) => {
             handle_http2_sendfile(conn, stream_id, &base_path, is_dir, index_file.as_deref(), path, &prefix, &security).await
@@ -9062,7 +9113,20 @@ where
         Backend::Redirect(redirect_url, status_code, preserve_path, _) => {
             handle_http2_redirect(conn, stream_id, &redirect_url, status_code, preserve_path, path, &prefix).await
         }
+    };
+    
+    // WASMライフサイクルコールバック: リクエスト完了
+    #[cfg(feature = "wasm")]
+    {
+        if !wasm_modules_to_apply.is_empty() {
+            let config = CURRENT_CONFIG.load();
+            if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                crate::wasm::on_request_complete(wasm_engine, &wasm_modules_to_apply);
+            }
+        }
     }
+    
+    result
 }
 
 /// HTTP/2 プロキシ処理（HTTP/1.1バックエンドへ変換）
@@ -10465,9 +10529,12 @@ async fn handle_requests(
                                     match write_result {
                                         Ok((Ok(_), _)) => {
                                             log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, 0, resp.status_code, resp_size, start_instant);
+                                            // WASMライフサイクルコールバック: リクエスト完了
+                                            crate::wasm::on_request_complete(wasm_engine, &modules_to_apply);
                                         }
                                         _ => {}
                                     }
+                                    clear_wasm_response_modules();
                                     accumulated.clear();
                                     return;
                                 }
@@ -10528,8 +10595,24 @@ async fn handle_requests(
                         match ws_result {
                             Some((status, resp_size)) => {
                                 log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
+                                
+                                // WASMライフサイクルコールバック: リクエスト完了
+                                #[cfg(feature = "wasm")]
+                                {
+                                    let wasm_modules = get_wasm_response_modules();
+                                    if !wasm_modules.is_empty() {
+                                        let config = CURRENT_CONFIG.load();
+                                        if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                                            crate::wasm::on_request_complete(wasm_engine, &wasm_modules);
+                                        }
+                                    }
+                                    clear_wasm_response_modules();
+                                }
                             }
-                            None => {}
+                            None => {
+                                #[cfg(feature = "wasm")]
+                                clear_wasm_response_modules();
+                            }
                         }
                         // WebSocket 接続終了後は HTTP 接続も終了
                         return;
@@ -10559,6 +10642,20 @@ async fn handle_requests(
                 match result {
                     Some((stream_back, status, resp_size, should_close)) => {
                         log_access(&method_bytes, &host_bytes, &path_bytes, &user_agent, content_length as u64, status, resp_size, start_instant);
+                        
+                        // WASMライフサイクルコールバック: リクエスト完了
+                        #[cfg(feature = "wasm")]
+                        {
+                            let wasm_modules = get_wasm_response_modules();
+                            if !wasm_modules.is_empty() {
+                                let config = CURRENT_CONFIG.load();
+                                if let Some(ref wasm_engine) = config.wasm_filter_engine {
+                                    crate::wasm::on_request_complete(wasm_engine, &wasm_modules);
+                                }
+                            }
+                            clear_wasm_response_modules();
+                        }
+                        
                         tls_stream = stream_back;
                         
                         // Connection: close が要求された場合、またはエラー時は接続を閉じる
@@ -10568,6 +10665,10 @@ async fn handle_requests(
                         // Keep-Alive: ループを継続して次のリクエストを待機
                     }
                     None => {
+                        // WASMモジュールリストをクリア
+                        #[cfg(feature = "wasm")]
+                        clear_wasm_response_modules();
+                        
                         return;
                     }
                 }
