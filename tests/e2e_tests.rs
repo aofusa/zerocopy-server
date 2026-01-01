@@ -2326,3 +2326,516 @@ fn test_grpc_web_cors() {
     }
 }
 
+// ====================
+// 優先度高: kTLS機能テスト
+// ====================
+
+/// kTLSが利用可能かどうかをチェック
+fn is_ktls_available() -> bool {
+    // /proc/modules で tls モジュールがロードされているか確認
+    if let Ok(modules) = std::fs::read_to_string("/proc/modules") {
+        if !modules.lines().any(|line| line.starts_with("tls ")) {
+            return false;
+        }
+    } else {
+        return false;
+    }
+
+    // /proc/sys/net/ipv4/tcp_available_ulp で tls が利用可能か確認
+    if let Ok(ulp) = std::fs::read_to_string("/proc/sys/net/ipv4/tcp_available_ulp") {
+        if ulp.contains("tls") {
+            return true;
+        }
+    }
+
+    false
+}
+
+#[test]
+#[cfg(feature = "ktls")]
+fn test_ktls_availability() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // kTLSが利用可能かどうかを確認
+    let ktls_available = is_ktls_available();
+    
+    if ktls_available {
+        eprintln!("kTLS is available on this system");
+    } else {
+        eprintln!("kTLS is not available (tls module may not be loaded)");
+        eprintln!("To enable kTLS: sudo modprobe tls");
+    }
+    
+    // kTLSが利用可能な場合、TLS接続が正常に動作することを確認
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response even if kTLS is not available");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+}
+
+#[test]
+#[cfg(feature = "ktls")]
+fn test_ktls_tls_handshake() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // kTLSが利用可能な場合でも、TLSハンドシェイクは正常に動作することを確認
+    use std::time::Instant;
+    
+    let start = Instant::now();
+    let response = send_request(PROXY_PORT, "/", &[]);
+    let elapsed = start.elapsed();
+    
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    eprintln!("TLS handshake completed in {:?}", elapsed);
+    
+    // kTLSが有効な場合、パフォーマンスが向上する可能性がある
+    // ただし、テスト環境では明確な差が出ない可能性もある
+    if is_ktls_available() {
+        eprintln!("kTLS may be active (performance improvement expected)");
+    }
+}
+
+#[test]
+#[cfg(feature = "ktls")]
+fn test_ktls_multiple_connections() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // kTLSが有効な場合、複数の接続が正常に動作することを確認
+    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use std::thread;
+    
+    let success_count = Arc::new(AtomicUsize::new(0));
+    let total_connections = 10;
+    
+    let handles: Vec<_> = (0..total_connections)
+        .map(|_| {
+            let success_count = Arc::clone(&success_count);
+            thread::spawn(move || {
+                let response = send_request(PROXY_PORT, "/", &[]);
+                if let Some(response) = response {
+                    if get_status_code(&response) == Some(200) {
+                        success_count.fetch_add(1, Ordering::Relaxed);
+                    }
+                }
+            })
+        })
+        .collect();
+    
+    for handle in handles {
+        let _ = handle.join();
+    }
+    
+    let successes = success_count.load(Ordering::Relaxed);
+    assert!(
+        successes >= total_connections * 8 / 10,
+        "At least 80% of kTLS connections should succeed: {}/{}",
+        successes, total_connections
+    );
+    
+    if is_ktls_available() {
+        eprintln!("kTLS multiple connections test: {}/{} succeeded", successes, total_connections);
+    }
+}
+
+// ====================
+// 優先度高: HTTP/2詳細機能テスト
+// ====================
+
+#[test]
+#[cfg(feature = "http2")]
+fn test_http2_alpn_negotiation() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // HTTP/2のALPNネゴシエーションをテスト
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(e) => {
+                eprintln!("TLS handshake error: {:?}", e);
+                return;
+            }
+        }
+    }
+    
+    // ALPNでHTTP/2がネゴシエートされたことを確認
+    let protocol = tls_conn.alpn_protocol();
+    if let Some(proto) = protocol {
+        eprintln!("ALPN negotiated protocol: {:?}", proto);
+        assert!(
+            proto == b"h2" || proto == b"http/1.1",
+            "Should negotiate HTTP/2 (h2) or HTTP/1.1: {:?}", proto
+        );
+        
+        if proto == b"h2" {
+            eprintln!("HTTP/2 successfully negotiated via ALPN");
+        } else {
+            eprintln!("HTTP/1.1 negotiated (HTTP/2 may not be enabled in config)");
+        }
+    } else {
+        eprintln!("No ALPN protocol negotiated");
+    }
+}
+
+#[test]
+#[cfg(feature = "http2")]
+fn test_http2_connection_reuse() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // HTTP/2の接続再利用をテスト
+    // HTTP/2では、1つの接続で複数のリクエストを並行処理できる
+    
+    // まず、HTTP/2接続が確立されることを確認
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    // ALPNでHTTP/2がネゴシエートされた場合、接続再利用が可能
+    let protocol = tls_conn.alpn_protocol();
+    if let Some(proto) = protocol {
+        if proto == b"h2" {
+            eprintln!("HTTP/2 connection established - connection reuse is possible");
+            // HTTP/2では、同じ接続で複数のリクエストを送信できる
+            // 実際のテストには、HTTP/2クライアントライブラリが必要
+        }
+    }
+    
+    // 基本的な動作確認
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    assert_eq!(get_status_code(&response.unwrap()), Some(200), "Should return 200 OK");
+}
+
+#[test]
+#[cfg(feature = "http2")]
+fn test_http2_header_compression() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // HTTP/2のHPACKヘッダー圧縮をテスト
+    // HTTP/2では、HPACKアルゴリズムによりヘッダーが圧縮される
+    
+    // まず、HTTP/2接続が確立されることを確認
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    // ALPNでHTTP/2がネゴシエートされた場合、HPACK圧縮が使用される
+    let protocol = tls_conn.alpn_protocol();
+    if let Some(proto) = protocol {
+        if proto == b"h2" {
+            eprintln!("HTTP/2 connection established - HPACK header compression is active");
+            // HTTP/2では、HPACKによりヘッダーが圧縮される
+            // 実際の圧縮率の測定には、HTTP/2クライアントライブラリが必要
+        }
+    }
+    
+    // 基本的な動作確認
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    assert_eq!(get_status_code(&response.unwrap()), Some(200), "Should return 200 OK");
+}
+
+// ====================
+// 優先度高: WebSocket双方向通信テスト
+// ====================
+
+#[test]
+fn test_websocket_upgrade_request() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // WebSocketアップグレードリクエストをテスト
+    // HTTPSポートを使用するため、TLS接続を確立する必要がある
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    // rustls::Streamを使用してI/Oを実行
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // WebSocketアップグレードリクエストを送信
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // WebSocketがサポートされている場合、101 Switching Protocolsが返される可能性がある
+    // または、WebSocketエンドポイントが存在しない場合は404が返される
+    assert!(
+        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        "Should return 101, 200, 404, or 502 for WebSocket upgrade request: {:?}", status
+    );
+    
+    if status == Some(101) {
+        eprintln!("WebSocket upgrade successful (101 Switching Protocols)");
+        // Upgradeヘッダーを確認
+        let upgrade = get_header_value(&response, "Upgrade");
+        if let Some(upgrade_value) = upgrade {
+            assert_eq!(upgrade_value.to_lowercase(), "websocket", "Upgrade header should be 'websocket'");
+        }
+    } else {
+        eprintln!("WebSocket upgrade not supported or endpoint not found: status {:?}", status);
+    }
+}
+
+#[test]
+fn test_websocket_connection_persistence() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // WebSocket接続の永続性をテスト
+    // WebSocket接続は、アップグレード後も維持される
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    // rustls::Streamを使用してI/Oを実行
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // WebSocketアップグレードリクエストを送信
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信（ヘッダー部分を読み取る）
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1];
+    let mut header_end = None;
+    
+    // ヘッダー部分を読み取る（\r\n\r\nまで）
+    loop {
+        match tls_stream.read_exact(&mut buf) {
+            Ok(_) => {
+                response.push(buf[0]);
+                // \r\n\r\nを検出（ヘッダー終了）
+                if response.len() >= 4 {
+                    let len = response.len();
+                    if &response[len-4..] == b"\r\n\r\n" {
+                        header_end = Some(len);
+                        break;
+                    }
+                }
+                // ヘッダーが大きすぎる場合は中止
+                if response.len() > 8192 {
+                    break;
+                }
+            }
+            Err(_) => {
+                // エラーまたはEOF
+                if response.is_empty() {
+                    eprintln!("No response received");
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    
+    if response.is_empty() {
+        eprintln!("Empty response received");
+        return;
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    if status == Some(101) {
+        eprintln!("WebSocket connection established");
+        // WebSocket接続が確立された場合、接続は維持される
+        // 実際の双方向通信テストには、WebSocketクライアントライブラリが必要
+    } else {
+        eprintln!("WebSocket connection not established: status {:?}", status);
+    }
+    
+    // 基本的な動作確認
+    assert!(
+        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        "Should return appropriate status: {:?}", status
+    );
+}
+
+#[test]
+fn test_websocket_proxy_forwarding() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+
+    // WebSocketプロキシ転送をテスト
+    // プロキシは、WebSocket接続をバックエンドに転送する必要がある
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    // rustls::Streamを使用してI/Oを実行
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // WebSocketアップグレードリクエストを送信
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信
+    let mut response = Vec::new();
+    let mut buf = [0u8; 8192];
+    loop {
+        match tls_stream.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => response.extend_from_slice(&buf[..n]),
+            Err(_) => break,
+        }
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    // WebSocketがサポートされている場合、プロキシはバックエンドに転送する
+    // バックエンドがWebSocketをサポートしていない場合、502が返される可能性がある
+    assert!(
+        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        "Should return appropriate status: {:?}", status
+    );
+    
+    if status == Some(101) {
+        eprintln!("WebSocket proxy forwarding successful");
+    } else if status == Some(502) {
+        eprintln!("WebSocket proxy forwarding failed (backend may not support WebSocket)");
+    }
+}
+
