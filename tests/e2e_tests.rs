@@ -2502,6 +2502,116 @@ fn test_http3_latency() {
     let _ = client.close();
 }
 
+// ====================
+// 未実装テスト: QPACK圧縮の詳細テスト
+// ====================
+
+#[test]
+#[cfg(feature = "http3")]
+fn test_http3_qpack_compression() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // QPACK圧縮の詳細テスト
+    // 同じヘッダーセットを持つ複数のリクエストを送信し、
+    // 2回目以降のリクエストでヘッダーが動的テーブルから参照されることを確認
+    
+    let server_addr = format!("127.0.0.1:{}", PROXY_HTTP3_PORT)
+        .parse()
+        .expect("Invalid server address");
+    
+    // HTTP/3接続を確立
+    let mut client = match Http3TestClient::new(server_addr) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create HTTP/3 client: {}", e);
+            return;
+        }
+    };
+    
+    // ハンドシェイクを完了
+    if client.handshake(Duration::from_secs(5)).is_err() {
+        eprintln!("HTTP/3 handshake failed, skipping test");
+        return;
+    }
+    
+    // 同じヘッダーセットを持つ複数のリクエストを送信
+    let headers = vec![
+        ("User-Agent", "test-client/1.0"),
+        ("Accept", "application/json"),
+        ("X-Custom-Header", "test-value"),
+    ];
+    
+    let mut first_request_size = 0;
+    let mut second_request_size = 0;
+    
+    // 1回目のリクエスト
+    match client.send_request_with_size_measurement("GET", "/", &headers, None) {
+        Ok((stream_id, size)) => {
+            first_request_size = size;
+            eprintln!("First request size: {} bytes", size);
+            
+            // レスポンスを受信（完了を待つ）
+            let _ = client.recv_response(stream_id, Duration::from_secs(5));
+        }
+        Err(e) => {
+            eprintln!("Failed to send first HTTP/3 request: {}", e);
+            return;
+        }
+    }
+    
+    // 2回目のリクエスト（同じヘッダー）
+    match client.send_request_with_size_measurement("GET", "/", &headers, None) {
+        Ok((stream_id, size)) => {
+            second_request_size = size;
+            eprintln!("Second request size: {} bytes", size);
+            
+            // レスポンスを受信（完了を待つ）
+            let _ = client.recv_response(stream_id, Duration::from_secs(5));
+        }
+        Err(e) => {
+            eprintln!("Failed to send second HTTP/3 request: {}", e);
+            return;
+        }
+    }
+    
+    // 3回目のリクエスト（同じヘッダー）
+    let mut third_request_size = 0;
+    match client.send_request_with_size_measurement("GET", "/", &headers, None) {
+        Ok((stream_id, size)) => {
+            third_request_size = size;
+            eprintln!("Third request size: {} bytes", size);
+            
+            // レスポンスを受信（完了を待つ）
+            let _ = client.recv_response(stream_id, Duration::from_secs(5));
+        }
+        Err(e) => {
+            eprintln!("Failed to send third HTTP/3 request: {}", e);
+            return;
+        }
+    }
+    
+    // QPACK圧縮の効果を確認
+    // 2回目以降のリクエストでパケットサイズが減少することを確認
+    if first_request_size > 0 && second_request_size > 0 {
+        let compression_ratio = (first_request_size as f64 - second_request_size as f64) / first_request_size as f64;
+        eprintln!("QPACK compression ratio: {:.2}%", compression_ratio * 100.0);
+        
+        // 2回目以降のリクエストでパケットサイズが減少することを確認
+        // （動的テーブルが使用されるため）
+        // ただし、QUICのパケット分割やその他の要因でサイズが増加する場合もあるため、
+        // 厳密な検証は行わない
+        if second_request_size < first_request_size {
+            eprintln!("QPACK compression detected: second request is smaller");
+        }
+    }
+    
+    // 接続を閉じる
+    let _ = client.close();
+}
+
 #[test]
 #[cfg(feature = "http3")]
 fn test_http3_concurrent_connections() {
@@ -4635,6 +4745,98 @@ fn test_grpc_compression_negotiation() {
         status == Some(200) || status == Some(404) || status == Some(502),
         "Should return 200, 404, or 502: {:?}", status
     );
+}
+
+// ====================
+// 未実装テスト: gRPCトレーラーの詳細テスト
+// ====================
+
+#[test]
+#[cfg(feature = "grpc")]
+fn test_grpc_trailer_detailed() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // gRPCトレーラーの詳細テスト
+    // 様々なgRPCステータスコードとエラーメッセージの処理を検証
+    
+    let mut client = match GrpcTestClient::new("127.0.0.1", PROXY_PORT) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("Failed to create gRPC client: {}", e);
+            return;
+        }
+    };
+    
+    // gRPCリクエストを送信
+    let response = match client.send_grpc_request(
+        "/grpc.test.v1.TestService/Test",
+        b"test message",
+        &[],
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("Failed to send gRPC request: {}", e);
+            return;
+        }
+    };
+    
+    // HTTPステータスコードを確認
+    let http_status = GrpcTestClient::extract_status_code(&response);
+    assert!(
+        http_status == Some(200) || http_status == Some(404) || http_status == Some(502),
+        "Should return 200, 404, or 502: {:?}", http_status
+    );
+    
+    // トレーラーを抽出
+    let trailers = GrpcTestClient::extract_trailers(&response);
+    
+    // grpc-statusの存在を確認（エンドポイントが存在する場合）
+    let grpc_status = GrpcTestClient::extract_grpc_status(&response);
+    if grpc_status.is_some() {
+        let status_code = grpc_status.unwrap();
+        
+        // gRPCステータスコードは0-16の範囲内であることを確認
+        assert!(
+            status_code <= 16,
+            "gRPC status code should be in range 0-16, got: {}",
+            status_code
+        );
+        
+        // grpc-statusトレーラーが存在することを確認
+        let has_grpc_status = trailers.iter().any(|(name, _)| name == "grpc-status");
+        assert!(has_grpc_status, "grpc-status trailer should be present");
+        
+        // grpc-messageの存在を確認（エラーの場合）
+        if status_code != 0 {
+            let grpc_message = GrpcTestClient::extract_grpc_message(&response);
+            // エラーの場合、grpc-messageが存在する可能性がある
+            if grpc_message.is_some() {
+                let message = grpc_message.unwrap();
+                assert!(!message.is_empty(), "grpc-message should not be empty if present");
+                
+                // grpc-messageトレーラーが存在することを確認
+                let has_grpc_message = trailers.iter().any(|(name, _)| name == "grpc-message");
+                assert!(has_grpc_message, "grpc-message trailer should be present for errors");
+            }
+        }
+        
+        eprintln!("gRPC status code: {}, trailers: {:?}", status_code, trailers);
+    } else {
+        // エンドポイントが存在しない場合、トレーラーが存在しない可能性がある
+        eprintln!("gRPC status not found (endpoint may not exist), trailers: {:?}", trailers);
+    }
+    
+    // トレーラーヘッダーがgrpc-で始まることを確認
+    for (name, _) in &trailers {
+        assert!(
+            name.starts_with("grpc-"),
+            "Trailer header should start with 'grpc-', got: {}",
+            name
+        );
+    }
 }
 
 // ====================

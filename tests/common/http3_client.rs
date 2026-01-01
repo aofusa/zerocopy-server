@@ -320,4 +320,53 @@ impl Http3TestClient {
         }
         Ok(())
     }
+    
+    /// リクエストを送信してパケットサイズを測定
+    pub fn send_request_with_size_measurement(
+        &mut self,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+        body: Option<&[u8]>,
+    ) -> Result<(u64, usize), Box<dyn std::error::Error>> {
+        let h3_conn = self.h3_conn.as_mut()
+            .ok_or("HTTP/3 connection not established")?;
+        
+        // ヘッダーを構築
+        let mut h3_headers = vec![
+            h3::Header::new(b":method", method.as_bytes()),
+            h3::Header::new(b":path", path.as_bytes()),
+            h3::Header::new(b":scheme", b"https"),
+            h3::Header::new(b":authority", b"localhost"),
+        ];
+        
+        for (name, value) in headers {
+            h3_headers.push(h3::Header::new(name.as_bytes(), value.as_bytes()));
+        }
+        
+        // リクエストを送信
+        let stream_id = h3_conn.send_request(&mut self.conn, &h3_headers, body.is_some())?;
+        
+        // ボディを送信
+        if let Some(body) = body {
+            h3_conn.send_body(&mut self.conn, stream_id, body, true)?;
+        }
+        
+        // パケットを送信してサイズを測定
+        let mut out = [0u8; 1350];
+        let mut total_size = 0;
+        loop {
+            match self.conn.send(&mut out) {
+                Ok((write, _)) if write > 0 => {
+                    total_size += write;
+                    self.socket.send(&out[..write])?;
+                }
+                Ok(_) => break,
+                Err(quiche::Error::Done) => break,
+                Err(e) => return Err(format!("Send error: {}", e).into()),
+            }
+        }
+        
+        Ok((stream_id, total_size))
+    }
 }

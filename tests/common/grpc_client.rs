@@ -180,6 +180,72 @@ impl GrpcTestClient {
         }
         None
     }
+    
+    /// レスポンスからgRPCメッセージを取得
+    pub fn extract_grpc_message(response: &[u8]) -> Option<String> {
+        let response_str = std::str::from_utf8(response).ok()?;
+        for line in response_str.lines() {
+            if line.starts_with("grpc-message:") {
+                let parts: Vec<&str> = line.split(':').collect();
+                if parts.len() >= 2 {
+                    let message = parts[1].trim();
+                    // URLデコード
+                    return Some(url_decode(message));
+                }
+            }
+        }
+        None
+    }
+    
+    /// レスポンスからすべてのトレーラーヘッダーを取得
+    pub fn extract_trailers(response: &[u8]) -> Vec<(String, String)> {
+        let mut trailers = Vec::new();
+        let response_str = match std::str::from_utf8(response) {
+            Ok(s) => s,
+            Err(_) => return trailers,
+        };
+        
+        // ヘッダーセクションとボディセクションを分離
+        let header_end = response_str.find("\r\n\r\n").unwrap_or(0);
+        let trailer_section = &response_str[header_end + 4..];
+        
+        // grpc-で始まるヘッダーを探す
+        for line in trailer_section.lines() {
+            if line.starts_with("grpc-") {
+                if let Some(colon_idx) = line.find(':') {
+                    let name = line[..colon_idx].trim().to_string();
+                    let value = line[colon_idx + 1..].trim().to_string();
+                    trailers.push((name, value));
+                }
+            }
+        }
+        
+        trailers
+    }
+}
+
+/// URLデコード（簡易実装）
+fn url_decode(encoded: &str) -> String {
+    let mut result = String::new();
+    let mut chars = encoded.chars().peekable();
+    
+    while let Some(c) = chars.next() {
+        if c == '%' {
+            let hex: String = chars.by_ref().take(2).collect();
+            if hex.len() == 2 {
+                if let Ok(byte) = u8::from_str_radix(&hex, 16) {
+                    result.push(byte as char);
+                    continue;
+                }
+            }
+            result.push('%');
+            result.push_str(&hex);
+        } else {
+            result.push(c);
+        }
+    }
+    
+    result
 }
 
 /// TLSクライアント設定を作成（自己署名証明書を許可）
