@@ -1075,6 +1075,50 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_user` | 起動後に降格するユーザー名 | なし |
 | `drop_privileges_group` | 起動後に降格するグループ名 | なし |
 | `max_concurrent_connections` | 同時接続数の上限 | 0（無制限） |
+| `allow_security_failures` | セキュリティ機能の有効化に失敗した場合の動作 | false |
+
+#### セキュリティ機能失敗時の動作
+
+`allow_security_failures` オプションで、セキュリティ機能（サンドボックス、seccomp、Landlock）の有効化に失敗した場合の動作を制御できます。
+
+| 設定値 | 動作 | 用途 |
+|--------|------|------|
+| `false`（デフォルト） | 有効化に失敗した場合はサーバーの起動を失敗させる | **本番環境推奨** - セキュリティ機能が確実に有効化されることを保証 |
+| `true` | 有効化に失敗しても警告を出して起動を続行する | 開発・デバッグ用 - セキュリティ機能が利用できない環境でも開発を継続可能 |
+
+**デフォルト動作（`allow_security_failures = false`）:**
+
+セキュリティ機能の有効化に失敗した場合、詳細なエラーメッセージを出力してサーバーの起動を中止します。これにより、本番環境でセキュリティ機能が無効化された状態で動作することを防止します。
+
+```toml
+[security]
+# デフォルト: false（失敗時に起動を中止）
+# allow_security_failures = false
+
+enable_sandbox = true
+enable_seccomp = true
+enable_landlock = true
+```
+
+**開発・デバッグモード（`allow_security_failures = true`）:**
+
+セキュリティ機能が利用できない環境（カーネルバージョン不足、権限不足など）でも、警告を出して起動を続行します。
+
+```toml
+[security]
+# 開発環境でセキュリティ機能が利用できない場合のみ true に設定
+allow_security_failures = true
+
+enable_sandbox = true
+enable_seccomp = true
+enable_landlock = true
+```
+
+**注意事項:**
+
+- **本番環境では `false`（デフォルト）を推奨**: セキュリティ機能が確実に有効化されることを保証
+- **権限降格の失敗**: 権限降格の失敗は常に起動を中止します（`allow_security_failures` の設定に関係なく）
+- **エラーメッセージ**: 失敗時には詳細なエラーメッセージと対処法が表示されます
 
 #### seccomp 設定
 

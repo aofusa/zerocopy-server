@@ -1075,6 +1075,50 @@ landlock_write_paths = ["/var/log/veil"]
 | `drop_privileges_user` | Username to drop to after startup | none |
 | `drop_privileges_group` | Group name to drop to after startup | none |
 | `max_concurrent_connections` | Maximum concurrent connections | 0 (unlimited) |
+| `allow_security_failures` | Behavior when security feature activation fails | false |
+
+#### Security Feature Failure Handling
+
+The `allow_security_failures` option controls the behavior when security features (sandbox, seccomp, Landlock) fail to activate.
+
+| Value | Behavior | Use Case |
+|-------|----------|----------|
+| `false` (default) | Abort server startup on activation failure | **Recommended for production** - Ensures security features are reliably enabled |
+| `true` | Continue startup with warnings on activation failure | Development/debugging - Allows development to continue even when security features are unavailable |
+
+**Default Behavior (`allow_security_failures = false`):**
+
+When security feature activation fails, the server outputs detailed error messages and aborts startup. This prevents the server from running in production with security features disabled.
+
+```toml
+[security]
+# Default: false (abort on failure)
+# allow_security_failures = false
+
+enable_sandbox = true
+enable_seccomp = true
+enable_landlock = true
+```
+
+**Development/Debug Mode (`allow_security_failures = true`):**
+
+Allows the server to start with warnings even when security features are unavailable (e.g., insufficient kernel version, missing privileges).
+
+```toml
+[security]
+# Set to true only in development when security features are unavailable
+allow_security_failures = true
+
+enable_sandbox = true
+enable_seccomp = true
+enable_landlock = true
+```
+
+**Notes:**
+
+- **Production environments should use `false` (default)**: Ensures security features are reliably enabled
+- **Privilege drop failures**: Privilege drop failures always abort startup (regardless of `allow_security_failures` setting)
+- **Error messages**: Detailed error messages and troubleshooting hints are displayed on failure
 
 #### seccomp Configuration
 
