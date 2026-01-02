@@ -743,11 +743,39 @@ health_check() {
 }
 
 # テスト実行
+# Phase 1: 並列化による高速化
+# 環境変数 PARALLEL_JOBS で並列数を制御可能（デフォルト: CPUコア数または4）
 run_tests() {
-    log_info "Running E2E tests..."
+    log_info "Running E2E tests in parallel..."
     
     cd "$PROJECT_DIR"
-    cargo test --test e2e_tests -- --test-threads=1
+    
+    # 並列数の決定
+    # 1. 環境変数 PARALLEL_JOBS が設定されている場合はそれを使用
+    # 2. それ以外は CPUコア数を取得（取得できない場合は4を使用）
+    if [ -n "${PARALLEL_JOBS:-}" ]; then
+        TEST_THREADS="${PARALLEL_JOBS}"
+    else
+        # CPUコア数を取得（Linux/macOS対応）
+        if command -v nproc > /dev/null 2>&1; then
+            CPU_CORES=$(nproc)
+        elif command -v sysctl > /dev/null 2>&1; then
+            CPU_CORES=$(sysctl -n hw.ncpu 2>/dev/null || echo "4")
+        else
+            CPU_CORES=4
+        fi
+        
+        # 並列数は CPUコア数と4の小さい方（リソース競合を避けるため）
+        if [ "$CPU_CORES" -lt 4 ]; then
+            TEST_THREADS="$CPU_CORES"
+        else
+            TEST_THREADS=4
+        fi
+    fi
+    
+    log_info "Running tests with ${TEST_THREADS} parallel threads"
+    
+    cargo test --test e2e_tests -- --test-threads="${TEST_THREADS}"
     
     log_info "E2E tests completed"
 }
@@ -803,6 +831,12 @@ case "${1:-}" in
             exit 1
         fi
         
+        # サーバー起動後の安定化待機（30秒）
+        # サーバー起動直後は初期化処理に時間がかかるため、テスト開始前に待機
+        log_info "Waiting 30 seconds for servers to stabilize before running tests..."
+        sleep 30
+        log_info "Starting tests..."
+        
         # テスト実行（失敗してもtrapでクリーンアップ）
         set +e
         run_tests
@@ -823,7 +857,7 @@ case "${1:-}" in
         echo "  stop    - Stop all servers"
         echo "  restart - Restart all servers"
         echo "  health  - Check server health"
-        echo "  test    - Run E2E tests"
+        echo "  test    - Run E2E tests (parallelized for faster execution)"
         echo "  clean   - Clean up fixtures"
         echo ""
         echo "Config Types (optional, default: default):"
@@ -834,6 +868,12 @@ case "${1:-}" in
         echo "  least_conn   - Use least connections algorithm"
         echo "  ip_hash      - Use IP hash algorithm"
         echo "  security     - Enable security features (rate limiting, IP restriction)"
+        echo ""
+        echo "Parallelization (Phase 1):"
+        echo "  Tests are now run in parallel for faster execution."
+        echo "  Default: Uses CPU core count or 4 (whichever is smaller)"
+        echo "  Custom: Set PARALLEL_JOBS environment variable"
+        echo "  Example: PARALLEL_JOBS=8 $0 test"
         exit 1
         ;;
 esac
