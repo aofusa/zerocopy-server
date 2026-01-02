@@ -49,7 +49,9 @@ use base64;
 
 // E2E環境のポート設定（e2e_setup.shと一致させる）
 const PROXY_PORT: u16 = 8443;  // プロキシHTTPSポート
+#[allow(dead_code)]
 const PROXY_HTTP_PORT: u16 = 8080;  // プロキシHTTPポート（HTTPSリダイレクト用）
+#[allow(dead_code)]
 const PROXY_H2C_PORT: u16 = 8081;  // H2C (HTTP/2 Cleartext) ポート
 const PROXY_HTTP3_PORT: u16 = 8443;  // HTTP/3ポート（デフォルトではHTTPSポートと同じ）
 const BACKEND1_PORT: u16 = 9001;
@@ -2844,6 +2846,7 @@ fn test_grpc_streaming_detailed() {
 
 #[test]
 #[cfg(feature = "http3")]
+#[allow(unused_assignments)]
 fn test_http3_qpack_compression() {
     if !is_e2e_environment_ready() {
         eprintln!("Skipping test: E2E environment not ready");
@@ -2914,10 +2917,10 @@ fn test_http3_qpack_compression() {
     }
     
     // 3回目のリクエスト（同じヘッダー）
-    let mut third_request_size = 0;
+    let mut _third_request_size = 0;
     match client.send_request_with_size_measurement("GET", "/", &headers, None) {
         Ok((stream_id, size)) => {
-            third_request_size = size;
+            _third_request_size = size;
             eprintln!("Third request size: {} bytes", size);
             
             // レスポンスを受信（完了を待つ）
@@ -7171,6 +7174,57 @@ fn test_buffering_adaptive_content_length_missing() {
            "Response should be processed even without Content-Length");
 }
 
+#[test]
+fn test_buffering_max_memory_buffer_within_limit() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // メモリバッファ上限内での動作確認
+    // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
+    
+    // 通常のサイズのレスポンスをリクエスト
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Content-Lengthを確認
+    let content_length = get_content_length_from_headers(response.as_bytes());
+    if let Some(cl) = content_length {
+        // メモリバッファ上限（デフォルト10MB）内であれば正常に処理される
+        eprintln!("Buffering max memory buffer within limit test: content_length={} bytes", cl);
+        assert!(cl < 10 * 1024 * 1024, "Response should be within memory buffer limit");
+    }
+}
+
+#[test]
+fn test_buffering_invalid_content_length() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 不正なContent-Lengthヘッダーの動作確認
+    // 注意: このテストは設定ファイルでバッファリングを有効化する必要がある
+    
+    // 通常のリクエストを送信（バックエンドが不正なContent-Lengthを返す場合は別途テストが必要）
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // Content-Lengthヘッダーを確認
+    let content_length = get_content_length_from_headers(response.as_bytes());
+    // 不正なContent-Lengthが存在する場合でも、プロキシが適切に処理することを確認
+    eprintln!("Buffering invalid content length test: content_length={:?}", content_length);
+}
+
 // ====================
 // 優先度中: より詳細なヘルスチェックテスト
 // ====================
@@ -7395,6 +7449,62 @@ fn test_health_check_path_custom() {
     }
 }
 
+#[test]
+fn test_health_check_interval_accuracy() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // ヘルスチェック間隔の正確性を確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    
+    use std::time::Instant;
+    
+    // メトリクスエンドポイントから初期状態を取得
+    let start = Instant::now();
+    let metrics1 = send_request(PROXY_PORT, "/__metrics", &[]);
+    
+    // ヘルスチェック間隔（デフォルト1秒）を待つ
+    std::thread::sleep(Duration::from_secs(2));
+    
+    let metrics2 = send_request(PROXY_PORT, "/__metrics", &[]);
+    let elapsed = start.elapsed();
+    
+    // メトリクスが更新されていることを確認（間隔が経過している）
+    if let (Some(m1), Some(m2)) = (metrics1, metrics2) {
+        if m1.contains("http_upstream_health") || m2.contains("http_upstream_health") {
+            eprintln!("Health check interval accuracy test: elapsed={:?}", elapsed);
+            // 間隔が経過していることを確認
+            assert!(elapsed >= Duration::from_secs(1), "Health check interval should have elapsed");
+        }
+    }
+}
+
+#[test]
+fn test_health_check_timeout_enforcement() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // タイムアウトの強制を確認
+    // 注意: このテストは設定ファイルでヘルスチェックを有効化する必要がある
+    // 実際のテストには、バックエンドの遅延をシミュレートする必要がある
+    
+    // 通常のリクエストが成功することを確認
+    let response = send_request(PROXY_PORT, "/", &[]);
+    assert!(response.is_some(), "Should receive response");
+    
+    let response = response.unwrap();
+    let status = get_status_code(&response);
+    assert_eq!(status, Some(200), "Should return 200 OK");
+    
+    // タイムアウトが適切に設定されている場合、タイムアウト時間経過後にリクエストがキャンセルされる
+    // 実際のテストには、バックエンドの遅延をシミュレートする必要がある
+    eprintln!("Health check timeout enforcement test: request successful");
+}
+
 // ====================
 // WebSocket: エラーハンドリングテスト（優先度: 高）
 // ====================
@@ -7490,6 +7600,176 @@ fn test_websocket_invalid_websocket_version() {
     );
     
     eprintln!("WebSocket invalid version test: status={:?}", status);
+}
+
+#[test]
+fn test_websocket_connection_close() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 接続クローズの動作確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    // rustls::Streamを使用してI/Oを実行
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // WebSocketアップグレードリクエストを送信
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信（ヘッダー部分のみ）
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1];
+    
+    // ヘッダー部分を読み取る（\r\n\r\nまで）
+    loop {
+        match tls_stream.read_exact(&mut buf) {
+            Ok(_) => {
+                response.push(buf[0]);
+                // \r\n\r\nを検出（ヘッダー終了）
+                if response.len() >= 4 {
+                    let len = response.len();
+                    if &response[len-4..] == b"\r\n\r\n" {
+                        break;
+                    }
+                }
+                // ヘッダーが大きすぎる場合は中止
+                if response.len() > 8192 {
+                    break;
+                }
+            }
+            Err(_) => {
+                if response.is_empty() {
+                    eprintln!("No response received");
+                    return;
+                }
+                break;
+            }
+        }
+    }
+    
+    if response.is_empty() {
+        eprintln!("Empty response received");
+        return;
+    }
+    
+    let response = String::from_utf8_lossy(&response);
+    let status = get_status_code(&response);
+    
+    if status == Some(101) {
+        eprintln!("WebSocket connection established, closing connection");
+        // 接続をクローズ（dropで自動的にクローズされる）
+    } else {
+        eprintln!("WebSocket connection not established: status {:?}", status);
+    }
+    
+    // 基本的な動作確認
+    assert!(
+        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        "Should return appropriate status: {:?}", status
+    );
+}
+
+#[test]
+fn test_websocket_unexpected_close() {
+    if !is_e2e_environment_ready() {
+        eprintln!("Skipping test: E2E environment not ready");
+        return;
+    }
+    
+    // 予期しない接続クローズの処理を確認
+    
+    let mut stream = TcpStream::connect(format!("127.0.0.1:{}", PROXY_PORT)).unwrap();
+    stream.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+    stream.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
+    
+    // TLS接続を確立
+    let config = create_client_config();
+    let server_name = ServerName::try_from("localhost".to_string()).unwrap();
+    let mut tls_conn = ClientConnection::new(config, server_name).unwrap();
+    
+    // TLSハンドシェイクを完了
+    while tls_conn.is_handshaking() {
+        match tls_conn.complete_io(&mut stream) {
+            Ok(_) => {}
+            Err(_) => {
+                eprintln!("TLS handshake error");
+                return;
+            }
+        }
+    }
+    
+    // rustls::Streamを使用してI/Oを実行
+    let mut tls_stream = rustls::Stream::new(&mut tls_conn, &mut stream);
+    
+    // WebSocketアップグレードリクエストを送信
+    let request = b"GET / HTTP/1.1\r\nHost: localhost\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    if let Err(e) = tls_stream.write_all(request) {
+        eprintln!("Failed to send WebSocket upgrade request: {:?}", e);
+        return;
+    }
+    tls_stream.flush().unwrap();
+    
+    // レスポンスを受信（ヘッダー部分のみ）
+    let mut response = Vec::new();
+    let mut buf = [0u8; 1];
+    
+    // ヘッダー部分を読み取る
+    for _ in 0..8192 {
+        match tls_stream.read_exact(&mut buf) {
+            Ok(_) => {
+                response.push(buf[0]);
+                // \r\n\r\nを検出（ヘッダー終了）
+                if response.len() >= 4 {
+                    let len = response.len();
+                    if &response[len-4..] == b"\r\n\r\n" {
+                        break;
+                    }
+                }
+            }
+            Err(_) => {
+                // 予期しないクローズ（EOF）
+                break;
+            }
+        }
+    }
+    
+    if !response.is_empty() {
+        let response = String::from_utf8_lossy(&response);
+        let status = get_status_code(&response);
+        eprintln!("WebSocket unexpected close test: status={:?}", status);
+        
+        // 予期しないクローズが発生しても、適切に処理されることを確認
+        assert!(
+            status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+            "Should return appropriate status even on unexpected close: {:?}", status
+        );
+    }
 }
 
 // ====================

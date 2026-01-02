@@ -11,11 +11,13 @@ use std::sync::Arc;
 
 /// gRPCフレーム構造体
 #[derive(Debug, Clone)]
+#[allow(dead_code)]
 pub struct GrpcFrame {
     pub compressed: bool,
     pub data: Vec<u8>,
 }
 
+#[allow(dead_code)]
 impl GrpcFrame {
     /// 新しいgRPCフレームを作成
     pub fn new(data: Vec<u8>) -> Self {
@@ -63,11 +65,14 @@ impl GrpcFrame {
 }
 
 /// gRPCテストクライアント
+#[allow(dead_code)]
 pub struct GrpcTestClient {
+    #[allow(dead_code)]
     tls_conn: ClientConnection,
     stream: TcpStream,
 }
 
+#[allow(dead_code)]
 impl GrpcTestClient {
     /// 新しいgRPCクライアントを作成
     pub fn new(server_addr: &str, port: u16) -> Result<Self, Box<dyn std::error::Error>> {
@@ -225,6 +230,7 @@ impl GrpcTestClient {
 }
 
 /// URLデコード（簡易実装）
+#[allow(dead_code)]
 fn url_decode(encoded: &str) -> String {
     let mut result = String::new();
     let mut chars = encoded.chars().peekable();
@@ -249,6 +255,7 @@ fn url_decode(encoded: &str) -> String {
 }
 
 /// TLSクライアント設定を作成（自己署名証明書を許可）
+#[allow(dead_code)]
 fn create_client_config() -> Arc<ClientConfig> {
     // CryptoProviderは既にe2e_tests.rsで初期化されていることを前提とする
     // 初期化を試みるが、既に初期化されている場合はエラーを無視

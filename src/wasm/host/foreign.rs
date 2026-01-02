@@ -20,6 +20,9 @@ static FOREIGN_FUNCTIONS: Lazy<RwLock<HashMap<String, ForeignFn>>> =
     Lazy::new(|| RwLock::new(HashMap::new()));
 
 /// Register a foreign function
+/// 
+/// Note: Currently unused, reserved for future Proxy-Wasm extensions
+#[allow(dead_code)]
 pub fn register_foreign_function(name: &str, func: ForeignFn) {
     if let Ok(mut registry) = FOREIGN_FUNCTIONS.write() {
         registry.insert(name.to_string(), func);

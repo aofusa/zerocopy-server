@@ -229,6 +229,7 @@ EOF
 listen = "127.0.0.1:${BACKEND_H2C_PORT}"
 threads = 1
 http2_enabled = true
+h2c_enabled = true
 # http設定は不要（HTTP（平文）サーバーとして動作）
 
 [tls]

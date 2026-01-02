@@ -400,6 +400,7 @@ mod tests {
     fn test_context_stats() {
         let stats = get_context_stats();
         // Just verify it doesn't panic
-        assert!(stats.total_contexts >= 0);
+        // Note: stats.total_contexts is usize, always >= 0
+        let _ = stats.total_contexts;
     }
 }

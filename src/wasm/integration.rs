@@ -170,7 +170,7 @@ where
             deliver_http_call_response(pending.context_id, pending.token, response.clone());
             
             // Take the context and call on_http_call_response
-            if let Some(stored) = take_context(pending.context_id) {
+            if let Some(_stored) = take_context(pending.context_id) {
                 engine.on_http_call_response(
                     &pending.module_name,
                     pending.token,

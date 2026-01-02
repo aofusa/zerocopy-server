@@ -17,6 +17,7 @@ use aws_lc_rs::rand::{SecureRandom, SystemRandom};
 
 /// HTTP/3テストクライアント
 #[cfg(feature = "http3")]
+#[allow(dead_code)]
 pub struct Http3TestClient {
     conn: Connection,
     socket: UdpSocket,
@@ -26,6 +27,7 @@ pub struct Http3TestClient {
 }
 
 #[cfg(feature = "http3")]
+#[allow(dead_code)]
 impl Http3TestClient {
     /// 新しいHTTP/3クライアントを作成
     pub fn new(server_addr: SocketAddr) -> Result<Self, Box<dyn std::error::Error>> {

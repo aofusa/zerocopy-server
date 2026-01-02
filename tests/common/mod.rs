@@ -14,6 +14,7 @@ use std::time::Duration;
 use std::io::{Read, Write};
 
 /// テスト用の自己署名TLS証明書を生成
+#[allow(dead_code)]
 pub fn generate_test_certs(output_dir: &std::path::Path) -> std::io::Result<(PathBuf, PathBuf)> {
     use rcgen::{generate_simple_self_signed, CertifiedKey};
     
@@ -189,6 +190,7 @@ impl SimpleHttpServer {
     }
     
     /// サーバーのポートを取得
+    #[allow(dead_code)]
     pub fn port(&self) -> u16 {
         self.addr.port()
     }
@@ -205,6 +207,7 @@ impl Drop for SimpleHttpServer {
 
 
 /// テスト用設定ファイルを生成
+#[allow(dead_code)]
 pub fn generate_test_config(
     https_port: u16,
     http_port: u16,
@@ -266,6 +269,7 @@ upstream = "backend"
 }
 
 /// ポートが利用可能になるまで待機
+#[allow(dead_code)]
 pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
     let start = std::time::Instant::now();
     while start.elapsed() < timeout {
@@ -278,6 +282,7 @@ pub fn wait_for_port(port: u16, timeout: Duration) -> bool {
 }
 
 /// 遅延応答するHTTPサーバー（タイムアウトテスト用）
+#[allow(dead_code)]
 pub struct DelayedHttpServer {
     handle: Option<std::thread::JoinHandle<()>>,
     pub addr: SocketAddr,
@@ -286,6 +291,7 @@ pub struct DelayedHttpServer {
     delay: Duration,
 }
 
+#[allow(dead_code)]
 impl DelayedHttpServer {
     /// 新しい遅延応答HTTPサーバーを起動
     /// 
