@@ -1489,15 +1489,15 @@ fn test_grpc_unary_call() {
     
     // ステータスコードを確認
     let status = GrpcTestClient::extract_status_code(&response);
-    // gRPCエンドポイントが存在しない場合は404、存在する場合は200が返される
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
+    // gRPCエンドポイントが存在する場合は200が返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for gRPC request, got: {:?}", status
     );
     
     // gRPCフレームを抽出（成功した場合のみ）
     if let Ok(frame) = GrpcTestClient::extract_grpc_frame(&response) {
-        assert!(!frame.data.is_empty() || status == Some(404), "Should receive response message or 404");
+        assert!(!frame.data.is_empty(), "Should receive non-empty response message");
     }
 }
 
@@ -2962,9 +2962,9 @@ fn test_grpc_streaming_detailed() {
         };
         
         let status = GrpcTestClient::extract_status_code(&response);
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502),
-            "Should return 200, 404, or 502: {:?}", status
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
         );
     }
     
@@ -2994,9 +2994,9 @@ fn test_grpc_streaming_detailed() {
         };
         
         let status = GrpcTestClient::extract_status_code(&response);
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502),
-            "Should return 200, 404, or 502: {:?}", status
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
         );
         
         // gRPCフレームを抽出
@@ -3303,10 +3303,10 @@ fn test_grpc_client_streaming() {
         };
         
         let status = GrpcTestClient::extract_status_code(&response);
-        // gRPCエンドポイントが存在しない場合は404、存在する場合は200が返される
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502),
-            "Should return 200, 404, or 502: {:?}", status
+        // gRPCエンドポイントが存在する場合は200が返される
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
         );
     }
 }
@@ -3343,10 +3343,10 @@ fn test_grpc_server_streaming() {
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    // gRPCエンドポイントが存在しない場合は404、存在する場合は200が返される
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
+    // gRPCエンドポイントが存在する場合は200が返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for gRPC request, got: {:?}", status
     );
 }
 
@@ -3384,9 +3384,9 @@ fn test_grpc_bidirectional_streaming() {
         };
         
         let status = GrpcTestClient::extract_status_code(&response);
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502),
-            "Should return 200, 404, or 502: {:?}", status
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
         );
     }
 }
@@ -3420,11 +3420,11 @@ fn test_grpc_timeout_header() {
         }
     };
     
-    let status = GrpcTestClient::extract_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
-    );
+        let status = GrpcTestClient::extract_status_code(&response);
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
+        );
 }
 
 #[test]
@@ -3456,11 +3456,11 @@ fn test_grpc_encoding_header() {
         }
     };
     
-    let status = GrpcTestClient::extract_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
-    );
+        let status = GrpcTestClient::extract_status_code(&response);
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
+        );
 }
 
 #[test]
@@ -3492,11 +3492,11 @@ fn test_grpc_accept_encoding_header() {
         }
     };
     
-    let status = GrpcTestClient::extract_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
-    );
+        let status = GrpcTestClient::extract_status_code(&response);
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
+        );
 }
 
 #[test]
@@ -3531,11 +3531,11 @@ fn test_grpc_metadata() {
         }
     };
     
-    let status = GrpcTestClient::extract_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
-    );
+        let status = GrpcTestClient::extract_status_code(&response);
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
+        );
 }
 
 #[test]
@@ -3569,11 +3569,11 @@ fn test_grpc_gzip_compression() {
         }
     };
     
-    let status = GrpcTestClient::extract_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
-    );
+        let status = GrpcTestClient::extract_status_code(&response);
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
+        );
 }
 
 #[test]
@@ -3606,9 +3606,9 @@ fn test_grpc_web_binary_format() {
     
     if let Some(response) = response {
         let status = get_status_code(&response);
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502),
-            "Should return 200, 404, or 502: {:?}", status
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
         );
     }
 }
@@ -3643,10 +3643,10 @@ fn test_grpc_proxy_forwarding() {
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    // プロキシが正常に動作している場合、200または404が返される
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
+    // プロキシが正常に動作している場合、200が返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for gRPC request, got: {:?}", status
     );
 }
 
@@ -3682,10 +3682,10 @@ fn test_grpc_invalid_frame() {
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    // 不正なフレームの場合、エラーが返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(400) || status == Some(404) || status == Some(502),
-        "Should return appropriate status: {:?}", status
+    // 不正なフレームの場合、400 Bad Requestが返される
+    assert_eq!(
+        status, Some(400),
+        "Should return 400 Bad Request for invalid frame, got: {:?}", status
     );
 }
 
@@ -3721,10 +3721,10 @@ fn test_grpc_oversized_message() {
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    // メッセージサイズ超過の場合、エラーが返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(413) || status == Some(404) || status == Some(502),
-        "Should return appropriate status: {:?}", status
+    // メッセージサイズ超過の場合、413 Payload Too Largeが返される
+    assert_eq!(
+        status, Some(413),
+        "Should return 413 Payload Too Large for oversized message, got: {:?}", status
     );
 }
 
@@ -3784,11 +3784,10 @@ fn test_error_handling_invalid_method() {
     let response = String::from_utf8_lossy(&response);
     let status = get_status_code(&response);
     
-    // 不正なメソッドの場合、400 Bad Request、501 Not Implemented、または405 Method Not Allowedが返される可能性がある
-    // ただし、プロキシが柔軟に処理する場合、200が返される可能性もある
-    assert!(
-        status == Some(400) || status == Some(501) || status == Some(405) || status == Some(200),
-        "Should return 400, 501, 405, or 200 for invalid method: {:?}", status
+    // 不正なメソッドの場合、405 Method Not Allowedが返される
+    assert_eq!(
+        status, Some(405),
+        "Should return 405 Method Not Allowed for invalid method, got: {:?}", status
     );
     
     eprintln!("Error handling test: invalid method returned status {:?}", status);
@@ -3846,10 +3845,10 @@ fn test_error_handling_missing_host() {
     let response = String::from_utf8_lossy(&response);
     let status = get_status_code(&response);
     
-    // Hostヘッダーが欠落している場合、400 Bad Requestが返される可能性がある
-    assert!(
-        status == Some(400) || status == Some(200),
-        "Should return 400 or 200 for missing host: {:?}", status
+    // Hostヘッダーが欠落している場合、400 Bad Requestが返される
+    assert_eq!(
+        status, Some(400),
+        "Should return 400 Bad Request for missing host, got: {:?}", status
     );
     
     eprintln!("Error handling test: missing host returned status {:?}", status);
@@ -3912,10 +3911,10 @@ fn test_error_handling_oversized_header() {
     let response = String::from_utf8_lossy(&response);
     let status = get_status_code(&response);
     
-    // 過大なヘッダーの場合、400 Bad Request、413 Request Entity Too Large、または431 Request Header Fields Too Largeが返される可能性がある
-    assert!(
-        status == Some(400) || status == Some(413) || status == Some(431) || status == None,
-        "Should return 400, 413, 431, or close connection for oversized header: {:?}", status
+    // 過大なヘッダーの場合、431 Request Header Fields Too Largeが返される
+    assert_eq!(
+        status, Some(431),
+        "Should return 431 Request Header Fields Too Large for oversized header, got: {:?}", status
     );
     
     eprintln!("Error handling test: oversized header returned status {:?}", status);
@@ -3973,10 +3972,10 @@ fn test_error_handling_invalid_path() {
     let response = String::from_utf8_lossy(&response);
     let status = get_status_code(&response);
     
-    // 不正なパスの場合、400 Bad Requestが返される可能性がある
-    assert!(
-        status == Some(400) || status == Some(404) || status == None,
-        "Should return 400, 404, or close connection for invalid path: {:?}", status
+    // 不正なパスの場合、400 Bad Requestが返される
+    assert_eq!(
+        status, Some(400),
+        "Should return 400 Bad Request for invalid path, got: {:?}", status
     );
     
     eprintln!("Error handling test: invalid path returned status {:?}", status);
@@ -4386,10 +4385,10 @@ fn test_etag_304() {
         
         if let Some(response2) = response2 {
             let status = get_status_code(&response2);
-            // ETagが一致する場合、304 Not Modifiedが返される可能性がある
-            assert!(
-                status == Some(200) || status == Some(304),
-                "Should return 200 OK or 304 Not Modified, got {:?}", status
+            // ETagが一致する場合、304 Not Modifiedが返される
+            assert_eq!(
+                status, Some(304),
+                "Should return 304 Not Modified for matching ETag, got: {:?}", status
             );
             
             if status == Some(304) {
@@ -4507,10 +4506,10 @@ fn test_websocket_bidirectional() {
     let response = String::from_utf8_lossy(&response);
     
     let status = get_status_code(&response);
-    // WebSocketがサポートされている場合、101 Switching Protocolsが返される可能性がある
-    assert!(
-        status == Some(101) || status == Some(404) || status == Some(502),
-        "Should return 101, 404, or 502 for WebSocket request: {:?}", status
+    // WebSocketがサポートされている場合、101 Switching Protocolsが返される
+    assert_eq!(
+        status, Some(101),
+        "Should return 101 Switching Protocols for WebSocket request, got: {:?}", status
     );
 }
 
@@ -4539,11 +4538,10 @@ fn test_redirect_301() {
     let response = String::from_utf8_lossy(&response);
     
     let status = get_status_code(&response);
-    // リダイレクトが設定されている場合、301が返される可能性がある
-    // 設定されていない場合、200が返される
-    assert!(
-        status == Some(200) || status == Some(301) || status == Some(302),
-        "Should return 200, 301, or 302: {:?}", status
+    // リダイレクトが設定されている場合、301 Moved Permanentlyが返される
+    assert_eq!(
+        status, Some(301),
+        "Should return 301 Moved Permanently for redirect, got: {:?}", status
     );
 }
 
@@ -4561,10 +4559,10 @@ fn test_redirect_302() {
     
     if let Some(response) = response {
         let status = get_status_code(&response);
-        // リダイレクトが設定されている場合、302が返される可能性がある
-        assert!(
-            status == Some(200) || status == Some(301) || status == Some(302) || status == Some(404),
-            "Should return appropriate status: {:?}", status
+        // リダイレクトが設定されている場合、302 Foundが返される
+        assert_eq!(
+            status, Some(302),
+            "Should return 302 Found for redirect, got: {:?}", status
         );
     }
 }
@@ -4617,10 +4615,10 @@ fn test_range_request_single() {
     let status = get_status_code(&response);
     
     // Rangeリクエストがサポートされている場合、206 Partial Contentが返される可能性がある
-    // サポートされていない場合、200が返される
-    assert!(
-        status == Some(200) || status == Some(206),
-        "Should return 200 OK or 206 Partial Content: {:?}", status
+    // Range Requestがサポートされている場合、206 Partial Contentが返される
+    assert_eq!(
+        status, Some(206),
+        "Should return 206 Partial Content for range request, got: {:?}", status
     );
 }
 
@@ -4807,11 +4805,10 @@ fn test_routing_method_condition() {
     
     if let Some(response) = response {
         let status = get_status_code(&response);
-        // メソッドが許可されている場合、200が返される
-        // 許可されていない場合、405 Method Not Allowedが返される可能性がある
-        assert!(
-            status == Some(200) || status == Some(405) || status == Some(404),
-            "Should return appropriate status: {:?}", status
+        // メソッドが許可されていない場合、405 Method Not Allowedが返される
+        assert_eq!(
+            status, Some(405),
+            "Should return 405 Method Not Allowed for restricted method, got: {:?}", status
         );
     }
 }
@@ -4877,11 +4874,10 @@ fn test_routing_source_ip_condition() {
     assert!(response.is_some(), "Should receive response");
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // IPが許可されている場合、200が返される
-    // 許可されていない場合、403が返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(403),
-        "Should return 200 OK or 403 Forbidden: {:?}", status
+    // IP制限が設定されている場合、403 Forbiddenが返される
+    assert_eq!(
+        status, Some(403),
+        "Should return 403 Forbidden for IP restriction, got: {:?}", status
     );
 }
 
@@ -4960,10 +4956,9 @@ fn test_grpc_wire_protocol() {
     if let Some(response) = response {
         let status = get_status_code(&response);
         // gRPCエンドポイントが存在する場合、200が返される
-        // 存在しない場合、404が返される
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502),
-            "Should return appropriate status: {:?}", status
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
         );
     }
 }
@@ -5040,9 +5035,9 @@ fn test_grpc_web_cors() {
     if let Some(response) = response {
         let status = get_status_code(&response);
         // CORSが設定されている場合、適切なCORSヘッダーが返される
-        assert!(
-            status == Some(200) || status == Some(204) || status == Some(404),
-            "Should return appropriate status: {:?}", status
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for CORS request, got: {:?}", status
         );
     }
 }
@@ -5075,9 +5070,9 @@ fn test_grpc_web_text_format() {
     
     if let Some(response) = response {
         let status = get_status_code(&response);
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502),
-            "Should return 200, 404, or 502: {:?}", status
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
         );
     }
 }
@@ -5105,9 +5100,9 @@ fn test_grpc_web_cors_headers() {
     
     if let Some(response) = response {
         let status = get_status_code(&response);
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502),
-            "Should return 200, 404, or 502: {:?}", status
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
         );
         
         // CORSヘッダーが含まれているか確認（レスポンスに含まれる場合）
@@ -5197,9 +5192,10 @@ fn test_grpc_proxy_timeout() {
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502) || status == Some(504),
-        "Should return appropriate status: {:?}", status
+    // タイムアウトが発生した場合、504 Gateway Timeoutが返される
+    assert_eq!(
+        status, Some(504),
+        "Should return 504 Gateway Timeout for timeout, got: {:?}", status
     );
 }
 
@@ -5234,10 +5230,10 @@ fn test_grpc_proxy_error_handling() {
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    // 存在しないエンドポイントの場合、404または502が返される
-    assert!(
-        status == Some(404) || status == Some(502),
-        "Should return 404 or 502 for non-existent endpoint: {:?}", status
+    // 存在しないエンドポイントの場合、404 Not Foundが返される
+    assert_eq!(
+        status, Some(404),
+        "Should return 404 Not Found for non-existent endpoint, got: {:?}", status
     );
 }
 
@@ -5273,10 +5269,10 @@ fn test_grpc_malformed_protobuf() {
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    // 不正なデータの場合、エラーが返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(400) || status == Some(404) || status == Some(502),
-        "Should return appropriate status: {:?}", status
+    // 不正なデータの場合、400 Bad Requestが返される
+    assert_eq!(
+        status, Some(400),
+        "Should return 400 Bad Request for malformed protobuf, got: {:?}", status
     );
 }
 
@@ -5347,11 +5343,11 @@ fn test_grpc_deflate_compression() {
         }
     };
     
-    let status = GrpcTestClient::extract_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
-    );
+        let status = GrpcTestClient::extract_status_code(&response);
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
+        );
 }
 
 #[test]
@@ -5384,11 +5380,11 @@ fn test_grpc_compression_negotiation() {
         }
     };
     
-    let status = GrpcTestClient::extract_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 200, 404, or 502: {:?}", status
-    );
+        let status = GrpcTestClient::extract_status_code(&response);
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for gRPC request, got: {:?}", status
+        );
 }
 
 // ====================
@@ -5811,11 +5807,10 @@ fn test_websocket_upgrade_request() {
     let response = String::from_utf8_lossy(&response);
     let status = get_status_code(&response);
     
-    // WebSocketがサポートされている場合、101 Switching Protocolsが返される可能性がある
-    // または、WebSocketエンドポイントが存在しない場合は404が返される
-    assert!(
-        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return 101, 200, 404, or 502 for WebSocket upgrade request: {:?}", status
+    // WebSocketがサポートされている場合、101 Switching Protocolsが返される
+    assert_eq!(
+        status, Some(101),
+        "Should return 101 Switching Protocols for WebSocket upgrade request, got: {:?}", status
     );
     
     if status == Some(101) {
@@ -5923,7 +5918,7 @@ fn test_websocket_connection_persistence() {
     
     // 基本的な動作確認
     assert!(
-        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        status == Some(101),
         "Should return appropriate status: {:?}", status
     );
 }
@@ -5986,7 +5981,7 @@ fn test_websocket_proxy_forwarding() {
     // WebSocketがサポートされている場合、プロキシはバックエンドに転送する
     // バックエンドがWebSocketをサポートしていない場合、502が返される可能性がある
     assert!(
-        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        status == Some(101),
         "Should return appropriate status: {:?}", status
     );
     
@@ -6074,10 +6069,9 @@ fn test_ip_restriction_with_config() {
     let status = get_status_code(&response);
     
     // IP制限が設定されている場合、127.0.0.1は許可されているため200が返される
-    // 設定されていない場合も、200が返される
-    assert!(
-        status == Some(200) || status == Some(403),
-        "Should return 200 OK or 403 Forbidden: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for allowed IP, got: {:?}", status
     );
     
     if status == Some(200) {
@@ -6106,11 +6100,10 @@ fn test_method_restriction() {
     let post_response = send_request_with_method(PROXY_PORT, "/", "POST", &[], Some(b"test body"));
     if let Some(response) = post_response {
         let status = get_status_code(&response);
-        // メソッドが許可されている場合、200が返される
-        // 許可されていない場合、405 Method Not Allowedが返される可能性がある
-        assert!(
-            status == Some(200) || status == Some(405) || status == Some(404),
-            "Should return appropriate status: {:?}", status
+        // メソッドが許可されていない場合、405 Method Not Allowedが返される
+        assert_eq!(
+            status, Some(405),
+            "Should return 405 Method Not Allowed for restricted method, got: {:?}", status
         );
         
         if status == Some(405) {
@@ -6179,11 +6172,10 @@ fn test_large_request_body() {
     
     if let Some(response) = response {
         let status = get_status_code(&response);
-        // ボディサイズ制限が設定されている場合、413 Request Entity Too Largeが返される可能性がある
-        // 制限されていない場合、200または404が返される
-        assert!(
-            status == Some(200) || status == Some(413) || status == Some(404) || status == Some(502),
-            "Should return appropriate status: {:?}", status
+        // ボディサイズ制限が設定されている場合、413 Request Entity Too Largeが返される
+        assert_eq!(
+            status, Some(413),
+            "Should return 413 Request Entity Too Large for oversized body, got: {:?}", status
         );
         
         if status == Some(413) {
@@ -6247,10 +6239,10 @@ fn test_malformed_headers() {
     let status = get_status_code(&response);
     
     // 不正なヘッダーの場合、400 Bad Requestが返される可能性がある
-    // または、接続が閉じられる可能性もある
-    assert!(
-        status == Some(200) || status == Some(400) || status == None,
-        "Should return 200, 400, or close connection: {:?}", status
+    // 不正なヘッダーの場合、400 Bad Requestが返される
+    assert_eq!(
+        status, Some(400),
+        "Should return 400 Bad Request for malformed headers, got: {:?}", status
     );
     
     if status == Some(400) {
@@ -6329,11 +6321,10 @@ fn test_backend_timeout_handling() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     
-    // バックエンドが正常に動作している場合、200が返される
-    // バックエンドがタイムアウトした場合、502が返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(502),
-        "Should return 200 OK or 502 Bad Gateway: {:?}", status
+    // バックエンドがタイムアウトした場合、502 Bad Gatewayが返される
+    assert_eq!(
+        status, Some(502),
+        "Should return 502 Bad Gateway for backend timeout, got: {:?}", status
     );
     
     if status == Some(200) {
@@ -6398,9 +6389,9 @@ fn test_chunked_transfer_encoding() {
     let status = get_status_code(&response);
     
     // Chunked Transfer Encodingがサポートされている場合、正常に処理される
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502),
-        "Should return appropriate status: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for chunked transfer encoding, got: {:?}", status
     );
     
     eprintln!("Chunked transfer encoding test: status {:?}", status);
@@ -6736,10 +6727,9 @@ fn test_sni_different_hostname() {
     let status = get_status_code(&response);
     
     // SNIが正しく処理された場合、200が返される
-    // 証明書が対応していない場合、接続エラーが発生する可能性がある
-    assert!(
-        status == Some(200) || status == Some(502),
-        "Should return 200 OK or 502 Bad Gateway with SNI: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK with SNI, got: {:?}", status
     );
     
     eprintln!("SNI different hostname test: status {:?}", status);
@@ -6765,10 +6755,10 @@ fn test_redirect_307() {
         let status = get_status_code(&response);
         let location = get_header_value(&response, "Location");
         
-        // リダイレクトが設定されている場合、307が返される可能性がある
-        assert!(
-            status == Some(200) || status == Some(301) || status == Some(302) || status == Some(307) || status == Some(404),
-            "Should return appropriate status: {:?}", status
+        // リダイレクトが設定されている場合、307 Temporary Redirectが返される
+        assert_eq!(
+            status, Some(307),
+            "Should return 307 Temporary Redirect for redirect, got: {:?}", status
         );
         
         if status == Some(307) {
@@ -6795,9 +6785,9 @@ fn test_redirect_308() {
         let location = get_header_value(&response, "Location");
         
         // リダイレクトが設定されている場合、308が返される可能性がある
-        assert!(
-            status == Some(200) || status == Some(301) || status == Some(302) || status == Some(308) || status == Some(404),
-            "Should return appropriate status: {:?}", status
+        assert_eq!(
+            status, Some(308),
+            "Should return 308 Permanent Redirect for redirect, got: {:?}", status
         );
         
         if status == Some(308) {
@@ -7227,10 +7217,10 @@ fn test_buffering_large_response() {
     
     if let Some(response) = response {
         let status = get_status_code(&response);
-        // 大きなファイルが存在しない場合、404が返される可能性がある
-        assert!(
-            status == Some(200) || status == Some(404),
-            "Should return 200 OK or 404 Not Found: {:?}", status
+        // 大きなファイルが存在する場合、200が返される
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for large file, got: {:?}", status
         );
         
         if status == Some(200) {
@@ -7741,7 +7731,7 @@ fn test_websocket_invalid_upgrade_request() {
     let status = get_status_code(&response);
     // 不正なUpgradeリクエストの場合、400 Bad Requestまたは200が返される可能性がある
     assert!(
-        status == Some(400) || status == Some(200) || status == Some(404),
+        status == Some(400),
         "Should return 400, 200, or 404 for invalid upgrade request: {:?}", status
     );
     
@@ -7772,7 +7762,7 @@ fn test_websocket_missing_connection_header() {
     let status = get_status_code(&response);
     // Connectionヘッダーがない場合、400 Bad Requestまたは200が返される可能性がある
     assert!(
-        status == Some(400) || status == Some(200) || status == Some(404),
+        status == Some(400),
         "Should return 400, 200, or 404 for missing connection header: {:?}", status
     );
     
@@ -7803,7 +7793,7 @@ fn test_websocket_invalid_websocket_version() {
     let status = get_status_code(&response);
     // 不正なバージョンの場合、400 Bad Requestまたは426 Upgrade Requiredが返される可能性がある
     assert!(
-        status == Some(400) || status == Some(426) || status == Some(200) || status == Some(404),
+        status == Some(426),
         "Should return 400, 426, 200, or 404 for invalid websocket version: {:?}", status
     );
     
@@ -7898,7 +7888,7 @@ fn test_websocket_connection_close() {
     
     // 基本的な動作確認
     assert!(
-        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        status == Some(101),
         "Should return appropriate status: {:?}", status
     );
 }
@@ -7974,7 +7964,7 @@ fn test_websocket_unexpected_close() {
         
         // 予期しないクローズが発生しても、適切に処理されることを確認
         assert!(
-            status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+            status == Some(101),
             "Should return appropriate status even on unexpected close: {:?}", status
         );
     }
@@ -8165,7 +8155,7 @@ fn test_100_continue() {
     
     // 100 Continueまたは200 OKが返される可能性がある
     assert!(
-        status == Some(100) || status == Some(200) || status == Some(404),
+        status == Some(100),
         "Should return 100, 200, or 404: {:?}", status
     );
     
@@ -8292,7 +8282,7 @@ fn test_host_validation() {
     
     // Hostヘッダーが欠落している場合、400 Bad Requestが返される可能性がある
     assert!(
-        status == Some(400) || status == Some(200),
+        status == Some(400),
         "Should return 400 Bad Request or 200 OK: {:?}", status
     );
     
@@ -8549,7 +8539,7 @@ fn test_incomplete_request_line() {
     
     // 不完全なリクエスト行の場合、400 Bad Requestが返される可能性がある
     assert!(
-        status == Some(400) || status == Some(200) || status == None,
+        status == Some(400),
         "Should return 400, 200, or close connection: {:?}", status
     );
     
@@ -8582,10 +8572,10 @@ fn test_range_request_multiple_ranges() {
     let status = get_status_code(&response);
     
     // 複数範囲の場合、200 OKまたは206 Partial Contentが返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(206),
-        "Should return 200 OK or 206 Partial Content: {:?}", status
-    );
+        assert_eq!(
+            status, Some(206),
+            "Should return 206 Partial Content for range request, got: {:?}", status
+        );
     
     eprintln!("Range request multiple ranges test: status {:?}", status);
 }
@@ -8611,7 +8601,7 @@ fn test_range_request_not_satisfiable() {
         
         // 範囲が満たせない場合、416 Range Not Satisfiableが返される可能性がある
         assert!(
-            status == Some(200) || status == Some(206) || status == Some(416) || status == Some(404),
+            status == Some(206),
             "Should return 200, 206, 416, or 404: {:?}", status
         );
         
@@ -8652,7 +8642,7 @@ fn test_range_request_suffix() {
     
     // サフィックス範囲の場合、206 Partial Contentが返される可能性がある
     assert!(
-        status == Some(200) || status == Some(206) || status == Some(404),
+        status == Some(206),
         "Should return 200, 206, or 404: {:?}", status
     );
     
@@ -8687,7 +8677,7 @@ fn test_range_request_open_ended() {
     
     // 開始位置のみの場合、206 Partial Contentが返される可能性がある
     assert!(
-        status == Some(200) || status == Some(206) || status == Some(404),
+        status == Some(206),
         "Should return 200, 206, or 404: {:?}", status
     );
     
@@ -8816,7 +8806,7 @@ fn test_content_length_transfer_encoding_conflict() {
     
     // 競合がある場合、400 Bad Requestが返される可能性がある
     assert!(
-        status == Some(400) || status == Some(200) || status == None,
+        status == Some(400),
         "Should return 400 Bad Request or close connection: {:?}", status
     );
     
@@ -8883,7 +8873,7 @@ fn test_invalid_content_length() {
     
     // 不正なContent-Lengthの場合、400 Bad Requestが返される可能性がある
     assert!(
-        status == Some(400) || status == Some(200) || status == None,
+        status == Some(400),
         "Should return 400 Bad Request or close connection: {:?}", status
     );
     
@@ -8946,7 +8936,7 @@ fn test_multiple_content_length() {
     
     // 複数のContent-Lengthの場合、400 Bad Requestが返される可能性がある
     assert!(
-        status == Some(400) || status == Some(200) || status == None,
+        status == Some(400),
         "Should return 400 Bad Request or close connection: {:?}", status
     );
     
@@ -9133,7 +9123,7 @@ fn test_chunked_transfer_encoding_trailer() {
     let status = get_status_code(&response);
     // 400 Bad Requestが返される可能性もある（リクエストの問題）
     assert!(
-        status == Some(200) || status == Some(400) || status == Some(404),
+        status == Some(400),
         "Should return 200, 400, or 404: {:?}", status
     );
     
@@ -9235,7 +9225,7 @@ fn test_oversized_request_line() {
     
     // 過大なリクエスト行の場合、414 URI Too Long、413 Payload Too Large、または400 Bad Requestが返される可能性がある
     assert!(
-        status == Some(414) || status == Some(413) || status == Some(400) || status == Some(200) || status == None,
+        status == Some(414),
         "Should return 414, 413, 400, 200, or close connection: {:?}", status
     );
     
@@ -9299,7 +9289,7 @@ fn test_oversized_header() {
     
     // 過大なヘッダーの場合、431 Request Header Fields Too Large、413 Payload Too Large、または400 Bad Requestが返される可能性がある
     assert!(
-        status == Some(431) || status == Some(413) || status == Some(400) || status == Some(200) || status == None,
+        status == Some(431),
         "Should return 431, 413, 400, 200, or close connection: {:?}", status
     );
     
@@ -9362,7 +9352,7 @@ fn test_malformed_request() {
     
     // 不正な形式のリクエストの場合、400 Bad Requestが返される可能性がある
     assert!(
-        status == Some(400) || status == Some(200) || status == None,
+        status == Some(400),
         "Should return 400, 200, or close connection: {:?}", status
     );
     
@@ -9388,7 +9378,7 @@ fn test_http_method_put() {
     let status = get_status_code(&response);
     // PUTメソッドは200、201、204、または405が返される可能性がある
     assert!(
-        status == Some(200) || status == Some(201) || status == Some(204) || status == Some(405) || status == Some(404),
+        status == Some(201),
         "Should return 200, 201, 204, 405, or 404: {:?}", status
     );
     
@@ -9410,7 +9400,7 @@ fn test_http_method_delete() {
     let status = get_status_code(&response);
     // DELETEメソッドは200、204、または405が返される可能性がある
     assert!(
-        status == Some(200) || status == Some(204) || status == Some(405) || status == Some(404),
+        status == Some(204),
         "Should return 200, 204, 405, or 404: {:?}", status
     );
     
@@ -9432,7 +9422,7 @@ fn test_http_method_patch() {
     let status = get_status_code(&response);
     // PATCHメソッドは200、204、または405が返される可能性がある
     assert!(
-        status == Some(200) || status == Some(204) || status == Some(405) || status == Some(404),
+        status == Some(204),
         "Should return 200, 204, 405, or 404: {:?}", status
     );
     
@@ -9454,7 +9444,7 @@ fn test_http_method_options() {
     let status = get_status_code(&response);
     // OPTIONSメソッドは200、204、または405が返される可能性がある
     assert!(
-        status == Some(200) || status == Some(204) || status == Some(405) || status == Some(404),
+        status == Some(204),
         "Should return 200, 204, 405, or 404: {:?}", status
     );
     
@@ -9482,7 +9472,7 @@ fn test_http_method_head() {
     let status = get_status_code(&response);
     // HEADメソッドは200、または404が返される可能性がある
     assert!(
-        status == Some(200) || status == Some(404),
+        status == Some(200),
         "Should return 200 or 404: {:?}", status
     );
     
@@ -9620,7 +9610,7 @@ fn test_error_handling_413_payload_too_large() {
     
     // 413 Payload Too Largeが返される可能性がある
     assert!(
-        status == Some(413) || status == Some(400) || status == Some(200) || status == None,
+        status == Some(413),
         "Should return 413, 400, 200, or close connection: {:?}", status
     );
     
@@ -10421,7 +10411,7 @@ fn test_error_handling_500_internal_server_error() {
     let status = get_status_code(&response);
     // 正常なレスポンスが返されることを確認
     assert!(
-        status == Some(200) || status == Some(404) || status == Some(500),
+        status == Some(500),
         "Should return 200, 404, or 500: {:?}", status
     );
     
@@ -10448,7 +10438,7 @@ fn test_error_handling_503_service_unavailable() {
     let status = get_status_code(&response);
     // 正常なレスポンスが返されることを確認
     assert!(
-        status == Some(200) || status == Some(404) || status == Some(503),
+        status == Some(503),
         "Should return 200, 404, or 503: {:?}", status
     );
     
@@ -10892,13 +10882,10 @@ fn test_h2c_proxy_forwarding() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     
-    // H2CバックエンドがHTTP/1.1サーバーとして動作している場合、
-    // プロキシがH2C接続を試みて失敗し、HTTP/1.1にフォールバックする可能性がある
-    // または、502 Bad Gatewayが返される可能性がある
-    // いずれにしても、プロキシがH2C接続を試みたことを確認
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // H2Cバックエンドが正常に動作している場合、200 OKが返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C request, got: {:?}", status
     );
     
     // X-H2C-Testヘッダーが追加されていることを確認（H2Cルートが使用された場合）
@@ -11953,7 +11940,7 @@ fn test_websocket_poll_mode_fixed() {
     // Fixedモードでは、常に固定タイムアウトでポーリングされる
     // 実際の検証には、WebSocketフレームの送受信とタイムアウトの測定が必要
     assert!(
-        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        status == Some(101),
         "Should return appropriate status: {:?}", status
     );
     
@@ -12018,7 +12005,7 @@ fn test_websocket_poll_mode_adaptive_active() {
     // Adaptiveモードでは、データ転送時は短いタイムアウトでポーリングされる
     // 実際の検証には、WebSocketフレームの送受信とタイムアウトの測定が必要
     assert!(
-        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        status == Some(101),
         "Should return appropriate status: {:?}", status
     );
     
@@ -12083,7 +12070,7 @@ fn test_websocket_long_connection() {
     // 長時間接続が維持されることを確認
     // 実際の検証には、WebSocketフレームの送受信と接続の維持時間の測定が必要
     assert!(
-        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        status == Some(101),
         "Should return appropriate status: {:?}", status
     );
     
@@ -12448,7 +12435,7 @@ fn test_websocket_poll_mode_adaptive_idle() {
     // Adaptiveモードでは、アイドル時はタイムアウトが延長される
     // 実際の検証には、WebSocketフレームの送受信とタイムアウトの測定が必要
     assert!(
-        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        status == Some(101),
         "Should return appropriate status: {:?}", status
     );
     
@@ -12513,7 +12500,7 @@ fn test_websocket_idle_connection_timeout() {
     // アイドル接続が適切にタイムアウトされることを確認
     // 実際の検証には、WebSocketフレームの送受信とタイムアウトの測定が必要
     assert!(
-        status == Some(101) || status == Some(200) || status == Some(404) || status == Some(502),
+        status == Some(101),
         "Should return appropriate status: {:?}", status
     );
     
@@ -13311,10 +13298,9 @@ fn test_routing_combined_conditions() {
     let status = get_status_code(&response);
     
     // すべての条件を満たす場合、200が返される
-    // 条件が満たされない場合、404または403が返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(403),
-        "Should return 200 OK, 404 Not Found, or 403 Forbidden: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for matching routing conditions, got: {:?}", status
     );
 }
 
@@ -13617,9 +13603,9 @@ fn test_routing_empty_path() {
     let status = get_status_code(&response.unwrap());
     
     // 空パスが正しくルーティングされることを確認
-    assert!(
-        status == Some(200) || status == Some(404),
-        "Should return 200 OK or 404 Not Found: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for empty path, got: {:?}", status
     );
 }
 
@@ -14071,9 +14057,9 @@ fn test_log_level_error() {
     let response = send_request(PROXY_PORT, "/nonexistent", &[]);
     assert!(response.is_some(), "Should receive response");
     let status = get_status_code(&response.unwrap());
-    assert!(
-        status == Some(404) || status == Some(502),
-        "Should return 404 Not Found or 502 Bad Gateway: {:?}", status
+    assert_eq!(
+        status, Some(404),
+        "Should return 404 Not Found for nonexistent endpoint, got: {:?}", status
     );
     
     eprintln!("Log level error test: Basic functionality confirmed (full implementation requires log file access)");
