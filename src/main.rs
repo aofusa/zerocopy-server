@@ -7565,6 +7565,24 @@ fn main() {
     // 同時接続数制限
     let max_connections = loaded_config.global_security.max_concurrent_connections;
     
+    // H2C専用サーバーの判定
+    // H2Cが有効で、h2c_listenが未指定またはlistenと同じ場合、通常のTLSリスナーは不要
+    #[cfg(feature = "http2")]
+    let is_h2c_only_server = loaded_config.h2c_enabled 
+        && (loaded_config.h2c_listen.is_none() 
+            || loaded_config.h2c_listen.as_ref().unwrap() == &loaded_config.listen_addr);
+    
+    #[cfg(not(feature = "http2"))]
+    let is_h2c_only_server = false;
+    
+    // 通常のTLSリスナーを起動（H2C専用サーバーの場合はスキップ）
+    if !is_h2c_only_server {
+        info!("============================================");
+        info!("HTTPS Server");
+        info!("Listen Address: {}", listen_addr);
+        info!("Workers: {} (SO_REUSEPORT enabled)", num_threads);
+        info!("============================================");
+    
     for thread_id in 0..num_threads {
         let acceptor_clone = acceptor.clone();
         // 注: host_routes と path_routes は CURRENT_CONFIG から取得するため、ここでは不要
@@ -7663,6 +7681,9 @@ fn main() {
             });
         });
         handles.push(handle);
+    }
+    } else {
+        info!("Skipping TLS listener (H2C-only server detected)");
     }
 
     // HTTP to HTTPS リダイレクトワーカー（設定されている場合のみ）
@@ -7907,7 +7928,7 @@ fn main() {
                         // タイムアウト付きaccept
                         let accept_result = timeout(Duration::from_secs(1), listener.accept()).await;
                         
-                        let (stream, peer_addr) = match accept_result {
+                        let (mut stream, peer_addr) = match accept_result {
                             Ok(Ok(s)) => s,
                             Ok(Err(e)) => {
                                 error!("[H2C Worker {}] Accept error: {}", thread_id, e);
@@ -7935,10 +7956,28 @@ fn main() {
                         // H2C接続処理をspawn（パニック耐性あり）
                         spawn_with_panic_catch(async move {
                             let _guard = ConnectionGuard::new();
-                            // H2C専用リスナーのため、プロトコル検出は不要
-                            // 直接H2C接続処理を呼び出す
-                            // 注意: プロトコル検出で既に読み込んだデータがないため、空の初期データを渡す
-                            handle_h2c_connection(stream, &peer_addr.ip().to_string(), Vec::new()).await;
+                            // H2C専用リスナーでも、プロトコル検出を実行して初期データを取得
+                            // これにより、クライアントがまだプリフェースを送信していない場合でも
+                            // 正しく処理できる
+                            let (protocol_type, initial_data) = detect_protocol_with_buffer(&mut stream).await;
+                            
+                            match protocol_type {
+                                ProtocolType::H2C => {
+                                    // H2C接続処理
+                                    handle_h2c_connection(stream, &peer_addr.ip().to_string(), initial_data).await;
+                                }
+                                ProtocolType::Http11 => {
+                                    // HTTP/1.1はH2C専用サーバーではサポートしない
+                                    warn!("[H2C Worker] Plain HTTP/1.1 not supported on H2C-only server, closing connection from {}", peer_addr);
+                                }
+                                ProtocolType::TLS => {
+                                    // TLSはH2C専用サーバーではサポートしない
+                                    warn!("[H2C Worker] TLS not supported on H2C-only server, closing connection from {}", peer_addr);
+                                }
+                                ProtocolType::Unknown => {
+                                    warn!("[H2C Worker] Unknown protocol from {}, closing connection", peer_addr);
+                                }
+                            }
                         });
                     }
                     

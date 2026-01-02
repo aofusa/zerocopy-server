@@ -217,18 +217,20 @@ EOF
 
     # H2Cバックエンド設定（HTTP/2 over cleartext、静的ファイル配信）
     # HTTP（平文）サーバーとして動作させ、H2C接続を受け入れる
-    # 注意: TLSセクションは必須だが、listenをHTTPポートに設定することでHTTPで動作可能
+    # 注意: H2C専用サーバーのため、通常のTLSリスナーは起動されない
     cat > "${FIXTURES_DIR}/backend_h2c.toml" << EOF
 [server]
 listen = "127.0.0.1:${BACKEND_H2C_PORT}"
+h2c_listen = "127.0.0.1:${BACKEND_H2C_PORT}"  # 明示的に設定（H2C専用サーバー）
 threads = 1
 http2_enabled = true
 h2c_enabled = true
-# http設定は不要（HTTP（平文）サーバーとして動作）
+# 注意: h2c_listenがlistenと同じ場合、通常のTLSリスナーは起動されない
 
 [tls]
 cert_path = "${FIXTURES_DIR}/cert.pem"
 key_path = "${FIXTURES_DIR}/key.pem"
+# 注意: H2C専用サーバーのため、TLS証明書は使用されないが、設定ファイルの検証で必要
 
 [logging]
 level = "warn"
@@ -500,7 +502,7 @@ start_servers() {
     echo $! >> "$PIDS_FILE"
     log_info "Backend 2 started on port ${BACKEND2_PORT} (PID: $!)"
     
-    # H2Cバックエンド起動（HTTP/1.1サーバーとして動作、H2Cテスト用）
+    # H2Cバックエンド起動（HTTP/2 over cleartextサーバーとして動作、H2Cテスト用）
     "$VEIL_BIN" -c "${FIXTURES_DIR}/backend_h2c.toml" &
     echo $! >> "$PIDS_FILE"
     log_info "H2C Backend started on port ${BACKEND_H2C_PORT} (PID: $!)"
@@ -522,7 +524,7 @@ start_servers() {
     # H2CバックエンドはHTTP（平文）サーバーとして動作
     # listenをHTTPポートに設定することで、HTTP（平文）で動作可能
     if wait_for_h2c_server "http://127.0.0.1:${BACKEND_H2C_PORT}/health" "H2C Backend" 15; then
-        log_info "H2C Backend is ready (HTTP plaintext mode)"
+        log_info "H2C Backend is ready (HTTP/2 over cleartext mode)"
     else
         log_warn "H2C Backend may not be fully ready, continuing..."
     fi
