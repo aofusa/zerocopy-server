@@ -9667,6 +9667,8 @@ fn test_concurrent_requests_different_paths() {
                 let response = send_request(PROXY_PORT, path, &[]);
                 if let Some(response) = response {
                     let status = get_status_code(&response);
+                    // 並列リクエストテスト: プロキシが並列リクエストを処理できることを確認
+                    // 404は「プロキシが正常に動作している」ことを示すため、成功としてカウント
                     if status == Some(200) || status == Some(404) {
                         success_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -9712,6 +9714,9 @@ fn test_concurrent_requests_mixed_methods() {
                 let response = send_request_with_method(PROXY_PORT, "/", method, &[], None);
                 if let Some(response) = response {
                     let status = get_status_code(&response);
+                    // 並列メソッドテスト: プロキシが並列リクエストを処理できることを確認
+                    // 404は「プロキシが正常に動作している」ことを示すため、成功としてカウント
+                    // 405は「メソッドが許可されていない」というエラーだが、プロキシが正常に動作していることを示すため、成功としてカウント
                     if status == Some(200) || status == Some(404) || status == Some(405) {
                         success_count.fetch_add(1, Ordering::Relaxed);
                     }
@@ -10492,6 +10497,19 @@ fn test_compression_zstd() {
     }
     
     // Zstd圧縮のテスト
+    // 前提条件: /large.txt が存在することを確認
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    if prereq.is_none() {
+        eprintln!("Prerequisite check failed: no response");
+        return;
+    }
+    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    if prereq_status != Some(200) {
+        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
+        return;
+    }
+    
+    // zstd圧縮をリクエスト
     let response = send_request(
         PROXY_PORT, 
         "/large.txt", 
@@ -10501,10 +10519,10 @@ fn test_compression_zstd() {
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // 404が返される可能性もあるが、通常は200が返される
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(400),
-        "Should return 200, 404, or 400: {:?}", status
+    // 前提条件チェックで200が返ることを確認済みなので、ここでも200を期待
+    assert_eq!(
+        status, Some(200),
+        "Compression zstd request should return 200 OK, got: {:?}", status
     );
     
     // 圧縮が有効な場合、Content-Encodingヘッダーがある
@@ -10527,6 +10545,18 @@ fn test_compression_multiple_encodings() {
         return;
     }
     
+    // 前提条件: /large.txt が存在することを確認
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    if prereq.is_none() {
+        eprintln!("Prerequisite check failed: no response");
+        return;
+    }
+    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    if prereq_status != Some(200) {
+        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
+        return;
+    }
+    
     // 複数の圧縮エンコーディングの優先順位のテスト
     let response = send_request(
         PROXY_PORT, 
@@ -10537,9 +10567,10 @@ fn test_compression_multiple_encodings() {
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(400),
-        "Should return 200, 404, or 400: {:?}", status
+    // 前提条件チェックで200が返ることを確認済みなので、ここでも200を期待
+    assert_eq!(
+        status, Some(200),
+        "Compression multiple encodings request should return 200 OK, got: {:?}", status
     );
     
     // 圧縮が有効な場合、Content-Encodingヘッダーがある
@@ -10559,6 +10590,18 @@ fn test_compression_no_encoding() {
         return;
     }
     
+    // 前提条件: /large.txt が存在することを確認
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    if prereq.is_none() {
+        eprintln!("Prerequisite check failed: no response");
+        return;
+    }
+    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    if prereq_status != Some(200) {
+        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
+        return;
+    }
+    
     // 圧縮を要求しない場合のテスト
     let response = send_request(
         PROXY_PORT, 
@@ -10569,9 +10612,10 @@ fn test_compression_no_encoding() {
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(400),
-        "Should return 200, 404, or 400: {:?}", status
+    // 前提条件チェックで200が返ることを確認済みなので、ここでも200を期待
+    assert_eq!(
+        status, Some(200),
+        "Compression identity request should return 200 OK, got: {:?}", status
     );
     
     // 圧縮が要求されない場合、Content-Encodingヘッダーがない可能性がある
@@ -10817,16 +10861,28 @@ fn test_buffering_memory_limit() {
     // バッファリングのメモリ制限のテスト
     // メモリ制限を超えた場合の動作を確認
     
+    // 前提条件: /large.txt が存在することを確認
+    let prereq = send_request(PROXY_PORT, "/large.txt", &[]);
+    if prereq.is_none() {
+        eprintln!("Prerequisite check failed: no response");
+        return;
+    }
+    let prereq_status = get_status_code(&prereq.as_ref().unwrap());
+    if prereq_status != Some(200) {
+        eprintln!("Prerequisite failed: /large.txt not found (status: {:?}), skipping test", prereq_status);
+        return;
+    }
+    
     // 大きなレスポンスをリクエスト
     let response = send_request(PROXY_PORT, "/large.txt", &[]);
     assert!(response.is_some(), "Should receive response");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // 200、404、または413が返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(413) || status == Some(400),
-        "Should return 200, 404, 413, or 400: {:?}", status
+    // 前提条件チェックで200が返ることを確認済みなので、ここでも200を期待
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for buffering memory limit test, got: {:?}", status
     );
     
     eprintln!("Buffering memory limit test: status {:?}", status);
@@ -10912,10 +10968,10 @@ fn test_h2c_get_request() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     
-    // 200 OKまたはエラー（H2CバックエンドがHTTP/1.1サーバーの場合）
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // H2C接続が正常に確立された場合、200 OKが返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C GET request, got: {:?}", status
     );
     
     if status == Some(200) {
@@ -10948,10 +11004,10 @@ fn test_h2c_post_request() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     
-    // 200 OKまたはエラー（H2CバックエンドがHTTP/1.1サーバーの場合）
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504) || status == Some(405),
-        "Should return 200 OK, 405 Method Not Allowed, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // H2C接続が正常に確立された場合、200 OKが返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C POST request, got: {:?}", status
     );
 }
 
@@ -11004,10 +11060,10 @@ fn test_h2c_connection_timeout() {
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // 200 OK、502 Bad Gateway、または504 Gateway Timeoutが返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // H2C接続が正常に確立された場合、200 OKが返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C POST request, got: {:?}", status
     );
 }
 
@@ -11019,18 +11075,16 @@ fn test_h2c_backend_unavailable() {
         return;
     }
     
-    // バックエンドが利用できない場合のエラーハンドリングを確認
-    // 実際のテストでは、バックエンドサーバーを停止してテストする必要があるが、
-    // テスト環境では既存のルートを使用して基本的な動作確認のみ実施
+    // 存在しないパスへのリクエストの場合、404 Not Foundが返される
     let response = send_request(PROXY_PORT, "/h2c/nonexistent", &[]);
     assert!(response.is_some(), "Should receive response from proxy");
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // 404 Not Found、502 Bad Gateway、または504 Gateway Timeoutが返される可能性がある
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 404 Not Found, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // 存在しないパスへのリクエストの場合、404 Not Foundが返される
+    assert_eq!(
+        status, Some(404),
+        "Should return 404 Not Found for nonexistent path, got: {:?}", status
     );
 }
 
@@ -11056,10 +11110,10 @@ fn test_h2c_basic_connection() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     
-    // プロキシがH2C接続を試みたことを確認（200 OK、502 Bad Gateway、または504 Gateway Timeout）
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // H2C接続が正常に確立された場合、200 OKが返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C connection, got: {:?}", status
     );
     
     // 接続が確立された場合、X-H2C-Testヘッダーが追加されていることを確認
@@ -11120,10 +11174,10 @@ fn test_h2c_connection_close() {
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // 接続が正常に終了することを確認
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // Connection: closeヘッダーが正しく処理され、接続が正常に終了することを確認
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C connection with close header, got: {:?}", status
     );
 }
 
@@ -11145,10 +11199,9 @@ fn test_h2c_handshake_success() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     // ハンドシェイクが成功した場合、200 OKが返される
-    // ハンドシェイクが失敗した場合、502 Bad Gatewayまたは504 Gateway Timeoutが返される
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for successful H2C handshake, got: {:?}", status
     );
     
     // ハンドシェイクが成功した場合、X-H2C-Testヘッダーが追加されていることを確認
@@ -11176,9 +11229,9 @@ fn test_h2c_settings_negotiation() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     // SETTINGSネゴシエーションが成功した場合、200 OKが返される
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for successful H2C SETTINGS negotiation, got: {:?}", status
     );
 }
 
@@ -11197,11 +11250,10 @@ fn test_h2c_handshake_failure() {
     
     let response = response.unwrap();
     let status = get_status_code(&response);
-    // ハンドシェイクが失敗した場合、502 Bad Gatewayまたは504 Gateway Timeoutが返される
-    // または、404 Not Foundが返される（パスが存在しない場合）
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 404 Not Found, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // 存在しないパスへのリクエストの場合、404 Not Foundが返される
+    assert_eq!(
+        status, Some(404),
+        "Should return 404 Not Found for invalid path, got: {:?}", status
     );
 }
 
@@ -11230,9 +11282,9 @@ fn test_h2c_large_request_body() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     // 大きなボディが正しく転送されることを確認
-    assert!(
-        status == Some(200) || status == Some(405) || status == Some(413) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 405 Method Not Allowed, 413 Request Entity Too Large, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for large request body, got: {:?}", status
     );
 }
 
@@ -11252,9 +11304,10 @@ fn test_h2c_large_response_body() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     // 大きなレスポンスが正しく受信されることを確認
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 404 Not Found, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // ファイルが存在する場合、200 OKが返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for large response, got: {:?}", status
     );
     
     if status == Some(200) {
@@ -11289,9 +11342,9 @@ fn test_h2c_header_compression() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     // HPACK圧縮が正しく動作することを確認
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C request with HPACK compression, got: {:?}", status
     );
 }
 
@@ -11331,9 +11384,10 @@ fn test_h2c_multiple_streams() {
     for response in responses {
         assert!(response.is_some(), "Should receive response from proxy");
         let status = get_status_code(&response.unwrap());
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(502) || status == Some(504),
-            "Should return 200 OK, 404 Not Found, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+        // H2C接続が正常に確立された場合、200 OKが返される
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for H2C multiplexing request, got: {:?}", status
         );
     }
 }
@@ -11359,9 +11413,9 @@ fn test_h2c_stream_priority() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     // 優先度が正しく処理されることを確認
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C request with priority, got: {:?}", status
     );
 }
 
@@ -11382,9 +11436,9 @@ fn test_h2c_stream_cancellation() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     // ストリームが正しく処理されることを確認
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C stream cancellation test, got: {:?}", status
     );
 }
 
@@ -11407,9 +11461,10 @@ fn test_h2c_invalid_frame() {
     let response = response.unwrap();
     let status = get_status_code(&response);
     // 不正なリクエストが適切に処理されることを確認
-    assert!(
-        status == Some(200) || status == Some(400) || status == Some(404) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 400 Bad Request, 404 Not Found, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // 不正なパス文字が含まれる場合、400 Bad Requestが返される
+    assert_eq!(
+        status, Some(400),
+        "Should return 400 Bad Request for invalid frame/path, got: {:?}", status
     );
 }
 
@@ -11439,9 +11494,10 @@ fn test_h2c_proxy_load_balancing() {
     for response in responses {
         assert!(response.is_some(), "Should receive response from proxy");
         let status = get_status_code(&response.unwrap());
-        assert!(
-            status == Some(200) || status == Some(502) || status == Some(504),
-            "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+        // H2C接続が正常に確立された場合、200 OKが返される
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for H2C load balancing request, got: {:?}", status
         );
     }
 }
@@ -11483,10 +11539,10 @@ fn test_h2c_grpc_unary_call() {
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    // gRPCステータスコードが返されることを確認（0=OK、またはエラー）
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 404 Not Found, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // gRPCリクエストが正常に処理された場合、200 OKが返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for gRPC request over H2C, got: {:?}", status
     );
 }
 
@@ -11525,10 +11581,10 @@ fn test_h2c_grpc_streaming() {
     };
     
     let status = GrpcTestClient::extract_status_code(&response);
-    // gRPCストリーミングが正しく処理されることを確認
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 404 Not Found, 502 Bad Gateway, or 504 Gateway Timeout, got: {:?}", status
+    // gRPCストリーミングが正しく処理された場合、200 OKが返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for gRPC streaming request over H2C, got: {:?}", status
     );
 }
 
@@ -11551,7 +11607,8 @@ fn test_h2c_throughput() {
         let response = send_request(PROXY_PORT, "/h2c/", &[]);
         if let Some(resp) = response {
             let status = get_status_code(&resp);
-            if status == Some(200) || status == Some(502) || status == Some(504) {
+            // H2C接続が正常に確立された場合、200 OKが返される
+            if status == Some(200) {
                 success_count += 1;
             }
         }
@@ -11627,9 +11684,9 @@ fn test_buffering_disk_spillover_enabled() {
         let status = get_status_code(&response);
         // ディスクスピルオーバーが有効な場合、メモリ上限超過時にディスクに書き込まれる
         // 正常に処理される場合は200が返される
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(413) || status == Some(500),
-            "Should return 200, 404, 413, or 500: {:?}", status
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for disk spillover test, got: {:?}", status
         );
         
         if status == Some(200) {
@@ -11661,11 +11718,10 @@ fn test_buffering_disk_spillover_disabled() {
     
     if let Some(response) = response {
         let status = get_status_code(&response);
-        // ディスクスピルオーバーが無効な場合、メモリ上限超過時にエラーが返される可能性がある
-        // または、ストリーミングモードにフォールバックされる
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(413) || status == Some(500),
-            "Should return 200, 404, 413, or 500: {:?}", status
+        // ディスクスピルオーバーが無効な場合でも、ストリーミングモードにフォールバックされるため、200が返される
+        assert_eq!(
+            status, Some(200),
+            "Should return 200 OK for buffering test (streaming fallback), got: {:?}", status
         );
         
         eprintln!("Buffering disk spillover disabled test: status={:?}", status);
@@ -12329,10 +12385,10 @@ fn test_buffering_disk_spillover_max_size() {
     
     if let Some(response) = response {
         let status = get_status_code(&response);
-        // ディスクバッファ上限超過時、エラーが返される可能性がある
-        assert!(
-            status == Some(200) || status == Some(404) || status == Some(413) || status == Some(500) || status == Some(507),
-            "Should return 200, 404, 413, 500, or 507: {:?}", status
+        // ディスクバッファ上限超過時、507 Insufficient Storageが返される
+        assert_eq!(
+            status, Some(507),
+            "Should return 507 Insufficient Storage for disk buffer max size exceeded, got: {:?}", status
         );
         
         eprintln!("Buffering disk spillover max size test: status={:?}", status);
@@ -13385,13 +13441,13 @@ fn test_routing_wildcard_path() {
     let status2 = get_status_code(&response2.unwrap());
     
     // ワイルドカードパスにマッチする場合、200が返される
-    assert!(
-        status1 == Some(200) || status1 == Some(404),
-        "Should return 200 OK or 404 Not Found: {:?}", status1
+    assert_eq!(
+        status1, Some(200),
+        "Should return 200 OK for wildcard path match, got: {:?}", status1
     );
-    assert!(
-        status2 == Some(200) || status2 == Some(404),
-        "Should return 200 OK or 404 Not Found: {:?}", status2
+    assert_eq!(
+        status2, Some(200),
+        "Should return 200 OK for wildcard path match, got: {:?}", status2
     );
 }
 
@@ -13422,14 +13478,14 @@ fn test_routing_header_multiple() {
     let status2 = get_status_code(&response2.unwrap());
     
     // すべての条件を満たす場合、200が返される
-    assert!(
-        status1 == Some(200) || status1 == Some(404) || status1 == Some(403),
-        "Should return 200 OK, 404 Not Found, or 403 Forbidden: {:?}", status1
+    assert_eq!(
+        status1, Some(200),
+        "Should return 200 OK for matching routing conditions, got: {:?}", status1
     );
-    // 条件を満たさない場合、404または403が返される可能性がある
-    assert!(
-        status2 == Some(200) || status2 == Some(404) || status2 == Some(403),
-        "Should return 200 OK, 404 Not Found, or 403 Forbidden: {:?}", status2
+    // 条件を満たさない場合、404が返される
+    assert_eq!(
+        status2, Some(404),
+        "Should return 404 Not Found for non-matching routing conditions, got: {:?}", status2
     );
 }
 
@@ -13454,14 +13510,14 @@ fn test_routing_query_multiple() {
     let status2 = get_status_code(&response2.unwrap());
     
     // すべての条件を満たす場合、200が返される
-    assert!(
-        status1 == Some(200) || status1 == Some(404) || status1 == Some(403),
-        "Should return 200 OK, 404 Not Found, or 403 Forbidden: {:?}", status1
+    assert_eq!(
+        status1, Some(200),
+        "Should return 200 OK for matching routing conditions, got: {:?}", status1
     );
-    // 条件を満たさない場合、404または403が返される可能性がある
-    assert!(
-        status2 == Some(200) || status2 == Some(404) || status2 == Some(403),
-        "Should return 200 OK, 404 Not Found, or 403 Forbidden: {:?}", status2
+    // 条件を満たさない場合、404が返される
+    assert_eq!(
+        status2, Some(404),
+        "Should return 404 Not Found for non-matching routing conditions, got: {:?}", status2
     );
 }
 
@@ -13481,10 +13537,10 @@ fn test_routing_source_ip_cidr() {
     let status1 = get_status_code(&response1.unwrap());
     
     // CIDR範囲に含まれる場合、200が返される
-    // 含まれない場合、403が返される可能性がある
-    assert!(
-        status1 == Some(200) || status1 == Some(403),
-        "Should return 200 OK or 403 Forbidden: {:?}", status1
+    // 127.0.0.1は127.0.0.0/8に含まれるため、200が返される
+    assert_eq!(
+        status1, Some(200),
+        "Should return 200 OK for CIDR range match, got: {:?}", status1
     );
 }
 
@@ -13525,14 +13581,14 @@ fn test_routing_condition_and_logic() {
     let status2 = get_status_code(&response2.unwrap());
     
     // すべての条件を満たす場合、200が返される
-    assert!(
-        status1 == Some(200) || status1 == Some(404) || status1 == Some(403),
-        "Should return 200 OK, 404 Not Found, or 403 Forbidden: {:?}", status1
+    assert_eq!(
+        status1, Some(200),
+        "Should return 200 OK for matching routing conditions, got: {:?}", status1
     );
-    // 条件を満たさない場合、404または403が返される可能性がある
-    assert!(
-        status2 == Some(200) || status2 == Some(404) || status2 == Some(403),
-        "Should return 200 OK, 404 Not Found, or 403 Forbidden: {:?}", status2
+    // 条件を満たさない場合、404が返される
+    assert_eq!(
+        status2, Some(404),
+        "Should return 404 Not Found for non-matching routing conditions, got: {:?}", status2
     );
 }
 
@@ -13626,13 +13682,14 @@ fn test_routing_trailing_slash() {
     let status2 = get_status_code(&response2.unwrap());
     
     // 末尾スラッシュの有無に関わらず、適切にルーティングされることを確認
-    assert!(
-        status1 == Some(200) || status1 == Some(404) || status1 == Some(301) || status1 == Some(302),
-        "Should return 200 OK, 404 Not Found, or redirect: {:?}", status1
+    // 通常は200が返される（リダイレクトが設定されていない場合）
+    assert_eq!(
+        status1, Some(200),
+        "Should return 200 OK for path without trailing slash, got: {:?}", status1
     );
-    assert!(
-        status2 == Some(200) || status2 == Some(404),
-        "Should return 200 OK or 404 Not Found: {:?}", status2
+    assert_eq!(
+        status2, Some(200),
+        "Should return 200 OK for path with trailing slash, got: {:?}", status2
     );
 }
 
@@ -13650,9 +13707,9 @@ fn test_routing_query_parameter_encoding() {
     let status = get_status_code(&response.unwrap());
     
     // URLエンコードされたクエリパラメータが正しく処理されることを確認
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(403),
-        "Should return 200 OK, 404 Not Found, or 403 Forbidden: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for URL-encoded query parameter, got: {:?}", status
     );
 }
 
@@ -13673,9 +13730,10 @@ fn test_routing_source_ip_ipv6() {
     let status = get_status_code(&response.unwrap());
     
     // IPv6アドレスが正しく評価されることを確認（実際のIPv6接続テストは別途必要）
-    assert!(
-        status == Some(200) || status == Some(404) || status == Some(403),
-        "Should return 200 OK, 404 Not Found, or 403 Forbidden: {:?}", status
+    // 127.0.0.1からのリクエストなので、200が返される
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for IPv6 routing test, got: {:?}", status
     );
 }
 
@@ -13702,9 +13760,9 @@ fn test_h2c_server_prior_knowledge() {
     let status = get_status_code(&response.unwrap());
     
     // H2C接続が確立された場合、200が返される
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C prior knowledge connection, got: {:?}", status
     );
 }
 
@@ -13752,9 +13810,9 @@ fn test_h2c_server_connection_close() {
     let status = get_status_code(&response.unwrap());
     
     // 接続が正常に終了することを確認
-    assert!(
-        status == Some(200) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 502 Bad Gateway, or 504 Gateway Timeout: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C connection close, got: {:?}", status
     );
 }
 
@@ -13781,9 +13839,9 @@ fn test_h2c_large_header_block() {
     let status = get_status_code(&response.unwrap());
     
     // 大きなヘッダーブロックが正しく処理されることを確認
-    assert!(
-        status == Some(200) || status == Some(400) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 400 Bad Request, 502 Bad Gateway, or 504 Gateway Timeout: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for large header block, got: {:?}", status
     );
 }
 
@@ -13811,9 +13869,9 @@ fn test_h2c_flow_control() {
     let status = get_status_code(&response.unwrap());
     
     // フロー制御が正しく動作することを確認
-    assert!(
-        status == Some(200) || status == Some(413) || status == Some(502) || status == Some(504),
-        "Should return 200 OK, 413 Payload Too Large, 502 Bad Gateway, or 504 Gateway Timeout: {:?}", status
+    assert_eq!(
+        status, Some(200),
+        "Should return 200 OK for H2C flow control test, got: {:?}", status
     );
 }
 
