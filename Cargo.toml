@@ -202,8 +202,10 @@ tokio = { version = "1.42", features = ["full", "test-util"] }
 h2 = "0.4"
 tokio-rustls = "0.26"
 http = "1.2"
-hyper = { version = "1.6", features = ["client", "http2"] }
-hyper-rustls = { version = "0.27", features = ["http2"] }
+# HTTP/1.1 + HTTP/2クライアント
+hyper = { version = "1.6", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", features = ["http1", "http2"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
 
 # gRPCクライアント（HTTP/2ベース）
 # tls-aws-lcはaws-lc-rsを使用したTLS、channelはクライアント機能
@@ -221,6 +223,7 @@ tonic-h3 = "0.0.5"
 
 # 共通ユーティリティ
 futures = "0.3"
+http-body-util = "0.1"
 
 [[bench]]
 name = "throughput"
