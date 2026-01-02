@@ -12997,5 +12997,82 @@ mod wasm_tests {
             eprintln!("Request ID header found in response: {:?}", request_id);
         }
     }
+
+    // ====================
+    // 追加テスト: ケーパビリティ制御（ローカルレスポンス）
+    // ====================
+
+    #[test]
+    fn test_wasm_capability_local_response() {
+        if !is_e2e_environment_ready() {
+            eprintln!("Skipping test: E2E environment not ready");
+            return;
+        }
+        
+        // ローカルレスポンス送信権限のテスト
+        // 注意: header_filter.wasmはローカルレスポンスを送信しないため、基本的な動作確認のみ
+        // 実際のローカルレスポンステストには、ローカルレスポンスを送信するWASMモジュールが必要
+        let response = send_request(PROXY_PORT, "/wasm/", &[]);
+        assert!(response.is_some(), "Should receive response");
+        
+        let response = response.unwrap();
+        let status = get_status_code(&response);
+        assert_eq!(status, Some(200), "Should return 200 OK");
+        
+        // ローカルレスポンス送信権限が有効な場合、WASMモジュールが正常に動作することを確認
+        // (header_filter.wasmはローカルレスポンスを送信しないため、通常のレスポンスが返される)
+        let processed = get_header_value(&response, "X-Veil-Processed");
+        assert_eq!(processed, Some("true".to_string()), 
+                   "Should have X-Veil-Processed header when local response capability is enabled");
+    }
+
+    // ====================
+    // 追加テスト: パフォーマンス
+    // ====================
+
+    #[test]
+    fn test_wasm_performance() {
+        if !is_e2e_environment_ready() {
+            eprintln!("Skipping test: E2E environment not ready");
+            return;
+        }
+        
+        // パフォーマンステスト
+        // WASMモジュールの実行時間を測定
+        use std::time::Instant;
+        
+        let num_requests = 10;
+        let mut total_time = Duration::from_secs(0);
+        let mut success_count = 0;
+        
+        for _ in 0..num_requests {
+            let start = Instant::now();
+            let response = send_request(PROXY_PORT, "/wasm/", &[]);
+            let elapsed = start.elapsed();
+            total_time += elapsed;
+            
+            if let Some(resp) = response {
+                let status = get_status_code(&resp);
+                if status == Some(200) {
+                    success_count += 1;
+                }
+            }
+        }
+        
+        // すべてのリクエストが成功することを確認
+        assert_eq!(success_count, num_requests, 
+                   "All requests should succeed: {}/{}", success_count, num_requests);
+        
+        // 平均実行時間を計算
+        let avg_time = total_time / num_requests;
+        eprintln!("WASM performance test: {} requests, avg time: {:?}", num_requests, avg_time);
+        
+        // 平均実行時間が妥当な範囲内であることを確認（例: 5秒以内）
+        assert!(
+            avg_time < Duration::from_secs(5),
+            "Average execution time should be reasonable: {:?}",
+            avg_time
+        );
+    }
 }
 
